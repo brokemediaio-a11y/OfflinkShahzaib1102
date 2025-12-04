@@ -4,6 +4,7 @@ import 'package:permission_handler/permission_handler.dart';
 import '../../core/app_colors.dart';
 import '../../core/app_strings.dart';
 import '../../core/constants.dart';
+import '../../providers/device_provider.dart';
 import '../../utils/permissions_helper.dart';
 import '../../utils/logger.dart';
 import '../home/home_screen.dart';
@@ -98,18 +99,29 @@ class _PermissionsScreenState extends ConsumerState<PermissionsScreen> {
     return _permissions.values.every((granted) => granted);
   }
 
-  void _continue() {
-    if (_allPermissionsGranted) {
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute(builder: (_) => const HomeScreen()),
-      );
-    } else {
+  Future<void> _continue() async {
+    if (!_allPermissionsGranted) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text('Please grant all permissions to continue'),
           backgroundColor: AppColors.error,
         ),
       );
+      return;
+    }
+
+    setState(() => _isLoading = true);
+    try {
+      final connectionManager = ref.read(connectionManagerProvider);
+      await connectionManager.initialize();
+      if (!mounted) return;
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (_) => const HomeScreen()),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _isLoading = false);
+      }
     }
   }
 
@@ -121,76 +133,85 @@ class _PermissionsScreenState extends ConsumerState<PermissionsScreen> {
         backgroundColor: AppColors.primary,
         foregroundColor: AppColors.textLight,
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(AppConstants.defaultPadding),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            const SizedBox(height: 24),
-            // Description
-            Text(
-              AppStrings.permissionsDescription,
-              style: const TextStyle(
-                fontSize: 16,
-                color: AppColors.textSecondary,
-              ),
-            ),
-            const SizedBox(height: 32),
-            // Bluetooth Permission
-            _PermissionCard(
-              title: AppStrings.bluetoothPermission,
-              description: 'Required for device discovery and connection',
-              isGranted: _permissions['bluetooth'] ?? false,
-              onTap: () => _requestPermission('bluetooth'),
-              icon: Icons.bluetooth,
-            ),
-            const SizedBox(height: 16),
-            // Location Permission
-            _PermissionCard(
-              title: AppStrings.locationPermission,
-              description: 'Required for Bluetooth device scanning',
-              isGranted: _permissions['location'] ?? false,
-              onTap: () => _requestPermission('location'),
-              icon: Icons.location_on,
-            ),
-            const SizedBox(height: 16),
-            // Nearby Devices Permission
-            _PermissionCard(
-              title: AppStrings.nearbyDevicesPermission,
-              description: 'Required for discovering nearby devices',
-              isGranted: _permissions['nearbyDevices'] ?? false,
-              onTap: () => _requestPermission('nearbyDevices'),
-              icon: Icons.devices,
-            ),
-            const Spacer(),
-            // Continue Button
-            ElevatedButton(
-              onPressed: _isLoading ? null : _continue,
-              style: ElevatedButton.styleFrom(
-                backgroundColor: AppColors.primary,
-                foregroundColor: AppColors.textLight,
-                padding: const EdgeInsets.symmetric(vertical: 16),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(AppConstants.defaultBorderRadius),
-                ),
-              ),
-              child: _isLoading
-                  ? const SizedBox(
-                      height: 20,
-                      width: 20,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        valueColor: AlwaysStoppedAnimation<Color>(AppColors.textLight),
-                      ),
-                    )
-                  : const Text(
-                      AppStrings.continueButton,
-                      style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+      body: LayoutBuilder(
+        builder: (context, constraints) {
+          return SingleChildScrollView(
+            padding: const EdgeInsets.all(AppConstants.defaultPadding),
+            child: ConstrainedBox(
+              constraints: BoxConstraints(minHeight: constraints.maxHeight),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const SizedBox(height: 24),
+                  // Description
+                  Text(
+                    AppStrings.permissionsDescription,
+                    style: const TextStyle(
+                      fontSize: 16,
+                      color: AppColors.textSecondary,
                     ),
+                  ),
+                  const SizedBox(height: 32),
+                  // Bluetooth Permission
+                  _PermissionCard(
+                    title: AppStrings.bluetoothPermission,
+                    description: 'Required for device discovery and connection',
+                    isGranted: _permissions['bluetooth'] ?? false,
+                    onTap: () => _requestPermission('bluetooth'),
+                    icon: Icons.bluetooth,
+                  ),
+                  const SizedBox(height: 16),
+                  // Location Permission
+                  _PermissionCard(
+                    title: AppStrings.locationPermission,
+                    description: 'Required for Bluetooth device scanning',
+                    isGranted: _permissions['location'] ?? false,
+                    onTap: () => _requestPermission('location'),
+                    icon: Icons.location_on,
+                  ),
+                  const SizedBox(height: 16),
+                  // Nearby Devices Permission
+                  _PermissionCard(
+                    title: AppStrings.nearbyDevicesPermission,
+                    description: 'Required for discovering nearby devices',
+                    isGranted: _permissions['nearbyDevices'] ?? false,
+                    onTap: () => _requestPermission('nearbyDevices'),
+                    icon: Icons.devices,
+                  ),
+                  const SizedBox(height: 24),
+                  // Continue Button
+                  ElevatedButton(
+                    onPressed: _isLoading ? null : _continue,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: AppColors.primary,
+                      foregroundColor: AppColors.textLight,
+                      padding: const EdgeInsets.symmetric(vertical: 16),
+                      shape: RoundedRectangleBorder(
+                        borderRadius:
+                            BorderRadius.circular(AppConstants.defaultBorderRadius),
+                      ),
+                    ),
+                    child: _isLoading
+                        ? const SizedBox(
+                            height: 20,
+                            width: 20,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              valueColor:
+                                  AlwaysStoppedAnimation<Color>(AppColors.textLight),
+                            ),
+                          )
+                        : const Text(
+                            AppStrings.continueButton,
+                            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                          ),
+                  ),
+                  const SizedBox(height: 16),
+                ],
+              ),
             ),
-            const SizedBox(height: 16),
-          ],
-        ),
+          );
+        },
       ),
     );
   }

@@ -25,25 +25,27 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
     // Wait a bit for splash screen to be visible
     await Future.delayed(const Duration(seconds: 2));
 
-    // Initialize connection manager
-    final connectionManager = ref.read(connectionManagerProvider);
-    await connectionManager.initialize();
-
-    // Check permissions
+    // Check permissions before initializing communication stack
     final allPermissionsGranted = await PermissionsHelper.areAllPermissionsGranted();
 
     if (!mounted) return;
 
-    // Navigate based on permissions
-    if (allPermissionsGranted) {
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute(builder: (_) => const HomeScreen()),
-      );
-    } else {
+    if (!allPermissionsGranted) {
       Navigator.of(context).pushReplacement(
         MaterialPageRoute(builder: (_) => const PermissionsScreen()),
       );
+      return;
     }
+
+    // Initialize connection manager once permissions are granted
+    final connectionManager = ref.read(connectionManagerProvider);
+    await connectionManager.initialize();
+
+    if (!mounted) return;
+
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(builder: (_) => const HomeScreen()),
+    );
   }
 
   @override

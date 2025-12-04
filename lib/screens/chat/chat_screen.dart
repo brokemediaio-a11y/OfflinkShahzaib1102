@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:uuid/uuid.dart';
@@ -31,16 +32,29 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     _setupMessageListener();
   }
 
+  StreamSubscription<String>? _messageSubscription;
+
   void _setupMessageListener() {
     // Listen to incoming messages from connection manager
-    // This would be set up through the connection manager's message stream
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final connectionManager = ref.read(connectionManagerProvider);
-      connectionManager.incomingMessages.listen((messageJson) {
+      _messageSubscription = connectionManager.incomingMessages.listen((messageJson) {
         try {
+          // Only process messages if we're still mounted and viewing this device's chat
+          if (!mounted) return;
+          
           // Parse and handle incoming message
           final chatNotifier = ref.read(chatProvider(widget.device.id).notifier);
           chatNotifier.receiveMessage(messageJson);
+          
+          // Scroll to bottom when new message arrives
+          if (_scrollController.hasClients) {
+            _scrollController.animateTo(
+              _scrollController.position.maxScrollExtent,
+              duration: const Duration(milliseconds: 300),
+              curve: Curves.easeOut,
+            );
+          }
         } catch (e) {
           Logger.error('Error handling incoming message', e);
         }
@@ -69,6 +83,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
   @override
   void dispose() {
+    _messageSubscription?.cancel();
     _messageController.dispose();
     _scrollController.dispose();
     super.dispose();
@@ -79,11 +94,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     final chatState = ref.watch(chatProvider(widget.device.id));
     final connectionState = ref.watch(connectionProvider);
 
-    // Load messages for this conversation
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      final chatNotifier = ref.read(chatProvider(widget.device.id).notifier);
-      chatNotifier.loadMessagesForConversation(widget.device.id);
-    });
+    // Load messages for this conversation on first build
+    if (_currentDeviceId != widget.device.id) {
+      _currentDeviceId = widget.device.id;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        final chatNotifier = ref.read(chatProvider(widget.device.id).notifier);
+        chatNotifier.loadMessagesForConversation(widget.device.id);
+      });
+    }
 
     return Scaffold(
       appBar: AppBar(

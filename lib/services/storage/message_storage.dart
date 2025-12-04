@@ -38,14 +38,23 @@ class MessageStorage {
   }
 
   // Get messages for a specific conversation
+  // Matches messages where the other device is either sender or receiver
   static List<MessageModel> getMessagesForConversation(String otherDeviceId) {
     try {
-      return _messagesBox?.values
-              .where((message) =>
-                  message.senderId == otherDeviceId ||
-                  message.receiverId == otherDeviceId)
-              .toList() ??
-          [];
+      final allMessages = _messagesBox?.values.toList() ?? [];
+      // Filter messages where the other device is involved
+      // Either the other device sent to us, or we sent to the other device
+      final conversationMessages = allMessages.where((message) {
+        // Match if other device is sender (we received from them)
+        // OR if other device is receiver (we sent to them)
+        return message.senderId == otherDeviceId || 
+               message.receiverId == otherDeviceId;
+      }).toList();
+      
+      // Sort by timestamp
+      conversationMessages.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+      
+      return conversationMessages;
     } catch (e) {
       Logger.error('Error getting messages for conversation', e);
       return [];

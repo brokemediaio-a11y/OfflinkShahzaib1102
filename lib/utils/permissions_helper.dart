@@ -1,5 +1,4 @@
 import 'package:permission_handler/permission_handler.dart';
-import 'package:flutter/services.dart';
 import 'logger.dart';
 
 class PermissionsHelper {
@@ -8,8 +7,9 @@ class PermissionsHelper {
     try {
       // For Android 12+ (API 31+), we need BLUETOOTH_SCAN and BLUETOOTH_CONNECT
       // For older versions, use the legacy BLUETOOTH permission
-      if (await Permission.bluetoothScan.isGranted && 
-          await Permission.bluetoothConnect.isGranted) {
+      if (await Permission.bluetoothScan.isGranted &&
+          await Permission.bluetoothConnect.isGranted &&
+          await _isBluetoothAdvertiseGranted()) {
         return true;
       }
       // Fallback for older Android versions
@@ -42,16 +42,21 @@ class PermissionsHelper {
         // Request BLUETOOTH_CONNECT permission
         var connectStatus = await Permission.bluetoothConnect.request();
         Logger.info('BLUETOOTH_CONNECT status: ${connectStatus.toString()}');
+
+        var advertiseStatus = await Permission.bluetoothAdvertise.request();
+        Logger.info('BLUETOOTH_ADVERTISE status: ${advertiseStatus.toString()}');
         
         // Both are required for Android 12+
-        if (scanStatus.isGranted && connectStatus.isGranted) {
+        if (scanStatus.isGranted && connectStatus.isGranted && advertiseStatus.isGranted) {
           Logger.info('Bluetooth permissions granted (Android 12+)');
           return true;
         }
         
         // If at least one is granted, log it
-        if (scanStatus.isGranted || connectStatus.isGranted) {
-          Logger.warning('Partial Bluetooth permissions: SCAN=${scanStatus.isGranted}, CONNECT=${connectStatus.isGranted}');
+        if (scanStatus.isGranted || connectStatus.isGranted || advertiseStatus.isGranted) {
+          Logger.warning(
+            'Partial Bluetooth permissions: SCAN=${scanStatus.isGranted}, CONNECT=${connectStatus.isGranted}, ADVERTISE=${advertiseStatus.isGranted}',
+          );
         }
       } catch (e) {
         Logger.debug('New Bluetooth permissions not available, trying legacy: ${e.toString()}');
@@ -144,6 +149,15 @@ class PermissionsHelper {
   static Future<bool> areAllPermissionsGranted() async {
     final permissions = await checkAllPermissions();
     return permissions.values.every((granted) => granted);
+  }
+
+  static Future<bool> _isBluetoothAdvertiseGranted() async {
+    try {
+      final status = await Permission.bluetoothAdvertise.status;
+      return status.isGranted;
+    } catch (_) {
+      return true;
+    }
   }
 }
 

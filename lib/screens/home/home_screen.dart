@@ -21,6 +21,50 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   void initState() {
     super.initState();
     // Connection manager is already initialized in splash screen
+    // Listen for incoming connections to show chat navigation
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _setupConnectionListener();
+    });
+  }
+
+  void _setupConnectionListener() {
+    // Listen for connection state changes
+    ref.listen<ConnectionProviderState>(connectionProvider, (previous, next) {
+      // If we just got connected and weren't connected before, show option to open chat
+      if (previous?.state != ConnectionStateType.connected &&
+          next.state == ConnectionStateType.connected &&
+          next.connectedDevice != null &&
+          mounted) {
+        _showConnectionDialog(next.connectedDevice!);
+      }
+    });
+  }
+
+  void _showConnectionDialog(DeviceModel device) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Device Connected'),
+        content: Text('Connected to ${device.name}\n\nOpen chat to start messaging?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Later'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.of(context).pop();
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => ChatScreen(device: device),
+                ),
+              );
+            },
+            child: const Text('Open Chat'),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _connectToDevice(DeviceModel device) async {
@@ -57,18 +101,74 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         backgroundColor: AppColors.primary,
         foregroundColor: AppColors.textLight,
         actions: [
-          // Connection status indicator
-          if (connectionState.state == ConnectionStateType.connected)
+          // Permanent Chat Button - always visible when connected
+          if (connectionState.state == ConnectionStateType.connected &&
+              connectionState.connectedDevice != null)
             IconButton(
-              icon: const Icon(Icons.info_outline),
+              icon: const Icon(Icons.chat),
+              tooltip: 'Open Chat',
               onPressed: () {
                 Navigator.of(context).push(
                   MaterialPageRoute(
-                    builder: (_) => const ConnectionStatusScreen(),
+                    builder: (_) => ChatScreen(device: connectionState.connectedDevice!),
                   ),
                 );
               },
             ),
+          // Menu button to access all screens
+          PopupMenuButton<String>(
+            icon: const Icon(Icons.more_vert),
+            onSelected: (value) {
+              switch (value) {
+                case 'chat':
+                  if (connectionState.connectedDevice != null) {
+                    Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) => ChatScreen(device: connectionState.connectedDevice!),
+                      ),
+                    );
+                  } else {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('No device connected'),
+                        backgroundColor: AppColors.error,
+                      ),
+                    );
+                  }
+                  break;
+                case 'connection':
+                  Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => const ConnectionStatusScreen(),
+                    ),
+                  );
+                  break;
+              }
+            },
+            itemBuilder: (context) => [
+              if (connectionState.state == ConnectionStateType.connected)
+                const PopupMenuItem(
+                  value: 'chat',
+                  child: Row(
+                    children: [
+                      Icon(Icons.chat, size: 20),
+                      SizedBox(width: 8),
+                      Text('Open Chat'),
+                    ],
+                  ),
+                ),
+              const PopupMenuItem(
+                value: 'connection',
+                child: Row(
+                  children: [
+                    Icon(Icons.info_outline, size: 20),
+                    SizedBox(width: 8),
+                    Text('Connection Status'),
+                  ],
+                ),
+              ),
+            ],
+          ),
         ],
       ),
       body: Column(

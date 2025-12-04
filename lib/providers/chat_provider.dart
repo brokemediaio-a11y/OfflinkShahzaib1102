@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:uuid/uuid.dart';
 import '../models/message_model.dart';
@@ -36,13 +37,15 @@ class ChatState {
 
 class ChatNotifier extends StateNotifier<ChatState> {
   final ConnectionNotifier _connectionNotifier;
-  final String _currentDeviceId;
+  final String _myDeviceId; // Our own device ID (for sending messages)
+  final String _otherDeviceId; // The device we're chatting with
   StreamSubscription<String>? _messageSubscription;
 
-  ChatNotifier(ConnectionNotifier connectionNotifier, String currentDeviceId)
+  ChatNotifier(ConnectionNotifier connectionNotifier, String myDeviceId, String otherDeviceId)
       : _connectionNotifier = connectionNotifier,
-        _currentDeviceId = currentDeviceId,
-        super(ChatState(currentDeviceId: currentDeviceId)) {
+        _myDeviceId = myDeviceId,
+        _otherDeviceId = otherDeviceId,
+        super(ChatState(currentDeviceId: otherDeviceId)) {
     _loadMessages();
     _setupMessageListener();
   }
@@ -55,11 +58,12 @@ class ChatNotifier extends StateNotifier<ChatState> {
 
   Future<void> _loadMessages() async {
     try {
-      final allMessages = MessageStorage.getAllMessages();
-      // Filter messages for current conversation
-      // For now, we'll load all messages
-      state = state.copyWith(messages: allMessages);
-      Logger.info('Loaded ${allMessages.length} messages');
+      // Load messages for the conversation with the other device
+      final messages = MessageStorage.getMessagesForConversation(_otherDeviceId);
+      // Sort messages by timestamp
+      messages.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+      state = state.copyWith(messages: messages);
+      Logger.info('Loaded ${messages.length} messages for conversation with: $_otherDeviceId');
     } catch (e) {
       Logger.error('Error loading messages', e);
       state = state.copyWith(error: 'Failed to load messages');
@@ -73,8 +77,8 @@ class ChatNotifier extends StateNotifier<ChatState> {
       final message = MessageModel(
         id: const Uuid().v4(),
         content: content.trim(),
-        senderId: _currentDeviceId,
-        receiverId: receiverId,
+        senderId: _myDeviceId, // Our own device ID
+        receiverId: receiverId, // The device we're sending to
         timestamp: DateTime.now(),
         status: MessageStatus.sending,
         isSent: true,
@@ -91,10 +95,9 @@ class ChatNotifier extends StateNotifier<ChatState> {
       await MessageStorage.saveMessage(message);
 
       // Send via connection manager
-      final messageJson = message.toJson();
-      final sent = await _connectionNotifier.sendMessage(
-        messageJson.toString(),
-      );
+      // Convert message to JSON string properly using jsonEncode
+      final messageJson = jsonEncode(message.toJson());
+      final sent = await _connectionNotifier.sendMessage(messageJson);
 
       if (sent) {
         // Update message status to sent
@@ -147,36 +150,128 @@ class ChatNotifier extends StateNotifier<ChatState> {
 
   void receiveMessage(String messageJson) {
     try {
-      // Parse message JSON
-      // For now, we'll create a simple message
-      final message = MessageModel(
-        id: const Uuid().v4(),
-        content: messageJson, // Simplified - should parse JSON
-        senderId: 'other', // Should extract from JSON
-        receiverId: _currentDeviceId,
-        timestamp: DateTime.now(),
-        status: MessageStatus.delivered,
-        isSent: false,
-      );
+      Logger.info('Received message JSON: $messageJson');
+      
+      // Parse the JSON string to extract the message data
+      final jsonMap = _parseJsonString(messageJson);
+      
+      MessageModel message;
+      
+      if (jsonMap != null) {
+        // Parse from JSON
+        message = MessageModel.fromJson(jsonMap);
+        // Mark as received (not sent by this device)
+        // The receiverId should be our device ID (the one receiving)
+        message = message.copyWith(
+          receiverId: _myDeviceId, // Our device ID (we're receiving)
+          isSent: false,
+          status: MessageStatus.delivered,
+        );
+        Logger.info('Parsed message from JSON: ${message.content} from ${message.senderId}');
+      } else {
+        // Fallback: treat as plain text message
+        Logger.warning('Could not parse message JSON, treating as plain text: $messageJson');
+        message = MessageModel(
+          id: const Uuid().v4(),
+          content: messageJson,
+          senderId: _otherDeviceId, // Assume it's from the device we're chatting with
+          receiverId: _myDeviceId, // We're receiving it
+          timestamp: DateTime.now(),
+          status: MessageStatus.delivered,
+          isSent: false,
+        );
+      }
+
+      // Check if message already exists (avoid duplicates)
+      final exists = state.messages.any((m) => m.id == message.id);
+      if (exists) {
+        Logger.debug('Message already exists, skipping: ${message.id}');
+        return;
+      }
+
+      // Check if message is for this conversation
+      // Message is for this conversation if:
+      // 1. The sender is the device we're chatting with (they sent it to us)
+      // 2. OR the receiver is the device we're chatting with (we sent it to them)
+      final isForThisConversation = message.senderId == _otherDeviceId || 
+                                     message.receiverId == _otherDeviceId;
+      
+      if (!isForThisConversation) {
+        Logger.debug('Message not for this conversation. Sender: ${message.senderId}, Receiver: ${message.receiverId}, Chatting with: $_otherDeviceId');
+        // Still save it to storage, but don't add to current state
+        MessageStorage.saveMessage(message);
+        return;
+      }
 
       // Add to state
+      final updatedMessages = [...state.messages, message];
+      // Sort by timestamp
+      updatedMessages.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+      
       state = state.copyWith(
-        messages: [...state.messages, message],
+        messages: updatedMessages,
       );
 
       // Save to local storage
       MessageStorage.saveMessage(message);
-      Logger.info('Message received and saved');
+      Logger.info('Message received and saved: ${message.content}');
+    } catch (e, stackTrace) {
+      Logger.error('Error receiving message', e, stackTrace);
+      // Try to save as plain text message as fallback
+      try {
+        final fallbackMessage = MessageModel(
+          id: const Uuid().v4(),
+          content: messageJson,
+          senderId: _otherDeviceId, // Assume from device we're chatting with
+          receiverId: _myDeviceId, // We're receiving it
+          timestamp: DateTime.now(),
+          status: MessageStatus.delivered,
+          isSent: false,
+        );
+        final updatedMessages = [...state.messages, fallbackMessage];
+        updatedMessages.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+        state = state.copyWith(
+          messages: updatedMessages,
+        );
+        MessageStorage.saveMessage(fallbackMessage);
+      } catch (e2) {
+        Logger.error('Error saving fallback message', e2);
+      }
+    }
+  }
+
+  Map<String, dynamic>? _parseJsonString(String jsonString) {
+    try {
+      // Remove any leading/trailing whitespace
+      final cleaned = jsonString.trim();
+      
+      // Handle case where JSON might be wrapped in quotes or have extra characters
+      String jsonToParse = cleaned;
+      if (cleaned.startsWith('"') && cleaned.endsWith('"')) {
+        // Remove surrounding quotes
+        jsonToParse = cleaned.substring(1, cleaned.length - 1);
+        // Unescape JSON string
+        jsonToParse = jsonToParse.replaceAll('\\"', '"').replaceAll('\\n', '\n');
+      }
+      
+      // Parse JSON string to Map
+      final decoded = jsonDecode(jsonToParse) as Map<String, dynamic>;
+      return decoded;
     } catch (e) {
-      Logger.error('Error receiving message', e);
+      Logger.error('Error parsing JSON string: $jsonString', e);
+      return null;
     }
   }
 
   Future<void> loadMessagesForConversation(String otherDeviceId) async {
     try {
-      final messages = MessageStorage.getMessagesForConversation(otherDeviceId);
+      // Get messages where the other device is involved
+      // This includes messages we sent to them AND messages they sent to us
+      final messages = MessageStorage.getMessagesForConversation(_otherDeviceId);
+      // Sort messages by timestamp
+      messages.sort((a, b) => a.timestamp.compareTo(b.timestamp));
       state = state.copyWith(messages: messages);
-      Logger.info('Loaded messages for conversation: $otherDeviceId');
+      Logger.info('Loaded ${messages.length} messages for conversation with: $_otherDeviceId');
     } catch (e) {
       Logger.error('Error loading conversation messages', e);
       state = state.copyWith(error: 'Failed to load messages');
@@ -201,9 +296,10 @@ final currentDeviceIdProvider = Provider<String>((ref) {
 });
 
 // Provider for ChatNotifier
-final chatProvider = StateNotifierProvider.family<ChatNotifier, ChatState, String>((ref, receiverId) {
+// The parameter is the device we're chatting with (otherDeviceId)
+final chatProvider = StateNotifierProvider.family<ChatNotifier, ChatState, String>((ref, otherDeviceId) {
   final connectionNotifier = ref.watch(connectionProvider.notifier);
-  final currentDeviceId = ref.watch(currentDeviceIdProvider);
-  return ChatNotifier(connectionNotifier, currentDeviceId);
+  final myDeviceId = ref.watch(currentDeviceIdProvider);
+  return ChatNotifier(connectionNotifier, myDeviceId, otherDeviceId);
 });
 

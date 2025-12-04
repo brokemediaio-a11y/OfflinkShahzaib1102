@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../core/constants.dart';
 import '../models/device_model.dart';
 import '../services/communication/connection_manager.dart';
 import '../utils/logger.dart';
@@ -34,24 +35,38 @@ class DeviceState {
 
 class DeviceNotifier extends StateNotifier<DeviceState> {
   final ConnectionManager _connectionManager;
-  StreamSubscription<List<DeviceModel>>? _bleSubscription;
-  StreamSubscription<List<DeviceModel>>? _wifiSubscription;
+  StreamSubscription<List<DeviceModel>>? _deviceSubscription;
+  Timer? _scanTimer;
 
   DeviceNotifier(this._connectionManager) : super(DeviceState()) {
     _setupListeners();
   }
 
   void _setupListeners() {
-    // Note: We'll update devices through the connection manager's methods
-    // For now, devices will be updated when scan results come in
+    _deviceSubscription =
+        _connectionManager.getDiscoveredDevices().listen((devices) {
+      state = state.copyWith(discoveredDevices: devices);
+    });
   }
 
   Future<void> startScan() async {
     try {
-      state = state.copyWith(isScanning: true, error: null);
+      _scanTimer?.cancel();
+      state = state.copyWith(
+        discoveredDevices: [],
+        isScanning: true,
+        error: null,
+      );
       await _connectionManager.startScan();
+      _scanTimer = Timer(AppConstants.bleScanTimeout, () async {
+        await _connectionManager.stopScan();
+        if (mounted) {
+          state = state.copyWith(isScanning: false);
+        }
+      });
       Logger.info('Device scan started');
     } catch (e) {
+      _scanTimer?.cancel();
       state = state.copyWith(
         isScanning: false,
         error: 'Failed to start scan: ${e.toString()}',
@@ -62,6 +77,7 @@ class DeviceNotifier extends StateNotifier<DeviceState> {
 
   Future<void> stopScan() async {
     try {
+      _scanTimer?.cancel();
       await _connectionManager.stopScan();
       state = state.copyWith(isScanning: false);
       Logger.info('Device scan stopped');
@@ -84,8 +100,8 @@ class DeviceNotifier extends StateNotifier<DeviceState> {
 
   @override
   void dispose() {
-    _bleSubscription?.cancel();
-    _wifiSubscription?.cancel();
+    _scanTimer?.cancel();
+    _deviceSubscription?.cancel();
     super.dispose();
   }
 }
