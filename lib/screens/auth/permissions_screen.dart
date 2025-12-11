@@ -24,11 +24,30 @@ class _PermissionsScreenState extends ConsumerState<PermissionsScreen> {
   };
 
   bool _isLoading = false;
+  bool _isNearbyDevicesSupported = false;
 
   @override
   void initState() {
     super.initState();
-    _checkPermissions();
+    _initializePermissions();
+  }
+
+  Future<void> _initializePermissions() async {
+    // First check if Nearby Devices permission is supported
+    await _checkNearbyDevicesSupport();
+    // Then check all permissions
+    await _checkPermissions();
+  }
+
+  Future<void> _checkNearbyDevicesSupport() async {
+    final isSupported = await PermissionsHelper.isNearbyDevicesPermissionSupported();
+    setState(() {
+      _isNearbyDevicesSupported = isSupported;
+      // If not supported, automatically mark as granted
+      if (!isSupported) {
+        _permissions['nearbyDevices'] = true;
+      }
+    });
   }
 
   Future<void> _checkPermissions() async {
@@ -36,6 +55,10 @@ class _PermissionsScreenState extends ConsumerState<PermissionsScreen> {
     final permissions = await PermissionsHelper.checkAllPermissions();
     setState(() {
       _permissions = permissions;
+      // Ensure nearbyDevices is marked as granted if not supported on this device
+      if (!_isNearbyDevicesSupported) {
+        _permissions['nearbyDevices'] = true;
+      }
       _isLoading = false;
     });
   }
@@ -60,9 +83,15 @@ class _PermissionsScreenState extends ConsumerState<PermissionsScreen> {
           }
           break;
         case 'nearbyDevices':
-          granted = await PermissionsHelper.requestNearbyDevicesPermission();
-          if (!granted) {
-            errorMessage = 'Nearby devices permission is required.';
+          // Only request if supported on this device
+          if (_isNearbyDevicesSupported) {
+            granted = await PermissionsHelper.requestNearbyDevicesPermission();
+            if (!granted) {
+              errorMessage = 'Nearby devices permission is required.';
+            }
+          } else {
+            // On older devices, this permission doesn't exist, so consider it granted
+            granted = true;
           }
           break;
       }
@@ -75,6 +104,10 @@ class _PermissionsScreenState extends ConsumerState<PermissionsScreen> {
       _permissions[permission] = granted;
       _isLoading = false;
     });
+
+    // After requesting any permission, refresh ALL permissions to update the UI.
+    // Bluetooth and Nearby Devices permissions are separate on Android 12+ and must be requested independently.
+    await _checkPermissions();
 
     // Show error message if permission was denied
     if (!granted && errorMessage != null && mounted) {
@@ -96,7 +129,14 @@ class _PermissionsScreenState extends ConsumerState<PermissionsScreen> {
   }
 
   bool get _allPermissionsGranted {
-    return _permissions.values.every((granted) => granted);
+    // Check only the permissions that are relevant for this device
+    final bluetoothGranted = _permissions['bluetooth'] ?? false;
+    final locationGranted = _permissions['location'] ?? false;
+    final nearbyDevicesGranted = _isNearbyDevicesSupported 
+        ? (_permissions['nearbyDevices'] ?? false)
+        : true; // Not required on older devices
+    
+    return bluetoothGranted && locationGranted && nearbyDevicesGranted;
   }
 
   Future<void> _continue() async {
@@ -169,15 +209,17 @@ class _PermissionsScreenState extends ConsumerState<PermissionsScreen> {
                     onTap: () => _requestPermission('location'),
                     icon: Icons.location_on,
                   ),
-                  const SizedBox(height: 16),
-                  // Nearby Devices Permission
-                  _PermissionCard(
-                    title: AppStrings.nearbyDevicesPermission,
-                    description: 'Required for discovering nearby devices',
-                    isGranted: _permissions['nearbyDevices'] ?? false,
-                    onTap: () => _requestPermission('nearbyDevices'),
-                    icon: Icons.devices,
-                  ),
+                  // Nearby Devices Permission (only show on Android 12+)
+                  if (_isNearbyDevicesSupported) ...[
+                    const SizedBox(height: 16),
+                    _PermissionCard(
+                      title: AppStrings.nearbyDevicesPermission,
+                      description: 'Required for discovering nearby devices',
+                      isGranted: _permissions['nearbyDevices'] ?? false,
+                      onTap: () => _requestPermission('nearbyDevices'),
+                      icon: Icons.devices,
+                    ),
+                  ],
                   const SizedBox(height: 24),
                   // Continue Button
                   ElevatedButton(

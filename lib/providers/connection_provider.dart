@@ -4,6 +4,11 @@ import '../models/device_model.dart';
 import '../services/communication/connection_manager.dart';
 import '../utils/logger.dart';
 import 'device_provider.dart';
+import 'conversations_provider.dart';
+import 'chat_provider.dart';
+import '../models/message_model.dart';
+import '../services/storage/message_storage.dart';
+import 'dart:convert';
 
 class ConnectionProviderState {
   final ConnectionStateType state;
@@ -42,10 +47,11 @@ enum ConnectionStateType {
 
 class ConnectionNotifier extends StateNotifier<ConnectionProviderState> {
   final ConnectionManager _connectionManager;
+  final Ref _ref; // Add this to access other providers
   StreamSubscription<ConnectionState>? _connectionSubscription;
   StreamSubscription<String>? _messageSubscription;
 
-  ConnectionNotifier(this._connectionManager) : super(ConnectionProviderState()) {
+  ConnectionNotifier(this._connectionManager, this._ref) : super(ConnectionProviderState()) {
     _setupListeners();
   }
 
@@ -84,6 +90,81 @@ class ConnectionNotifier extends StateNotifier<ConnectionProviderState> {
         }
       },
     );
+
+    // GLOBAL MESSAGE LISTENER - persists across screens
+    _messageSubscription = _connectionManager.incomingMessages.listen(
+      (messageJson) {
+        _handleIncomingMessageGlobally(messageJson);
+      },
+    );
+  }
+
+  void _handleIncomingMessageGlobally(String messageJson) {
+    try {
+      Logger.info('Global message handler received: $messageJson');
+      
+      // Parse the message
+      final jsonMap = _parseJsonString(messageJson);
+      if (jsonMap == null) {
+        Logger.warning('Could not parse message JSON');
+        return;
+      }
+
+      var message = MessageModel.fromJson(jsonMap);
+      message = message.copyWith(
+        isSent: false,
+        status: MessageStatus.delivered,
+      );
+
+      // Save to storage
+      MessageStorage.saveMessage(message);
+
+      // Determine device name (use senderId or get from connected device)
+      String deviceName = message.senderId;
+      if (state.connectedDevice != null && 
+          (state.connectedDevice!.id == message.senderId || 
+           state.connectedDevice!.id == message.receiverId)) {
+        deviceName = state.connectedDevice!.name;
+      }
+
+      // Update conversations list
+      _ref.read(conversationsProvider.notifier).updateConversation(message, deviceName);
+
+      // Try to notify the chat provider for this device if it exists
+      // The chat provider is a family provider, so we need the device ID
+      final senderId = message.senderId;
+      try {
+        // Try to access the chat provider for the sender device
+        // If the chat screen is open for this device, the provider will exist
+        final chatNotifier = _ref.read(chatProvider(senderId).notifier);
+        // Call receiveMessage with the original JSON
+        chatNotifier.receiveMessage(messageJson);
+        Logger.info('Notified chat provider for device: $senderId');
+      } catch (e) {
+        // Chat provider doesn't exist for this device (chat screen not open)
+        // This is fine - messages are saved and will load when chat opens
+        Logger.debug('Chat provider not active for device: $senderId');
+      }
+      
+      Logger.info('Message processed globally: ${message.content}');
+    } catch (e, stackTrace) {
+      Logger.error('Error in global message handler', e, stackTrace);
+    }
+  }
+
+  Map<String, dynamic>? _parseJsonString(String jsonString) {
+    try {
+      final cleaned = jsonString.trim();
+      String jsonToParse = cleaned;
+      if (cleaned.startsWith('"') && cleaned.endsWith('"')) {
+        jsonToParse = cleaned.substring(1, cleaned.length - 1);
+        jsonToParse = jsonToParse.replaceAll('\\"', '"').replaceAll('\\n', '\n');
+      }
+      return jsonDecode(jsonToParse) as Map<String, dynamic>;
+    } catch (e) {
+      Logger.error('Error parsing JSON string', e);
+      return null;
+    }
   }
 
   Future<bool> connectToDevice(DeviceModel device) async {
@@ -142,6 +223,11 @@ class ConnectionNotifier extends StateNotifier<ConnectionProviderState> {
 
   Future<bool> sendMessage(String message) async {
     try {
+      // Check if connected before sending
+      if (state.state != ConnectionStateType.connected) {
+        Logger.warning('Cannot send message: not connected to any device');
+        return false;
+      }
       return await _connectionManager.sendMessage(message);
     } catch (e) {
       Logger.error('Error sending message', e);
@@ -164,6 +250,6 @@ class ConnectionNotifier extends StateNotifier<ConnectionProviderState> {
 // Provider for ConnectionNotifier
 final connectionProvider = StateNotifierProvider<ConnectionNotifier, ConnectionProviderState>((ref) {
   final connectionManager = ref.watch(connectionManagerProvider);
-  return ConnectionNotifier(connectionManager);
+  return ConnectionNotifier(connectionManager, ref);
 });
 

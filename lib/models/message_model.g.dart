@@ -106,6 +106,3 @@ class MessageStatusAdapter extends TypeAdapter<MessageStatus> {
           runtimeType == other.runtimeType &&
           typeId == other.typeId;
 }
-
-
-

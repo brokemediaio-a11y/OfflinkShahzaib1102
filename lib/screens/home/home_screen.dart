@@ -8,6 +8,7 @@ import '../../providers/device_provider.dart';
 import '../../providers/connection_provider.dart';
 import '../chat/chat_screen.dart';
 import '../connection/connection_status_screen.dart';
+import '../messages/messages_screen.dart';
 
 class HomeScreen extends ConsumerStatefulWidget {
   const HomeScreen({super.key});
@@ -17,29 +18,9 @@ class HomeScreen extends ConsumerStatefulWidget {
 }
 
 class _HomeScreenState extends ConsumerState<HomeScreen> {
-  @override
-  void initState() {
-    super.initState();
-    // Connection manager is already initialized in splash screen
-    // Listen for incoming connections to show chat navigation
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _setupConnectionListener();
-    });
-  }
-
-  void _setupConnectionListener() {
-    // Listen for connection state changes
-    ref.listen<ConnectionProviderState>(connectionProvider, (previous, next) {
-      // If we just got connected and weren't connected before, show option to open chat
-      if (previous?.state != ConnectionStateType.connected &&
-          next.state == ConnectionStateType.connected &&
-          next.connectedDevice != null &&
-          mounted) {
-        _showConnectionDialog(next.connectedDevice!);
-      }
-    });
-  }
-
+  
+  // Remove the initState listener setup - it's not allowed there
+  
   void _showConnectionDialog(DeviceModel device) {
     showDialog(
       context: context,
@@ -74,7 +55,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     if (!mounted) return;
 
     if (connected) {
-      // Navigate to chat screen
       Navigator.of(context).push(
         MaterialPageRoute(
           builder: (_) => ChatScreen(device: device),
@@ -94,6 +74,16 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   Widget build(BuildContext context) {
     final deviceState = ref.watch(deviceProvider);
     final connectionState = ref.watch(connectionProvider);
+    
+    // Move ref.listen inside build method
+    ref.listen<ConnectionProviderState>(connectionProvider, (previous, next) {
+      if (previous?.state != ConnectionStateType.connected &&
+          next.state == ConnectionStateType.connected &&
+          next.connectedDevice != null &&
+          mounted) {
+        _showConnectionDialog(next.connectedDevice!);
+      }
+    });
 
     return Scaffold(
       appBar: AppBar(
@@ -101,7 +91,22 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         backgroundColor: AppColors.primary,
         foregroundColor: AppColors.textLight,
         actions: [
-          // Permanent Chat Button - always visible when connected
+          IconButton(
+            icon: Stack(
+              children: [
+                const Icon(Icons.message),
+                // You can add a badge here for unread count
+              ],
+            ),
+            tooltip: 'Messages',
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => const MessagesScreen(),
+                ),
+              );
+            },
+          ),
           if (connectionState.state == ConnectionStateType.connected &&
               connectionState.connectedDevice != null)
             IconButton(
@@ -115,7 +120,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 );
               },
             ),
-          // Menu button to access all screens
           PopupMenuButton<String>(
             icon: const Icon(Icons.more_vert),
             onSelected: (value) {
@@ -173,7 +177,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       ),
       body: Column(
         children: [
-          // Scan Button Section
           Container(
             padding: const EdgeInsets.all(AppConstants.defaultPadding),
             color: AppColors.surface,
@@ -206,28 +209,26 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               ],
             ),
           ),
-          // Scanning indicator
           if (deviceState.isScanning)
             Container(
               padding: const EdgeInsets.symmetric(vertical: 8),
               color: AppColors.info.withOpacity(0.1),
-              child: Row(
+              child: const Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  const SizedBox(
+                  SizedBox(
                     width: 16,
                     height: 16,
                     child: CircularProgressIndicator(strokeWidth: 2),
                   ),
-                  const SizedBox(width: 8),
-                  const Text(
+                  SizedBox(width: 8),
+                  Text(
                     AppStrings.scanning,
                     style: TextStyle(color: AppColors.info),
                   ),
                 ],
               ),
             ),
-          // Error message
           if (deviceState.error != null)
             Container(
               padding: const EdgeInsets.all(12),
@@ -250,7 +251,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 ],
               ),
             ),
-          // Device List
           Expanded(
             child: deviceState.discoveredDevices.isEmpty
                 ? Center(
@@ -323,7 +323,6 @@ class _DeviceCard extends StatelessWidget {
           padding: const EdgeInsets.all(16),
           child: Row(
             children: [
-              // Device Icon
               Container(
                 width: 48,
                 height: 48,
@@ -343,7 +342,6 @@ class _DeviceCard extends StatelessWidget {
                 ),
               ),
               const SizedBox(width: 16),
-              // Device Info
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -359,7 +357,7 @@ class _DeviceCard extends StatelessWidget {
                     const SizedBox(height: 4),
                     Row(
                       children: [
-                        Icon(
+                        const Icon(
                           Icons.signal_cellular_alt,
                           size: 14,
                           color: AppColors.textSecondary,
@@ -398,8 +396,7 @@ class _DeviceCard extends StatelessWidget {
                   ],
                 ),
               ),
-              // Connect Icon
-              Icon(
+              const Icon(
                 Icons.arrow_forward_ios,
                 size: 16,
                 color: AppColors.textSecondary,
@@ -411,4 +408,3 @@ class _DeviceCard extends StatelessWidget {
     );
   }
 }
-

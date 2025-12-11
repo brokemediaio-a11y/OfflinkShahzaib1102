@@ -30,6 +30,11 @@ class ConnectionManager {
       _wifiDevices = devices;
       _emitDiscoveredDevices();
     });
+    
+    // Listen for native scan results
+    _nativeScanSubscription = _blePeripheralService.scanResults.listen((result) {
+      _handleNativeScanResult(result);
+    });
   }
 
   final BluetoothService _bluetoothService = BluetoothService();
@@ -46,14 +51,18 @@ class ConnectionManager {
 
   List<DeviceModel> _bleDevices = const <DeviceModel>[];
   List<DeviceModel> _wifiDevices = const <DeviceModel>[];
+  final Map<String, DeviceModel> _nativeScanDevices = {};
 
   bool _peripheralInitialized = false;
   bool _peripheralListening = false;
   bool _isAdvertising = false;
   bool _isInitialized = false;
+  bool _useNativeScanner = false;  // Flag to use native scanner
+  bool _nativeScannerFailed = false;
 
   StreamSubscription<List<DeviceModel>>? _bleDiscoverySubscription;
   StreamSubscription<List<DeviceModel>>? _wifiDiscoverySubscription;
+  StreamSubscription<Map<String, dynamic>>? _nativeScanSubscription;
 
   Stream<ConnectionState> get connectionState => _connectionController.stream;
   Stream<String> get incomingMessages => _messageController.stream;
@@ -61,7 +70,6 @@ class ConnectionManager {
   ConnectionType get currentConnectionType => _currentConnectionType;
   DeviceModel? get connectedDevice => _connectedDevice;
 
-  // Initialize both services
   Future<bool> initialize() async {
     if (_isInitialized) {
       await _ensurePeripheralStarted();
@@ -71,15 +79,10 @@ class ConnectionManager {
       final bleInitialized = await _bluetoothService.initialize();
       final wifiInitialized = await _wifiDirectService.initialize();
 
-      // Set up message listeners
-      // BluetoothService: for when we're the central (scanning/connecting)
       _bluetoothService.incomingMessages.listen((message) {
         Logger.info('Message received via BluetoothService (central): $message');
         _messageController.add(message);
       });
-
-      // Note: BlePeripheralService listener is set up in _ensurePeripheralStarted()
-      // after the service is initialized, to ensure the EventChannel is ready
 
       _wifiDirectService.incomingMessages.listen((message) {
         _messageController.add(message);
@@ -88,15 +91,14 @@ class ConnectionManager {
       final initialized = bleInitialized || wifiInitialized;
       Logger.info(
           'Connection manager initialized (BLE: $bleInitialized, Wi-Fi Direct: $wifiInitialized)');
-      unawaited(_scanLogStorage.logEvent(
-        'Connection manager initialized',
-        metadata: {'ble': bleInitialized, 'wifiDirect': wifiInitialized},
-      ));
+      
+      // Check if we should use native scanner (for TECNO devices)
+      _useNativeScanner = await _shouldUseNativeScanner();
+      Logger.info('Native scanner mode: $_useNativeScanner');
 
       if (initialized) {
         _isInitialized = true;
         if (bleInitialized) {
-          // Fire and forget; errors are logged inside _ensurePeripheralStarted.
           unawaited(_ensurePeripheralStarted());
         }
       }
@@ -104,67 +106,224 @@ class ConnectionManager {
       return initialized;
     } catch (e) {
       Logger.error('Error initializing connection manager', e);
-      unawaited(_scanLogStorage.logEvent(
-        'Connection manager init failure',
-        metadata: {'error': e.toString()},
-      ));
       return false;
     }
   }
 
-  // Start scanning for devices (both BLE and Wi-Fi Direct)
-  Future<void> startScan({bool useBle = true, bool useWifiDirect = false}) async {
+  // Check if device should use native scanner (TECNO and similar devices)
+  Future<bool> _shouldUseNativeScanner() async {
+    if (!Platform.isAndroid) return false;
+    
     try {
-      await _ensurePeripheralStarted();
-      if (useBle) {
-        await _bluetoothService.startScan();
+      final androidInfo = await DeviceInfoPlugin().androidInfo;
+      final manufacturer = androidInfo.manufacturer.toLowerCase();
+      final model = androidInfo.model.toLowerCase();
+      final brand = androidInfo.brand.toLowerCase();
+      
+      Logger.info('Device: manufacturer=$manufacturer, model=$model, brand=$brand');
+      
+      // TECNO and Transsion Holdings devices (TECNO, Infinix, itel)
+      final problematicDevices = [
+        'tecno', 'infinix', 'itel', 'transsion',
+        'cla', 'camon',  // TECNO model identifiers
+      ];
+      
+      for (final pattern in problematicDevices) {
+        if (manufacturer.contains(pattern) || 
+            model.contains(pattern) || 
+            brand.contains(pattern)) {
+          Logger.info('Detected problematic device ($pattern) - will use native scanner');
+          return true;
+        }
       }
-      // Wi-Fi Direct is disabled for now - requires native Android implementation
-      // if (useWifiDirect) {
-      //   await _wifiDirectService.startScan();
-      // }
-      Logger.info('Device scan started (BLE: $useBle, Wi-Fi Direct: disabled)');
+      
+      return false;
+    } catch (e) {
+      Logger.warning('Error detecting device type: $e');
+      return false;
+    }
+  }
+
+  Future<void> startScan({bool useBle = true, bool useWifiDirect = false}) async {
+    bool advertisingWasStopped = false;
+    try {
+      // Clear previous results
+      _nativeScanDevices.clear();
+      
+      try {
+        await _bluetoothService.stopScan();
+        await _blePeripheralService.stopNativeScan();
+      } catch (e) {
+        Logger.debug('No existing scan to stop: $e');
+      }
+      
+      await Future.delayed(const Duration(milliseconds: 500));
+      
+      final shouldStopAdvertising = await _shouldStopAdvertisingForScan();
+      Logger.info('Should stop advertising for scan: $shouldStopAdvertising');
+      
+      if (shouldStopAdvertising) {
+        Logger.info('Suspending peripheral role for scanning');
+        try {
+          await _blePeripheralService.suspendForScanning();
+          Logger.info('Peripheral suspended successfully');
+        } catch (e) {
+          Logger.error('Error suspending peripheral: $e');
+          rethrow;
+        }
+        _isAdvertising = false;
+        advertisingWasStopped = true;
+        
+        // Get appropriate delay for device
+        final delayMs = await _getScanDelayForDevice();
+        Logger.info('Waiting ${delayMs}ms for BLE stack to settle...');
+        await Future.delayed(Duration(milliseconds: delayMs));
+      } else {
+        await _ensurePeripheralStarted();
+      }
+      
+      if (useBle) {
+        // Try native scanner first for problematic devices
+        if (_useNativeScanner && !_nativeScannerFailed) {
+          Logger.info('Using native BLE scanner (TECNO mode)');
+          final result = await _blePeripheralService.startNativeScan(
+            timeoutMs: AppConstants.bleScanTimeout.inMilliseconds,
+          );
+          
+          if (result['success'] == true) {
+            Logger.info('Native scan started successfully');
+            unawaited(_scanLogStorage.logEvent(
+              'Native BLE scan started',
+              metadata: {'retry': result['retry'] ?? 0},
+            ));
+            return;
+          } else {
+            Logger.warning('Native scan failed: ${result['error']}');
+            _nativeScannerFailed = true;  // Fall back to flutter_blue_plus
+          }
+        }
+        
+        // Fall back to flutter_blue_plus
+        Logger.info('Using flutter_blue_plus scanner');
+        await _bluetoothService.startScan();
+        Logger.info('BLE scan started successfully');
+      }
+      
       unawaited(_scanLogStorage.logEvent(
         'Device scan started',
-        metadata: {'ble': useBle, 'wifiDirect': false},
+        metadata: {
+          'ble': useBle,
+          'useNative': _useNativeScanner && !_nativeScannerFailed,
+          'advertisingStopped': advertisingWasStopped
+        },
       ));
     } catch (e) {
       Logger.error('Error starting device scan', e);
       unawaited(_scanLogStorage.logEvent(
         'Device scan start failure',
-        metadata: {'error': e.toString()},
+        metadata: {'error': e.toString(), 'advertisingWasStopped': advertisingWasStopped},
       ));
+      if (advertisingWasStopped) {
+        await _restartAdvertisingAfterScan();
+      }
       rethrow;
     }
   }
 
-  // Stop scanning
-  Future<void> stopScan() async {
-    try {
-      await _bluetoothService.stopScan();
-      // Wi-Fi Direct disabled
-      // await _wifiDirectService.stopScan();
-      Logger.info('Device scan stopped');
-      unawaited(_scanLogStorage.logEvent('Device scan stopped'));
-    } catch (e) {
-      Logger.error('Error stopping device scan', e);
+  // Handle results from native scanner
+  void _handleNativeScanResult(Map<String, dynamic> result) {
+    // Check if it's an error
+    if (result['error'] == true) {
+      Logger.error('Native scan error: ${result['errorName']} (${result['errorCode']})');
       unawaited(_scanLogStorage.logEvent(
-        'Device scan stop failure',
-        metadata: {'error': e.toString()},
+        'Native scan error',
+        metadata: result,
+      ));
+      return;
+    }
+    
+    // Process device result
+    final deviceId = result['id'] as String?;
+    final deviceName = result['name'] as String? ?? 'Unknown Device';
+    final rssi = result['rssi'] as int? ?? -100;
+    
+    if (deviceId != null) {
+      final device = DeviceModel(
+        id: deviceId,
+        name: deviceName,
+        address: deviceId,
+        type: DeviceType.ble,
+        rssi: rssi,
+        lastSeen: DateTime.now(),
+      );
+      
+      Logger.info('Native scan found device: $deviceName ($deviceId)');
+      _nativeScanDevices[deviceId] = device;
+      _emitDiscoveredDevices();
+      
+      unawaited(_scanLogStorage.logEvent(
+        'Native scan device found',
+        metadata: {
+          'deviceId': deviceId,
+          'name': deviceName,
+          'rssi': rssi,
+          'matchedBy': result['matchedBy'],
+        },
       ));
     }
   }
 
-  // Connect to device (automatically chooses BLE or Wi-Fi Direct)
+  Future<void> stopScan() async {
+    try {
+      await _bluetoothService.stopScan();
+      await _blePeripheralService.stopNativeScan();
+      
+      Logger.info('Device scan stopped');
+      unawaited(_scanLogStorage.logEvent('Device scan stopped'));
+      
+      final shouldRestartAdvertising = await _shouldStopAdvertisingForScan();
+      if (shouldRestartAdvertising && !_isAdvertising) {
+        await _restartAdvertisingAfterScan();
+      }
+    } catch (e) {
+      Logger.error('Error stopping device scan', e);
+      final shouldRestartAdvertising = await _shouldStopAdvertisingForScan();
+      if (shouldRestartAdvertising && !_isAdvertising) {
+        unawaited(_restartAdvertisingAfterScan());
+      }
+    }
+  }
+
   Future<bool> connectToDevice(DeviceModel device) async {
     try {
+      // Stop any ongoing scan first to free up Bluetooth resources
+      Logger.info('Stopping scan before connecting to ${device.name}');
+      try {
+        await stopScan();
+        // Wait for Bluetooth resources to be fully released
+        // This is especially important after Classic Discovery or native scanning
+        await Future.delayed(const Duration(milliseconds: 500));
+        Logger.info('Scan stopped, resources released');
+      } catch (e) {
+        Logger.warning('Error stopping scan before connect: $e');
+        // Continue anyway - might not be scanning
+      }
+
       bool connected = false;
 
       if (device.type == DeviceType.ble) {
+        // Additional delay for BLE connections after scanning
+        await Future.delayed(const Duration(milliseconds: 300));
         connected = await _bluetoothService.connectToDevice(device);
         if (connected) {
           _currentConnectionType = ConnectionType.ble;
           _connectedDevice = _bluetoothService.getConnectedDevice();
+          
+          // IMPORTANT: Restart advertising after connecting as central
+          // This allows the other device to discover and connect back to us
+          Logger.info('Connection successful. Restarting advertising so other device can connect back...');
+          await Future.delayed(const Duration(milliseconds: 500)); // Small delay for connection to stabilize
+          unawaited(_ensurePeripheralStarted()); // Restart advertising in background
         }
       } else if (device.type == DeviceType.wifiDirect) {
         connected = await _wifiDirectService.connectToDevice(device);
@@ -177,25 +336,9 @@ class ConnectionManager {
       if (connected && _connectedDevice != null) {
         _connectionController.add(ConnectionState.connected);
         Logger.info('Connected to device: ${device.name}');
-        unawaited(_scanLogStorage.logEvent(
-          'Device connected',
-          metadata: {
-            'deviceId': _connectedDevice!.id,
-            'name': _connectedDevice!.name,
-            'connectionType': _currentConnectionType.name,
-          },
-        ));
       } else {
         _connectionController.add(ConnectionState.disconnected);
         Logger.error('Failed to connect to device: ${device.name}');
-        unawaited(_scanLogStorage.logEvent(
-          'Device connection failed',
-          metadata: {
-            'deviceId': device.id,
-            'name': device.name,
-            'connectionType': device.type.name,
-          },
-        ));
       }
 
       return connected;
@@ -206,7 +349,6 @@ class ConnectionManager {
     }
   }
 
-  // Disconnect from device
   Future<void> disconnect() async {
     try {
       if (_currentConnectionType == ConnectionType.ble) {
@@ -218,18 +360,18 @@ class ConnectionManager {
       _currentConnectionType = ConnectionType.none;
       _connectedDevice = null;
       _connectionController.add(ConnectionState.disconnected);
+      
+      // Restart advertising after disconnection so we can be discovered again
+      Logger.info('Disconnected from device. Restarting advertising...');
+      await Future.delayed(const Duration(milliseconds: 500));
+      unawaited(_ensurePeripheralStarted());
+      
       Logger.info('Disconnected from device');
-      unawaited(_scanLogStorage.logEvent('Device disconnected'));
     } catch (e) {
       Logger.error('Error disconnecting', e);
-      unawaited(_scanLogStorage.logEvent(
-        'Device disconnect failure',
-        metadata: {'error': e.toString()},
-      ));
     }
   }
 
-  // Send message
   Future<bool> sendMessage(String message) async {
     try {
       if (_currentConnectionType == ConnectionType.ble) {
@@ -246,29 +388,26 @@ class ConnectionManager {
     }
   }
 
-  // Check if connected
   bool isConnected() {
     if (_currentConnectionType == ConnectionType.ble) {
       return _bluetoothService.isConnected();
     } else if (_currentConnectionType == ConnectionType.wifiDirect) {
-      // Wi-Fi Direct connection check is async, so we'll use a cached value
       return _connectedDevice != null;
     }
     return false;
   }
 
-  // Get discovered devices from both services
   Stream<List<DeviceModel>> getDiscoveredDevices() {
     return _deviceStreamController.stream;
   }
 
-  // Dispose
   void dispose() {
     _bluetoothService.dispose();
     _wifiDirectService.dispose();
     _blePeripheralService.dispose();
     _bleDiscoverySubscription?.cancel();
     _wifiDiscoverySubscription?.cancel();
+    _nativeScanSubscription?.cancel();
     _connectionController.close();
     _messageController.close();
     _deviceStreamController.close();
@@ -276,9 +415,19 @@ class ConnectionManager {
 
   void _emitDiscoveredDevices() {
     final Map<String, DeviceModel> combined = {};
-    for (final device in [..._bleDevices, ..._wifiDevices]) {
+    
+    // Add devices from all sources
+    for (final device in _bleDevices) {
       combined[device.id] = device;
     }
+    for (final device in _wifiDevices) {
+      combined[device.id] = device;
+    }
+    // Native scan devices have priority (most recent)
+    for (final device in _nativeScanDevices.values) {
+      combined[device.id] = device;
+    }
+    
     _deviceStreamController.add(combined.values.toList());
   }
 
@@ -291,8 +440,6 @@ class ConnectionManager {
           characteristicUuid: AppConstants.bleCharacteristicUuid,
         );
         if (_peripheralInitialized && !_peripheralListening) {
-          // Set up listener for incoming messages from peripheral service
-          // This is for when we're the peripheral (advertising/receiving connections)
           _blePeripheralService.incomingMessages.listen((message) {
             Logger.info('Message received via BlePeripheralService (peripheral): $message');
             _messageController.add(message);
@@ -304,10 +451,6 @@ class ConnectionManager {
 
       if (!_peripheralInitialized) {
         Logger.warning('BLE peripheral not initialized');
-        unawaited(_scanLogStorage.logEvent(
-          'BLE peripheral initialization failed',
-          metadata: {'reason': 'not_supported_or_permission'},
-        ));
         return;
       }
 
@@ -318,22 +461,9 @@ class ConnectionManager {
       _isAdvertising = started;
       if (!started) {
         Logger.warning('Failed to start BLE advertising');
-        unawaited(_scanLogStorage.logEvent(
-          'BLE peripheral advertising failed',
-          metadata: {'deviceName': deviceName},
-        ));
-      } else {
-        unawaited(_scanLogStorage.logEvent(
-          'BLE peripheral advertising started',
-          metadata: {'deviceName': deviceName},
-        ));
       }
     } catch (e) {
       Logger.error('Error setting up BLE peripheral', e);
-      unawaited(_scanLogStorage.logEvent(
-        'BLE peripheral setup failure',
-        metadata: {'error': e.toString()},
-      ));
     }
   }
 
@@ -350,6 +480,84 @@ class ConnectionManager {
       return 'Offlink Device';
     }
   }
+
+  Future<bool> _shouldStopAdvertisingForScan() async {
+    if (!Platform.isAndroid) return false;
+    try {
+      final androidInfo = await DeviceInfoPlugin().androidInfo;
+      return androidInfo.version.sdkInt >= 31;
+    } catch (e) {
+      return true;
+    }
+  }
+
+  Future<int> _getScanDelayForDevice() async {
+    if (!Platform.isAndroid) return 1000;
+    
+    try {
+      final androidInfo = await DeviceInfoPlugin().androidInfo;
+      final manufacturer = androidInfo.manufacturer.toLowerCase();
+      final model = androidInfo.model.toLowerCase();
+      final brand = androidInfo.brand.toLowerCase();
+      
+      Logger.info('Device: manufacturer=$manufacturer, model=$model, brand=$brand');
+      
+      // TECNO devices need very long delays
+      final isTecno = manufacturer.contains('tecno') || 
+                      model.contains('tecno') || 
+                      brand.contains('tecno') ||
+                      manufacturer.contains('transsion') ||
+                      model.contains('cla') ||
+                      model.contains('camon');
+      
+      if (isTecno) {
+        Logger.info('Detected TECNO device - using 6000ms delay');
+        return 6000;
+      }
+      
+      final problematicBrands = ['infinix', 'itel', 'realme', 'oppo', 'vivo', 'xiaomi', 'redmi', 'poco'];
+      
+      for (final brandName in problematicBrands) {
+        if (manufacturer.contains(brandName) || model.contains(brandName) || brand.contains(brandName)) {
+          Logger.info('Detected $brandName device - using 4000ms delay');
+          return 4000;
+        }
+      }
+      
+      return 2500;
+    } catch (e) {
+      Logger.warning('Error detecting device: $e');
+      return 5000;
+    }
+  }
+
+  Future<void> _restartAdvertisingAfterScan() async {
+    try {
+      Logger.info('Resuming peripheral role after scan');
+      await Future.delayed(const Duration(milliseconds: 500));
+      
+      final shouldResumeGattServer = await _shouldStopAdvertisingForScan();
+      if (shouldResumeGattServer) {
+        final resumed = await _blePeripheralService.resumeAfterScanning();
+        if (!resumed) {
+          Logger.error('Failed to resume GATT server');
+          _peripheralInitialized = false;
+        }
+      }
+      
+      final deviceName = await _resolveDeviceName();
+      final started = await _blePeripheralService.startAdvertising(deviceName: deviceName);
+      _isAdvertising = started;
+      if (started) {
+        Logger.info('Peripheral role resumed successfully');
+      } else {
+        Logger.warning('Failed to resume advertising');
+      }
+    } catch (e) {
+      Logger.error('Error resuming peripheral role', e);
+      _isAdvertising = false;
+    }
+  }
 }
 
 enum ConnectionState {
@@ -358,4 +566,3 @@ enum ConnectionState {
   connected,
   error,
 }
-

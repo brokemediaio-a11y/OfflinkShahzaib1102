@@ -5,6 +5,18 @@ import 'core/app_colors.dart';
 import 'screens/splash/splash_screen.dart';
 import 'models/message_model.dart';
 import 'services/storage/message_storage.dart';
+import 'services/storage/device_storage.dart';
+import 'models/conversation_model.dart';
+import 'providers/conversations_provider.dart';
+import 'providers/connection_provider.dart';
+import 'screens/messages/messages_screen.dart';
+import 'screens/chat/chat_screen.dart';
+import 'models/device_model.dart';
+import 'core/app_strings.dart';
+import 'core/constants.dart';
+import 'utils/logger.dart';
+import 'dart:async';
+import 'dart:convert';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -20,9 +32,13 @@ void main() async {
   if (!Hive.isAdapterRegistered(1)) {
     Hive.registerAdapter(MessageStatusAdapter());
   }
+  if (!Hive.isAdapterRegistered(2)) {
+    Hive.registerAdapter(ConversationModelAdapter());
+  }
   
-  // Initialize message storage
+  // Initialize storage
   await MessageStorage.init();
+  await DeviceStorage.init();
   
   runApp(
     const ProviderScope(

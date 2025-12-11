@@ -1,7 +1,22 @@
+import 'dart:io';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:device_info_plus/device_info_plus.dart';
+import 'package:flutter/services.dart';
 import 'logger.dart';
 
 class PermissionsHelper {
+  static const MethodChannel _permissionsChannel =
+      MethodChannel('com.offlink.permissions');
+
+  /// Check if Nearby Devices permission is supported
+  /// Android 11: Uses Location permission
+  /// Android 12: Uses Bluetooth permissions
+  /// Android 13+: Uses NEARBY_WIFI_DEVICES permission
+  static Future<bool> isNearbyDevicesPermissionSupported() async {
+    if (!Platform.isAndroid) return false;
+    // All Android versions support nearby devices through some permission
+    return true;
+  }
   // Check if Bluetooth permission is granted
   static Future<bool> checkBluetoothPermission() async {
     try {
@@ -104,27 +119,168 @@ class PermissionsHelper {
     }
   }
 
-  // Check if Nearby Devices permission is granted (Android 12+)
+  /// Check if Nearby Devices permission is granted
+  /// Android 11 (API 30 and below): Uses Location permission
+  /// Android 12 (API 31-32): Uses Bluetooth permissions
+  /// Android 13+ (API 33+): Uses NEARBY_WIFI_DEVICES permission
   static Future<bool> checkNearbyDevicesPermission() async {
-    try {
-      final status = await Permission.nearbyWifiDevices.status;
-      return status.isGranted;
-    } catch (e) {
-      // Permission might not be available on older Android versions
-      Logger.debug('Nearby Devices permission not available');
-      return true; // Assume granted for older versions
+    if (!Platform.isAndroid) return false;
+
+    final sdkInt = await _getAndroidSdkInt();
+
+    // Android 11 and below: use Location
+    if (sdkInt <= 30) {
+      Logger.debug('Android 11: Checking Location permission for nearby devices');
+      return await checkLocationPermission();
     }
+
+    // Android 12: use Bluetooth permissions
+    if (sdkInt >= 31 && sdkInt <= 32) {
+      Logger.debug('Android 12: Checking Bluetooth permissions for nearby devices');
+      try {
+        final scanGranted = await Permission.bluetoothScan.isGranted;
+        final connectGranted = await Permission.bluetoothConnect.isGranted;
+        final advertiseGranted = await _isBluetoothAdvertiseGranted();
+
+        if (scanGranted && connectGranted && advertiseGranted) {
+          Logger.debug(
+              'Nearby Devices permission granted (via Bluetooth permissions on Android 12)');
+          return true;
+        }
+        Logger.debug(
+            'Nearby Devices permission not granted (Bluetooth permissions partial: SCAN=$scanGranted, CONNECT=$connectGranted, ADVERTISE=$advertiseGranted)');
+        return false;
+      } catch (e) {
+        Logger.error(
+            'Error checking Bluetooth permissions for nearby devices on Android 12: ${e.toString()}',
+            e);
+        return false;
+      }
+    }
+
+    // Android 13+: use NEARBY_WIFI_DEVICES
+    if (sdkInt >= 33) {
+      Logger.debug('Android 13+: Checking NEARBY_WIFI_DEVICES permission');
+      // Native check first
+      try {
+        final result = await _permissionsChannel
+            .invokeMethod<bool>('checkNearbyDevicesPermission');
+        if (result == true) {
+          Logger.debug(
+              'Nearby Devices permission granted (checked via native method on Android 13+)');
+          return true;
+        }
+        Logger.debug(
+            'Nearby Devices permission not granted (checked via native method)');
+      } catch (e) {
+        Logger.debug('Native permission check failed: ${e.toString()}');
+      }
+
+      // Fallback to permission_handler
+      try {
+        final status = await Permission.nearbyWifiDevices.status;
+        Logger.debug(
+            'Nearby Devices permission status via permission_handler: ${status.toString()}');
+        if (status.isGranted) return true;
+
+        if (status.isDenied) {
+          await Future.delayed(const Duration(milliseconds: 300));
+          final retryStatus = await Permission.nearbyWifiDevices.status;
+          Logger.debug(
+              'Nearby Devices permission retry status: ${retryStatus.toString()}');
+          return retryStatus.isGranted;
+        }
+        return false;
+      } catch (e) {
+        Logger.error(
+            'Error checking Nearby Devices permission on Android 13+: ${e.toString()}',
+            e);
+        return false;
+      }
+    }
+
+    Logger.warning(
+        'Unknown Android version for nearby devices permission check: SDK $sdkInt');
+    return false;
   }
 
-  // Request Nearby Devices permission
+  /// Request Nearby Devices permission
+  /// Android 11 (API 30 and below): Requests Location permission
+  /// Android 12 (API 31-32): Requests Bluetooth permissions
+  /// Android 13+ (API 33+): Requests NEARBY_WIFI_DEVICES permission
   static Future<bool> requestNearbyDevicesPermission() async {
-    try {
-      final status = await Permission.nearbyWifiDevices.request();
-      return status.isGranted;
-    } catch (e) {
-      Logger.debug('Nearby Devices permission not available');
-      return true; // Assume granted for older versions
+    if (!Platform.isAndroid) return false;
+
+    final sdkInt = await _getAndroidSdkInt();
+
+    // Already granted?
+    if (await checkNearbyDevicesPermission()) {
+      Logger.debug('Nearby Devices permission already granted');
+      return true;
     }
+
+    if (sdkInt <= 30) {
+      Logger.debug('Android 11: Requesting Location permission for nearby devices');
+      return await requestLocationPermission();
+    }
+
+    if (sdkInt >= 31 && sdkInt <= 32) {
+      Logger.debug('Android 12: Requesting Bluetooth permissions for nearby devices');
+      try {
+        final scanStatus = await Permission.bluetoothScan.request();
+        final connectStatus = await Permission.bluetoothConnect.request();
+        final advertiseStatus = await Permission.bluetoothAdvertise.request();
+
+        Logger.info(
+            'Bluetooth permissions request for nearby devices: SCAN=${scanStatus.toString()}, CONNECT=${connectStatus.toString()}, ADVERTISE=${advertiseStatus.toString()}');
+
+        if (scanStatus.isGranted &&
+            connectStatus.isGranted &&
+            advertiseStatus.isGranted) {
+          Logger.info(
+              'Nearby Devices permission granted (via Bluetooth permissions on Android 12)');
+          return true;
+        }
+
+        Logger.warning(
+            'Nearby Devices permission not granted (partial Bluetooth permissions on Android 12)');
+        return false;
+      } catch (e) {
+        Logger.error(
+            'Error requesting Bluetooth permissions for nearby devices on Android 12: ${e.toString()}',
+            e);
+        return false;
+      }
+    }
+
+    if (sdkInt >= 33) {
+      Logger.debug('Android 13+: Requesting NEARBY_WIFI_DEVICES permission');
+      try {
+        final status = await Permission.nearbyWifiDevices.request();
+        Logger.debug('Nearby Devices permission request result: ${status.toString()}');
+
+        if (status.isDenied || status.isPermanentlyDenied) {
+          await Future.delayed(const Duration(milliseconds: 500));
+          final nativeCheck = await checkNearbyDevicesPermission();
+          if (nativeCheck) {
+            Logger.debug(
+                'Nearby Devices permission granted (detected via native check after request)');
+            return true;
+          }
+        }
+        return status.isGranted;
+      } catch (e) {
+        Logger.error(
+            'Error requesting Nearby Devices permission on Android 13+: ${e.toString()}',
+            e);
+        await Future.delayed(const Duration(milliseconds: 300));
+        return await checkNearbyDevicesPermission();
+      }
+    }
+
+    Logger.warning(
+        'Unknown Android version for nearby devices permission request: SDK $sdkInt');
+    return false;
   }
 
   // Check all required permissions
@@ -157,6 +313,16 @@ class PermissionsHelper {
       return status.isGranted;
     } catch (_) {
       return true;
+    }
+  }
+
+  static Future<int> _getAndroidSdkInt() async {
+    try {
+      final androidInfo = await DeviceInfoPlugin().androidInfo;
+      return androidInfo.version.sdkInt;
+    } catch (e) {
+      Logger.error('Error fetching Android SDK version', e);
+      return 0;
     }
   }
 }
