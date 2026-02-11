@@ -335,37 +335,21 @@ class ConnectionManager {
       if (isConnected) {
         Logger.info('🔵 Central connected to our GATT server: $deviceName ($deviceAddress)');
         
-        // Find UUID from received messages
-        // When we receive: senderId = their UUID, receiverId = our MAC
         String? deviceUuid;
-        final allMessages = MessageStorage.getAllMessages();
         
-        // Get most recent received message where senderId is a UUID
-        // Sort by timestamp, most recent first
-        final sortedMessages = List<MessageModel>.from(allMessages);
-        sortedMessages.sort((a, b) => b.timestamp.compareTo(a.timestamp));
-        
-        // Look for the most recent message we received (isSent = false)
-        // The senderId in that message is the UUID of the device that sent it
-        for (final message in sortedMessages) {
-          if (!message.isSent) {
-            // This is a received message
-            // senderId is the UUID of the device that sent it
-            // receiverId is our MAC address (when we receive)
-            if (!message.senderId.contains(':')) {
-              // senderId is a UUID (no colons)
-              deviceUuid = message.senderId;
-              Logger.info('✅ Found device UUID from most recent received message: $deviceUuid');
-              break;
-            }
-          }
+        // Strategy 1: Check UUID-MAC mapping storage FIRST (most reliable)
+        deviceUuid = DeviceStorage.getUuidForMac(deviceAddress);
+        if (deviceUuid != null) {
+          Logger.info('✅ Found device UUID from UUID-MAC mapping: $deviceUuid');
         }
         
-        // Strategy 2: If still no UUID, check discovered devices for matching MAC
+        // Strategy 2: Check discovered devices
         if (deviceUuid == null) {
           for (final device in _bleDevices) {
             if (device.address == deviceAddress && !device.id.contains(':')) {
               deviceUuid = device.id;
+              // Store mapping for future use
+              DeviceStorage.setMacForUuid(deviceUuid, deviceAddress);
               Logger.info('✅ Found device UUID from discovered devices: $deviceUuid');
               break;
             }
@@ -377,28 +361,49 @@ class ConnectionManager {
           for (final device in _nativeScanDevices.values) {
             if (device.address == deviceAddress && !device.id.contains(':')) {
               deviceUuid = device.id;
+              DeviceStorage.setMacForUuid(deviceUuid, deviceAddress);
               Logger.info('✅ Found device UUID from native scan: $deviceUuid');
               break;
             }
           }
         }
         
-        // If still no UUID, use MAC address as fallback
-        final finalDeviceId = deviceUuid ?? deviceAddress;
+        // Strategy 4: Check messages for UUID associated with this MAC
         if (deviceUuid == null) {
-          Logger.warning('⚠️ Could not find UUID for connected device, using MAC address: $deviceAddress');
+          final allMessages = MessageStorage.getAllMessages();
+          final sortedMessages = List<MessageModel>.from(allMessages);
+          sortedMessages.sort((a, b) => b.timestamp.compareTo(a.timestamp));
+          
+          for (final message in sortedMessages) {
+            if (!message.isSent && !message.senderId.contains(':')) {
+              // Check if we have any message from this UUID that mentions this MAC
+              // This is indirect matching - if we received from a UUID and this MAC connects,
+              // it might be the same device
+              deviceUuid = message.senderId;
+              DeviceStorage.setMacForUuid(deviceUuid, deviceAddress);
+              Logger.info('✅ Found device UUID from messages: $deviceUuid');
+              break;
+            }
+          }
+        }
+        
+        // CRITICAL: Never use MAC as device ID - return early if UUID not found
+        if (deviceUuid == null) {
+          Logger.error('⚠️ Cannot find UUID for peripheral connection with MAC: $deviceAddress');
+          Logger.error('⚠️ Skipping connection to prevent MAC-based device identification');
+          return;
         }
         
         // Get stored name if available
-        final storedName = DeviceStorage.getDeviceDisplayName(finalDeviceId);
+        final storedName = DeviceStorage.getDeviceDisplayName(deviceUuid);
         final finalDeviceName = storedName ?? 
-                                (deviceName != 'Unknown Device' ? deviceName : finalDeviceId);
+                                (deviceName != 'Unknown Device' ? deviceName : deviceUuid);
         
-        // Create device model
+        // Create device model with UUID, never MAC
         final device = DeviceModel(
-          id: finalDeviceId,
+          id: deviceUuid, // UUID, never MAC
           name: finalDeviceName,
-          address: deviceAddress,
+          address: deviceAddress, // MAC only for connection
           type: DeviceType.ble,
           isConnected: true,
         );
@@ -409,27 +414,28 @@ class ConnectionManager {
         _isPeripheralConnection = true;  // Mark as peripheral connection
         _connectionController.add(ConnectionState.connected);
         
-        print('✅✅✅ [CONN_MGR] Peripheral connection TRACKED: $finalDeviceName ($finalDeviceId)');
+        print('✅✅✅ [CONN_MGR] Peripheral connection TRACKED: $finalDeviceName ($deviceUuid)');
         print('   [CONN_MGR] Device address: $deviceAddress');
         print('   [CONN_MGR] Connection type: peripheral (central connected to us)');
-        Logger.info('✅✅✅ Peripheral connection TRACKED: $finalDeviceName ($finalDeviceId)');
+        Logger.info('✅✅✅ Peripheral connection TRACKED: $finalDeviceName ($deviceUuid)');
         Logger.info('   Device address: $deviceAddress');
         Logger.info('   Connection type: peripheral (central connected to us)');
         
         // Store device name if we got a proper name
         if (deviceName.isNotEmpty && 
             deviceName != 'Unknown Device' && 
-            deviceName != finalDeviceId &&
-            !finalDeviceId.contains(':')) {
-          unawaited(DeviceStorage.setDeviceDisplayName(finalDeviceId, deviceName));
+            deviceName != deviceUuid &&
+            !deviceUuid.contains(':')) {
+          unawaited(DeviceStorage.setDeviceDisplayName(deviceUuid, deviceName));
         }
       } else {
         Logger.info('🔴 Central disconnected from our GATT server: $deviceName ($deviceAddress)');
         
         // Only disconnect if this was the connected device
+        // Match by MAC address (since that's what we get from the event)
         if (_isPeripheralConnection && 
             _connectedDevice != null && 
-            (_connectedDevice!.address == deviceAddress || _connectedDevice!.id == deviceAddress)) {
+            _connectedDevice!.address == deviceAddress) {
           _currentConnectionType = ConnectionType.none;
           _connectedDevice = null;
           _isPeripheralConnection = false;
@@ -491,10 +497,17 @@ class ConnectionManager {
           final connectedDevice = _bluetoothService.getConnectedDevice();
           _connectedDevice = connectedDevice;
           
-          // Store the device name if we got a proper name (not "Unknown Device" and not just the deviceId)
+          // Store UUID-MAC mapping and device name
           if (connectedDevice != null) {
             final deviceUuid = connectedDevice.id;
             final deviceName = connectedDevice.name;
+            
+            // Store UUID-MAC mapping
+            if (connectedDevice.address != null && !deviceUuid.contains(':')) {
+              DeviceStorage.setMacForUuid(deviceUuid, connectedDevice.address!);
+            }
+            
+            // Store device name if we got a proper name
             if (deviceUuid.isNotEmpty && 
                 deviceName.isNotEmpty && 
                 deviceName != 'Unknown Device' && 

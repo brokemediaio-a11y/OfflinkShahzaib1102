@@ -5,6 +5,7 @@ import '../../core/constants.dart';
 import '../../utils/logger.dart';
 import '../storage/scan_log_storage.dart';
 import '../storage/device_storage.dart';
+import '../storage/message_storage.dart';
 
 class BluetoothService {
   static final BluetoothService _instance = BluetoothService._internal();
@@ -243,33 +244,42 @@ class BluetoothService {
         Logger.debug('Could not extract UUID from advertisement: $e');
       }
       
-      // Use UUID if extracted, otherwise fallback to MAC address
-      final deviceId = deviceUuid ?? macAddress;
+      // CRITICAL: Only use UUID, never MAC as device ID
+      // If no UUID found, skip this device (it's not an Offlink device)
+      if (deviceUuid == null) {
+        Logger.debug('Skipping device without UUID: $deviceName ($macAddress)');
+        continue; // Skip devices without UUID
+      }
+      
+      // At this point, deviceUuid is guaranteed to be non-null
+      final uuid = deviceUuid;
+      
+      // Store UUID-MAC mapping for future reference
+      unawaited(DeviceStorage.setMacForUuid(uuid, macAddress));
       
       // Check if we have a stored name for this device first
-      final storedName = DeviceStorage.getDeviceDisplayName(deviceId);
+      final storedName = DeviceStorage.getDeviceDisplayName(uuid);
       String displayName = storedName ?? deviceName;
       
       // Store the device name if we got a proper name (not "Unknown Device", not empty, not just UUID/MAC)
-      if (deviceUuid != null && 
-          deviceName.isNotEmpty && 
+      if (deviceName.isNotEmpty && 
           deviceName != 'Unknown Device' && 
-          deviceName != deviceUuid && 
+          deviceName != uuid && 
           deviceName != macAddress &&
-          !deviceUuid.contains(':') && // Only for UUID-based IDs
+          !uuid.contains(':') && // Only for UUID-based IDs
           storedName == null) {
-        unawaited(DeviceStorage.setDeviceDisplayName(deviceUuid, deviceName));
+        unawaited(DeviceStorage.setDeviceDisplayName(uuid, deviceName));
         displayName = deviceName; // Use the discovered name immediately
-        Logger.debug('Storing discovered device name: $deviceUuid -> $deviceName');
+        Logger.debug('Storing discovered device name: $uuid -> $deviceName');
       }
       
       Logger.debug(
-        'BLE scan result: id=$deviceId (MAC: $macAddress) name=$displayName rssi=${result.rssi} '
+        'BLE scan result: id=$uuid (MAC: $macAddress) name=$displayName rssi=${result.rssi} '
         'serviceUuids=$serviceUuids',
       );
 
       final device = DeviceModel(
-        id: deviceId, // Will be UUID if extracted, otherwise MAC
+        id: uuid, // Always UUID, never MAC
         name: displayName, // Use stored name or discovered name
         address: macAddress, // Keep MAC for BLE connection (required by flutter_blue_plus)
         type: DeviceType.ble,
@@ -280,16 +290,11 @@ class BluetoothService {
       // Match by manufacturer data (UUID in 0xFFFF) or device name or service UUID
       // Since we removed device name and service UUID from advertisement to save space,
       // primary matching is now by manufacturer data containing UUID
-      final matchesByManufacturerData = deviceUuid != null;
-      final matchesTargetService = serviceUuids.contains(targetServiceUuid);
-      final matchesByName = displayName.toLowerCase().startsWith('offlink') || 
-                           deviceName.toLowerCase().startsWith('offlink');
-      
-      if (matchesByManufacturerData || matchesTargetService || matchesByName) {
-        _discoveredDevices[device.id] = device;
-        _deviceController.add(_discoveredDevices.values.toList());
-        Logger.info('Found Offlink device: $displayName (UUID: ${device.id}, MAC: $macAddress)');
-      }
+      // deviceUuid is guaranteed to be non-null here (we continue if null above)
+      // If we have a UUID, it's an Offlink device - add it to discovered devices
+      _discoveredDevices[device.id] = device;
+      _deviceController.add(_discoveredDevices.values.toList());
+      Logger.info('Found Offlink device: $displayName (UUID: $uuid, MAC: $macAddress)');
     }
   }
 
@@ -660,45 +665,76 @@ class BluetoothService {
     
     final macAddress = _connectedDevice!.remoteId.str;
     
-    // Try to find the device in discovered devices to get UUID
-    // If not found, use MAC as ID (legacy fallback)
-    DeviceModel discoveredDevice;
+    // CRITICAL: Always try to find UUID first, never use MAC as ID
+    String? deviceUuid;
+    
+    // Strategy 1: Check discovered devices by MAC
     try {
-      discoveredDevice = _discoveredDevices.values.firstWhere(
+      final discoveredDevice = _discoveredDevices.values.firstWhere(
         (d) => d.address == macAddress,
       );
+      deviceUuid = discoveredDevice.id;
+      // Ensure it's a UUID, not MAC
+      if (deviceUuid.contains(':')) {
+        deviceUuid = null; // This is MAC, not UUID
+      }
     } catch (e) {
-      // Device not in discovered list, create a new one
-      discoveredDevice = DeviceModel(
-        id: macAddress, // Fallback to MAC if UUID not found
-        name: platformName,
-        address: macAddress,
-        type: DeviceType.ble,
-        isConnected: true,
-      );
+      // Not in discovered devices
     }
     
-    // Use stored name if available, otherwise use platform name, otherwise use discovered device name
-    final deviceId = discoveredDevice.id;
-    final storedName = DeviceStorage.getDeviceDisplayName(deviceId);
+    // Strategy 2: Check UUID-MAC mapping storage
+    if (deviceUuid == null) {
+      deviceUuid = DeviceStorage.getUuidForMac(macAddress);
+    }
+    
+    // Strategy 3: Check messages for UUID associated with this MAC
+    if (deviceUuid == null) {
+      final allMessages = MessageStorage.getAllMessages();
+      // Find most recent message where receiverId is this MAC (when we received)
+      // or senderId matches a UUID and we have messages with this MAC
+      for (final message in allMessages.reversed) {
+        if (!message.isSent && message.receiverId == macAddress) {
+          // We received from this MAC, senderId should be UUID
+          if (!message.senderId.contains(':')) {
+            deviceUuid = message.senderId;
+            // Store mapping for future use
+            DeviceStorage.setMacForUuid(deviceUuid, macAddress);
+            break;
+          }
+        }
+      }
+    }
+    
+    // CRITICAL: If still no UUID found, return null instead of using MAC
+    // This prevents the UUID-to-MAC conversion issue
+    if (deviceUuid == null) {
+      Logger.error('⚠️ Cannot find UUID for connected device with MAC: $macAddress');
+      Logger.error('⚠️ Returning null to prevent MAC-based device identification');
+      return null;
+    }
+    
+    final storedName = DeviceStorage.getDeviceDisplayName(deviceUuid);
     final finalDeviceName = storedName ?? 
-                           (platformName != 'Unknown Device' && platformName.isNotEmpty && platformName != deviceId ? platformName : discoveredDevice.name);
+                           (platformName != 'Unknown Device' && platformName.isNotEmpty && platformName != deviceUuid ? platformName : 'Unknown Device');
     
     // Store the device name if we got a proper name from platform and it's different
     if (platformName.isNotEmpty && 
         platformName != 'Unknown Device' && 
-        platformName != deviceId &&
+        platformName != deviceUuid &&
         platformName != macAddress &&
-        !deviceId.contains(':') && // Only for UUID-based IDs
+        !deviceUuid.contains(':') && // Only for UUID-based IDs
         storedName == null) {
-      unawaited(DeviceStorage.setDeviceDisplayName(deviceId, platformName));
-      Logger.info('Storing device name from platform after connection: $deviceId -> $platformName');
+      unawaited(DeviceStorage.setDeviceDisplayName(deviceUuid, platformName));
+      Logger.info('Storing device name from platform after connection: $deviceUuid -> $platformName');
     }
     
-    // Return connected device model with updated connection status and name
-    return discoveredDevice.copyWith(
+    // ALWAYS return device with UUID as ID, MAC only in address field
+    return DeviceModel(
+      id: deviceUuid, // UUID, never MAC
+      name: finalDeviceName,
+      address: macAddress, // MAC only for connection purposes
+      type: DeviceType.ble,
       isConnected: true,
-      name: finalDeviceName, // Use stored name or platform name
     );
   }
 

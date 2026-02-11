@@ -106,5 +106,60 @@ class DeviceStorage {
       Logger.error('Error setting device display name', e);
     }
   }
+
+  /// UUID-MAC Mapping: Store MAC address for a UUID
+  static Future<void> setMacForUuid(String uuid, String macAddress) async {
+    try {
+      if (_deviceBox != null) {
+        await _deviceBox!.put('uuid_mac_$uuid', macAddress);
+        Logger.debug('Stored MAC mapping: $uuid -> $macAddress');
+      }
+    } catch (e) {
+      Logger.error('Error storing UUID-MAC mapping', e);
+    }
+  }
+
+  /// UUID-MAC Mapping: Get MAC address for a UUID
+  static String? getMacForUuid(String uuid) {
+    try {
+      return _deviceBox?.get('uuid_mac_$uuid') as String?;
+    } catch (e) {
+      Logger.error('Error getting MAC for UUID', e);
+      return null;
+    }
+  }
+
+  /// UUID-MAC Mapping: Get UUID for a MAC address
+  static String? getUuidForMac(String macAddress) {
+    try {
+      if (_deviceBox == null) return null;
+      
+      // Need to iterate through all keys to find matching MAC
+      // This is not ideal but Hive doesn't support reverse lookups efficiently
+      final keys = _deviceBox!.keys.where((key) => key.toString().startsWith('uuid_mac_'));
+      for (final key in keys) {
+        final storedMac = _deviceBox!.get(key) as String?;
+        if (storedMac == macAddress) {
+          // Extract UUID from key (format: 'uuid_mac_<uuid>')
+          final uuid = key.toString().replaceFirst('uuid_mac_', '');
+          return uuid;
+        }
+      }
+      return null;
+    } catch (e) {
+      Logger.error('Error getting UUID for MAC', e);
+      return null;
+    }
+  }
+
+  /// UUID-MAC Mapping: Remove mapping for a UUID
+  static Future<void> removeMacMapping(String uuid) async {
+    try {
+      await _deviceBox?.delete('uuid_mac_$uuid');
+      Logger.debug('Removed MAC mapping for UUID: $uuid');
+    } catch (e) {
+      Logger.error('Error removing MAC mapping', e);
+    }
+  }
 }
 
