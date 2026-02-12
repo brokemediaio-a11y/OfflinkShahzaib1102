@@ -16,6 +16,15 @@ allprojects {
         google()
         mavenCentral()
     }
+    
+    // Fix for record package missing namespace
+    afterEvaluate { project ->
+        if (project.name == 'record' && project.plugins.hasPlugin('com.android.library')) {
+            project.android {
+                namespace 'com.llfbandit.record'
+            }
+        }
+    }
 }
 
 rootProject.buildDir = '../build'

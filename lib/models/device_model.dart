@@ -83,6 +83,7 @@ class DeviceModel {
 
 enum DeviceType {
   ble,
+  classicBluetooth,
   wifiDirect,
 }
 

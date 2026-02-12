@@ -8,6 +8,32 @@ class PermissionsHelper {
   static const MethodChannel _permissionsChannel =
       MethodChannel('com.offlink.permissions');
 
+  /// Check if location services are enabled (CRITICAL for Android 13+ BLE scanning)
+  static Future<bool> isLocationEnabled() async {
+    if (!Platform.isAndroid) return true; // Not applicable on other platforms
+    
+    try {
+      final result = await _permissionsChannel.invokeMethod<bool>('isLocationEnabled');
+      return result ?? false;
+    } catch (e) {
+      Logger.error('Error checking location services', e);
+      return false;
+    }
+  }
+
+  /// Check if all required Bluetooth permissions are granted (Android 13+)
+  static Future<bool> checkBluetoothPermissions() async {
+    if (!Platform.isAndroid) return true;
+    
+    try {
+      final result = await _permissionsChannel.invokeMethod<bool>('checkBluetoothPermissions');
+      return result ?? false;
+    } catch (e) {
+      Logger.error('Error checking Bluetooth permissions', e);
+      return false;
+    }
+  }
+
   /// Check if Nearby Devices permission is supported
   /// Android 11: Uses Location permission
   /// Android 12: Uses Bluetooth permissions

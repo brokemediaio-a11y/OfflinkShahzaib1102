@@ -1,19 +1,24 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:device_info_plus/device_info_plus.dart';
 import '../../core/constants.dart';
 import '../../models/device_model.dart';
 import '../../models/message_model.dart';
 import '../../utils/logger.dart';
+import '../../utils/permissions_helper.dart';
 import '../storage/scan_log_storage.dart';
 import '../storage/device_storage.dart';
 import '../storage/message_storage.dart';
 import 'ble_peripheral_service.dart';
 import 'bluetooth_service.dart';
+import 'classic_bluetooth_service.dart';
 import 'wifi_direct_service.dart';
+import 'dart:convert';
 
 enum ConnectionType {
   ble,
+  classicBluetooth,
   wifiDirect,
   none,
 }
@@ -47,6 +52,7 @@ class ConnectionManager {
   final BluetoothService _bluetoothService = BluetoothService();
   final WifiDirectService _wifiDirectService = WifiDirectService();
   final BlePeripheralService _blePeripheralService = BlePeripheralService();
+  final ClassicBluetoothService _classicBluetoothService = ClassicBluetoothService();
   final ScanLogStorage _scanLogStorage = ScanLogStorage.instance;
 
   ConnectionType _currentConnectionType = ConnectionType.none;
@@ -87,25 +93,37 @@ class ConnectionManager {
     try {
       final bleInitialized = await _bluetoothService.initialize();
       final wifiInitialized = await _wifiDirectService.initialize();
+      final classicBluetoothInitialized = await _classicBluetoothService.initialize();
 
       _bluetoothService.incomingMessages.listen((message) {
         Logger.info('Message received via BluetoothService (central): $message');
-        _messageController.add(message);
+        _handleIncomingMessage(message);
       });
 
       _wifiDirectService.incomingMessages.listen((message) {
-        _messageController.add(message);
+        _handleIncomingMessage(message);
       });
 
       // Listen for messages from peripheral (when we receive as GATT server)
       _blePeripheralService.incomingMessages.listen((message) {
         Logger.info('Message received via BlePeripheralService (peripheral): $message');
-        _messageController.add(message);
+        _handleIncomingMessage(message);
       });
 
-      final initialized = bleInitialized || wifiInitialized;
+      // Listen for messages from Classic Bluetooth
+      _classicBluetoothService.incomingMessages.listen((message) {
+        Logger.info('Message received via ClassicBluetoothService: $message');
+        _handleIncomingMessage(message);
+      });
+
+      // Listen for Classic Bluetooth connection state changes
+      _classicBluetoothService.connectionState.listen((state) {
+        _handleClassicBluetoothConnectionState(state);
+      });
+
+      final initialized = bleInitialized || wifiInitialized || classicBluetoothInitialized;
       Logger.info(
-          'Connection manager initialized (BLE: $bleInitialized, Wi-Fi Direct: $wifiInitialized)');
+          'Connection manager initialized (BLE: $bleInitialized, Classic Bluetooth: $classicBluetoothInitialized, Wi-Fi Direct: $wifiInitialized)');
       
       // Check if we should use native scanner (for TECNO devices)
       _useNativeScanner = await _shouldUseNativeScanner();
@@ -170,6 +188,32 @@ class ConnectionManager {
         throw Exception('Cannot scan while peripheral connection is active. Device ${_connectedDevice!.name} is already connected.');
       }
       
+      // Android 13+ BLE scanning requirements check
+      if (useBle && Platform.isAndroid) {
+        final androidInfo = await DeviceInfoPlugin().androidInfo;
+        if (androidInfo.version.sdkInt >= 33) {
+          // Android 13+ requires location services to be enabled
+          final locationEnabled = await PermissionsHelper.isLocationEnabled();
+          if (!locationEnabled) {
+            throw Exception(
+              'Location services must be enabled for BLE scanning on Android 13+.\n\n'
+              'Please enable Location in your device settings and try again.'
+            );
+          }
+          
+          // Check all required permissions
+          final permissionsGranted = await PermissionsHelper.checkBluetoothPermissions();
+          if (!permissionsGranted) {
+            throw Exception(
+              'All Bluetooth permissions are required for scanning on Android 13+.\n\n'
+              'Please grant BLUETOOTH_SCAN, BLUETOOTH_CONNECT, BLUETOOTH_ADVERTISE, and Location permissions.'
+            );
+          }
+          
+          Logger.info('✅ Android 13+ BLE requirements verified: Location enabled, permissions granted');
+        }
+      }
+      
       // Clear previous results
       _nativeScanDevices.clear();
       
@@ -213,23 +257,81 @@ class ConnectionManager {
             timeoutMs: AppConstants.bleScanTimeout.inMilliseconds,
           );
           
-          if (result['success'] == true) {
-            Logger.info('Native scan started successfully');
+          // Only consider it successful if it's actually BLE scanning, not Classic discovery
+          if (result['success'] == true && result['mode'] != 'classic') {
+            Logger.info('Native BLE scan started successfully');
             unawaited(_scanLogStorage.logEvent(
               'Native BLE scan started',
-              metadata: {'retry': result['retry'] ?? 0},
+              metadata: {'retry': result['retry'] ?? 0, 'mode': result['mode'] ?? 'ble'},
             ));
             return;
           } else {
-            Logger.warning('Native scan failed: ${result['error']}');
+            Logger.warning('Native scan failed or fell back to Classic: ${result['error'] ?? result['mode']}');
             _nativeScannerFailed = true;  // Fall back to flutter_blue_plus
+            // Continue to flutter_blue_plus below
           }
         }
         
-        // Fall back to flutter_blue_plus
+        // Fall back to flutter_blue_plus (this can work even when native scanner fails)
         Logger.info('Using flutter_blue_plus scanner');
-        await _bluetoothService.startScan();
-        Logger.info('BLE scan started successfully');
+        try {
+          await _bluetoothService.startScan();
+          Logger.info('BLE scan started successfully with flutter_blue_plus');
+          unawaited(_scanLogStorage.logEvent(
+            'flutter_blue_plus scan started',
+            metadata: {'nativeScannerFailed': _nativeScannerFailed},
+          ));
+        } catch (e) {
+          Logger.error('flutter_blue_plus scan also failed: $e');
+          _nativeScannerFailed = true; // Mark as failed so we don't retry
+          
+          // Check if it's a registration failure
+          final errorStr = e.toString().toLowerCase();
+          final isRegistrationFailure = errorStr.contains('registration') || 
+                                       errorStr.contains('application_registration_failed') ||
+                                       errorStr.contains('scan_failed_application_registration_failed');
+          
+          if (isRegistrationFailure) {
+            // Both BLE methods failed with registration error - this is a device limitation
+            // Try Classic discovery as absolute last resort (won't find BLE devices, but we tried everything)
+            Logger.warning('⚠️ Both BLE scanning methods failed with registration error on this device.');
+            Logger.warning('⚠️ This appears to be a device/firmware limitation. Trying Classic discovery as last resort...');
+            
+            unawaited(_scanLogStorage.logEvent(
+              'All BLE scan methods failed - trying Classic discovery',
+              metadata: {'error': e.toString(), 'nativeScannerFailed': _nativeScannerFailed},
+            ));
+            
+            // Try Classic discovery as absolute last resort
+            try {
+              final classicResult = await _blePeripheralService.startNativeScan(
+                timeoutMs: 12000, // Shorter timeout for Classic discovery
+              );
+              
+              if (classicResult['success'] == true && classicResult['mode'] == 'classic') {
+                Logger.warning('⚠️ Using Classic Bluetooth discovery (will not find BLE-only devices)');
+                Logger.warning('⚠️ Note: Classic discovery cannot find BLE devices. Other devices must scan you instead.');
+                return; // Classic discovery started (even though it won't help)
+              }
+            } catch (classicError) {
+              Logger.error('Classic discovery also failed: $classicError');
+            }
+            
+            // All methods failed - throw error with helpful message
+            throw Exception(
+              'Scanning is not available on this device due to a firmware limitation.\n\n'
+              'Solution: Ask the other device to scan for you instead. '
+              'You will receive a connection notification when they find you.'
+            );
+          } else {
+            // Different error - rethrow
+            unawaited(_scanLogStorage.logEvent(
+              'All BLE scan methods failed',
+              metadata: {'error': e.toString(), 'nativeScannerFailed': _nativeScannerFailed},
+            ));
+            rethrow;
+          }
+        }
       }
       
       unawaited(_scanLogStorage.logEvent(
@@ -257,11 +359,21 @@ class ConnectionManager {
   void _handleNativeScanResult(Map<String, dynamic> result) {
     // Check if it's an error
     if (result['error'] == true) {
-      Logger.error('Native scan error: ${result['errorName']} (${result['errorCode']})');
+      final errorCode = result['errorCode'] as int?;
+      final errorName = result['errorName'] as String? ?? 'Unknown error';
+      Logger.error('Native scan error: $errorName (code: $errorCode)');
       unawaited(_scanLogStorage.logEvent(
         'Native scan error',
         metadata: result,
       ));
+      
+      // If it's a registration failure, mark native scanner as failed
+      if (errorCode == 2) { // SCAN_FAILED_APPLICATION_REGISTRATION_FAILED
+        Logger.warning('Native BLE scanner registration failed - marking as failed');
+        _nativeScannerFailed = true;
+        // Note: flutter_blue_plus will be tried by ConnectionManager.startScan()
+        // if it hasn't been tried yet. This error handler is for async failures.
+      }
       return;
     }
     
@@ -269,12 +381,18 @@ class ConnectionManager {
     final deviceId = result['id'] as String?;
     final deviceName = result['name'] as String? ?? 'Unknown Device';
     final rssi = result['rssi'] as int? ?? -100;
+    final discoveryType = result['discoveryType'] as String? ?? 'ble';
     
     if (deviceId != null) {
       // Extract device UUID from scan result (preferred) or use MAC as fallback
       final deviceUuid = result['deviceUuid'] as String?;
       final macAddress = result['macAddress'] as String? ?? deviceId;
       final finalDeviceId = (deviceUuid != null && deviceUuid.isNotEmpty) ? deviceUuid : deviceId;
+      
+      // Determine device type based on discovery type
+      final deviceType = discoveryType == 'classic' 
+          ? DeviceType.classicBluetooth 
+          : DeviceType.ble;
       
       // Check if we have a stored name for this device first
       final storedName = DeviceStorage.getDeviceDisplayName(finalDeviceId);
@@ -298,8 +416,8 @@ class ConnectionManager {
       final device = DeviceModel(
         id: finalDeviceId, // Use UUID if available, otherwise use provided ID
         name: displayName, // Use stored name or discovered name
-        address: macAddress, // Keep MAC for connection purposes (BLE requires MAC to connect)
-        type: DeviceType.ble,
+        address: macAddress, // Keep MAC for connection purposes
+        type: deviceType, // BLE or Classic Bluetooth
         rssi: rssi,
         lastSeen: DateTime.now(),
       );
@@ -317,6 +435,52 @@ class ConnectionManager {
           'matchedBy': result['matchedBy'],
         },
       ));
+    }
+  }
+
+  // Handle Classic Bluetooth connection state changes
+  void _handleClassicBluetoothConnectionState(Map<String, dynamic> state) {
+    try {
+      final isConnected = state['connected'] as bool? ?? false;
+      final deviceAddress = state['deviceAddress'] as String? ?? '';
+      final deviceName = state['deviceName'] as String? ?? 'Unknown Device';
+
+      if (isConnected) {
+        Logger.info('🔵 Classic Bluetooth connected: $deviceName ($deviceAddress)');
+        
+        // Try to get UUID from storage, or use MAC as ID for Classic Bluetooth
+        String? deviceUuid = DeviceStorage.getUuidForMac(deviceAddress);
+        final deviceId = deviceUuid ?? deviceAddress;
+
+        final device = DeviceModel(
+          id: deviceId,
+          name: deviceName,
+          address: deviceAddress,
+          type: DeviceType.classicBluetooth,
+          isConnected: true,
+        );
+
+        _connectedDevice = device;
+        _currentConnectionType = ConnectionType.classicBluetooth;
+        _isPeripheralConnection = false; // Classic Bluetooth is peer-to-peer
+        _connectionController.add(ConnectionState.connected);
+
+        Logger.info('✅✅✅ Classic Bluetooth connection TRACKED: $deviceName ($deviceId)');
+      } else {
+        Logger.info('🔴 Classic Bluetooth disconnected: $deviceName ($deviceAddress)');
+        
+        if (_currentConnectionType == ConnectionType.classicBluetooth &&
+            _connectedDevice != null &&
+            _connectedDevice!.address == deviceAddress) {
+          _currentConnectionType = ConnectionType.none;
+          _connectedDevice = null;
+          _connectionController.add(ConnectionState.disconnected);
+          
+          Logger.info('🔴 Classic Bluetooth connection closed');
+        }
+      }
+    } catch (e, stackTrace) {
+      Logger.error('❌ Error handling Classic Bluetooth connection state', e, stackTrace);
     }
   }
 
@@ -527,6 +691,39 @@ class ConnectionManager {
           await Future.delayed(const Duration(milliseconds: 500)); // Small delay for connection to stabilize
           unawaited(_ensurePeripheralStarted()); // Restart advertising in background
         }
+      } else if (device.type == DeviceType.classicBluetooth) {
+        // Connect via Classic Bluetooth
+        Logger.info('Connecting via Classic Bluetooth to ${device.name}');
+        connected = await _classicBluetoothService.connectToDevice(device);
+        if (connected) {
+          _currentConnectionType = ConnectionType.classicBluetooth;
+          _isPeripheralConnection = false;  // Classic Bluetooth is peer-to-peer
+          _connectedDevice = _classicBluetoothService.connectedDevice;
+          
+          // Store UUID-MAC mapping and device name
+          if (_connectedDevice != null) {
+            final deviceUuid = _connectedDevice!.id;
+            final deviceName = _connectedDevice!.name;
+            
+            // Store UUID-MAC mapping
+            if (_connectedDevice!.address != null && !deviceUuid.contains(':')) {
+              DeviceStorage.setMacForUuid(deviceUuid, _connectedDevice!.address!);
+            }
+            
+            // Store device name if we got a proper name
+            if (deviceUuid.isNotEmpty && 
+                deviceName.isNotEmpty && 
+                deviceName != 'Unknown Device' && 
+                deviceName != deviceUuid &&
+                !deviceUuid.contains(':')) {
+              final storedName = DeviceStorage.getDeviceDisplayName(deviceUuid);
+              if (storedName == null || storedName == deviceUuid) {
+                unawaited(DeviceStorage.setDeviceDisplayName(deviceUuid, deviceName));
+                Logger.info('Stored device name after Classic Bluetooth connection: $deviceUuid -> $deviceName');
+              }
+            }
+          }
+        }
       } else if (device.type == DeviceType.wifiDirect) {
         connected = await _wifiDirectService.connectToDevice(device);
         if (connected) {
@@ -562,6 +759,8 @@ class ConnectionManager {
           // Central connection - actively disconnect
           await _bluetoothService.disconnect();
         }
+      } else if (_currentConnectionType == ConnectionType.classicBluetooth) {
+        await _classicBluetoothService.disconnect();
       } else if (_currentConnectionType == ConnectionType.wifiDirect) {
         await _wifiDirectService.disconnect();
       }
@@ -584,6 +783,15 @@ class ConnectionManager {
 
   Future<bool> sendMessage(String message) async {
     try {
+      // Check if this is a voice message (chunked)
+      Map<String, dynamic>? messageJson;
+      try {
+        messageJson = jsonDecode(message) as Map<String, dynamic>;
+      } catch (e) {
+        // Not JSON, treat as regular text message
+      }
+
+      // Send message based on connection type
       if (_currentConnectionType == ConnectionType.ble) {
         if (_isPeripheralConnection) {
           // We have a central connected to our GATT server → send via peripheral
@@ -594,6 +802,9 @@ class ConnectionManager {
           Logger.info('Sending message via central (BLE client)');
           return await _bluetoothService.sendMessage(message);
         }
+      } else if (_currentConnectionType == ConnectionType.classicBluetooth) {
+        Logger.info('Sending message via Classic Bluetooth');
+        return await _classicBluetoothService.sendMessage(message);
       } else if (_currentConnectionType == ConnectionType.wifiDirect) {
         return await _wifiDirectService.sendMessage(message);
       } else {
@@ -606,9 +817,15 @@ class ConnectionManager {
     }
   }
 
+  void _handleIncomingMessage(String message) {
+    _messageController.add(message);
+  }
+
   bool isConnected() {
     if (_currentConnectionType == ConnectionType.ble) {
       return _bluetoothService.isConnected();
+    } else if (_currentConnectionType == ConnectionType.classicBluetooth) {
+      return _classicBluetoothService.isConnected;
     } else if (_currentConnectionType == ConnectionType.wifiDirect) {
       return _connectedDevice != null;
     }
@@ -623,6 +840,7 @@ class ConnectionManager {
     _bluetoothService.dispose();
     _wifiDirectService.dispose();
     _blePeripheralService.dispose();
+    _classicBluetoothService.dispose();
     _bleDiscoverySubscription?.cancel();
     _wifiDiscoverySubscription?.cancel();
     _nativeScanSubscription?.cancel();

@@ -490,9 +490,10 @@ class BlePeripheralManager(private val context: Context) {
         bleScanner = adapter.bluetoothLeScanner
         
         if (bleScanner == null) {
-            Log.e(tag, "BLE scanner not available, falling back to classic discovery")
-            useClassicDiscovery = true
-            return startClassicDiscovery(timeoutMs)
+            Log.e(tag, "BLE scanner not available, returning failure to try flutter_blue_plus")
+            // Don't fall back to Classic discovery - it can't find BLE devices
+            // Let ConnectionManager try flutter_blue_plus instead
+            return mapOf("success" to false, "error" to "BLE scanner not available")
         }
         
         scanRetryCount.set(0)
@@ -503,10 +504,22 @@ class BlePeripheralManager(private val context: Context) {
         val currentRetry = scanRetryCount.get()
         Log.d(tag, "Starting BLE scan attempt ${currentRetry + 1}/$maxScanRetries")
         
+        // For registration failures, try to clean up and wait longer
+        if (currentRetry > 0) {
+            Log.d(tag, "Retry attempt - waiting longer and cleaning up")
+            try {
+                // Stop any existing scan callbacks
+                stopNativeScan()
+                Thread.sleep(1000L + (currentRetry * 500L)) // Longer delay for retries
+            } catch (e: Exception) {
+                Log.w(tag, "Error during cleanup: ${e.message}")
+            }
+        }
+        
         val scanner = bleScanner
         if (scanner == null) {
-            Log.e(tag, "Scanner is null, falling back to classic discovery")
-            return startClassicDiscovery(timeoutMs)
+            Log.e(tag, "Scanner is null, returning failure to try flutter_blue_plus")
+            return mapOf("success" to false, "error" to "BLE scanner not available")
         }
         
         nativeScanCallback = object : ScanCallback() {
@@ -523,38 +536,54 @@ class BlePeripheralManager(private val context: Context) {
                 isScanning.set(false)
                 
                 if (errorCode == SCAN_FAILED_APPLICATION_REGISTRATION_FAILED) {
-                    // BLE scanner is broken on this device, use classic discovery
-                    Log.w(tag, "BLE scanner registration failed - switching to Classic Bluetooth discovery")
+                    // BLE scanner is broken on this device
+                    // Don't fall back to Classic discovery here - let ConnectionManager try flutter_blue_plus first
+                    // Classic discovery can't find BLE devices anyway
+                    Log.w(tag, "BLE scanner registration failed - returning failure to try flutter_blue_plus")
                     useClassicDiscovery = true
                     
+                    // Return failure so ConnectionManager can try flutter_blue_plus
                     mainHandler.post {
-                        val result = startClassicDiscovery(timeoutMs)
-                        if (result["success"] != true) {
-                            notifyScanError(errorCode)
-                        }
+                        notifyScanError(errorCode)
                     }
                 } else if (scanRetryCount.incrementAndGet() < maxScanRetries) {
                     retryAfterDelay(timeoutMs)
                 } else {
-                    // All retries failed, try classic discovery
-                    Log.w(tag, "All BLE scan retries failed - trying Classic discovery")
+                    // All retries failed - try flutter_blue_plus via ConnectionManager, not Classic discovery
+                    Log.w(tag, "All BLE scan retries failed - returning failure to try flutter_blue_plus")
                     mainHandler.post {
-                        startClassicDiscovery(timeoutMs)
+                        notifyScanError(errorCode)
                     }
                 }
             }
         }
         
-        val scanMode = when (currentRetry) {
-            0 -> ScanSettings.SCAN_MODE_LOW_LATENCY
-            1 -> ScanSettings.SCAN_MODE_BALANCED
-            else -> ScanSettings.SCAN_MODE_LOW_POWER
+        // Android 13+ requires LOW_LATENCY mode for reliable scanning
+        // Use aggressive settings to ensure all advertisements are detected
+        val scanMode = if (Build.VERSION.SDK_INT >= 33) {
+            // Android 13+ - always use LOW_LATENCY
+            ScanSettings.SCAN_MODE_LOW_LATENCY
+        } else {
+            // Android 12 and below - can use different modes for retries
+            when (currentRetry) {
+                0 -> ScanSettings.SCAN_MODE_LOW_LATENCY
+                1 -> ScanSettings.SCAN_MODE_BALANCED
+                else -> ScanSettings.SCAN_MODE_LOW_POWER
+            }
         }
         
-        val settings = ScanSettings.Builder()
+        val settingsBuilder = ScanSettings.Builder()
             .setScanMode(scanMode)
             .setReportDelay(0)
-            .build()
+        
+        // Android 13+ requires aggressive scan settings
+        if (Build.VERSION.SDK_INT >= 33) {
+            settingsBuilder
+                .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
+                .setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
+        }
+        
+        val settings = settingsBuilder.build()
         
         try {
             Log.d(tag, "Starting BLE scan with mode: ${getScanModeName(scanMode)}")
@@ -579,15 +608,16 @@ class BlePeripheralManager(private val context: Context) {
             Log.e(tag, "Exception starting BLE scan", ex)
             isScanning.set(false)
             
-            // Fall back to classic discovery
-            Log.w(tag, "BLE scan exception - trying Classic discovery")
-            return startClassicDiscovery(timeoutMs)
+            // Return failure to let ConnectionManager try flutter_blue_plus
+            Log.w(tag, "BLE scan exception - returning failure to try flutter_blue_plus")
+            return mapOf("success" to false, "error" to (ex.message ?: "BLE scan exception"))
         }
     }
     
     private fun retryAfterDelay(timeoutMs: Long) {
-        val delayMs = 2000L * scanRetryCount.get()
-        Log.d(tag, "Retrying BLE scan in ${delayMs}ms...")
+        val currentRetry = scanRetryCount.get()
+        val delayMs = 1500L + (currentRetry * 1000L) // Progressive delay: 1.5s, 2.5s, 3.5s
+        Log.d(tag, "Retrying BLE scan in ${delayMs}ms (attempt ${currentRetry + 1}/$maxScanRetries)...")
         
         mainHandler.postDelayed({
             startScanWithRetry(timeoutMs)
@@ -600,48 +630,104 @@ class BlePeripheralManager(private val context: Context) {
         val deviceAddress = device.address
         val rssi = result.rssi
         
+        // Android 13+ often doesn't expose Service UUIDs in scan results
+        // We should NOT rely on serviceUuids for device identification
         val serviceUuids = result.scanRecord?.serviceUuids?.map { it.uuid.toString().uppercase() } ?: emptyList()
         
-        // Extract device UUID from manufacturer data (if present)
+        // CRITICAL: Extract device UUID from manufacturer data (manufacturer ID 0xFFFF)
+        // This is the ONLY reliable way to identify devices on Android 13+
         var extractedDeviceUuid: String? = null
         val scanRecord = result.scanRecord
         if (scanRecord != null) {
-            // Check manufacturer data for UUID (manufacturer ID 0xFFFF)
-            val manufacturerData = scanRecord.getManufacturerSpecificData(0xFFFF)
-            if (manufacturerData != null && manufacturerData.size >= 16) {
+            // Method 1: Try getManufacturerSpecificData (standard method)
+            try {
+                val manufacturerData = scanRecord.getManufacturerSpecificData(0xFFFF)
+                if (manufacturerData != null && manufacturerData.size >= 16) {
+                    extractedDeviceUuid = extractUuidFromBytes(manufacturerData)
+                    if (extractedDeviceUuid != null) {
+                        Log.d(tag, "Extracted UUID from manufacturer data (method 1): $extractedDeviceUuid")
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(tag, "Method 1 failed to get manufacturer data", e)
+            }
+            
+            // Method 2: Try parsing all manufacturer data entries (Android 13+ fallback)
+            if (extractedDeviceUuid == null) {
                 try {
-                    // Extract 16-byte UUID (manufacturerData already contains just the UUID bytes)
-                    val uuidBytes = ByteArray(16)
-                    System.arraycopy(manufacturerData, 0, uuidBytes, 0, 16)
-                    
-                    // Convert 16-byte array back to UUID
-                    var msb: Long = 0
-                    var lsb: Long = 0
-                    for (i in 0..7) {
-                        msb = msb or ((uuidBytes[i].toLong() and 0xFF) shl (56 - i * 8))
+                    val allManufacturerData = scanRecord.getManufacturerSpecificData()
+                    if (allManufacturerData != null && allManufacturerData.size() > 0) {
+                        // Iterate through all manufacturer IDs
+                        for (i in 0 until allManufacturerData.size()) {
+                            val manufacturerId = allManufacturerData.keyAt(i)
+                            if (manufacturerId == 0xFFFF) {
+                                val data = allManufacturerData.valueAt(i)
+                                if (data != null && data.size >= 16) {
+                                    extractedDeviceUuid = extractUuidFromBytes(data)
+                                    if (extractedDeviceUuid != null) {
+                                        Log.d(tag, "Extracted UUID from manufacturer data (method 2): $extractedDeviceUuid")
+                                        break
+                                    }
+                                }
+                            }
+                        }
                     }
-                    for (i in 0..7) {
-                        lsb = lsb or ((uuidBytes[8 + i].toLong() and 0xFF) shl (56 - i * 8))
-                    }
-                    val uuid = UUID(msb, lsb)
-                    extractedDeviceUuid = uuid.toString()
-                    Log.d(tag, "Extracted device UUID from advertisement: $extractedDeviceUuid")
                 } catch (e: Exception) {
-                    Log.w(tag, "Failed to extract device UUID from manufacturer data", e)
+                    Log.w(tag, "Method 2 failed to parse manufacturer data", e)
+                }
+            }
+            
+            // Method 3: Try parsing raw advertisement bytes (Android 13+ last resort)
+            // Some OEMs (like TECNO) may structure manufacturer data differently
+            if (extractedDeviceUuid == null && Build.VERSION.SDK_INT >= 33) {
+                try {
+                    val rawBytes = scanRecord.bytes
+                    if (rawBytes != null && rawBytes.size > 0) {
+                        // Parse raw BLE advertisement data
+                        // Manufacturer data AD type is 0xFF, followed by length, manufacturer ID (2 bytes), then data
+                        var i = 0
+                        while (i < rawBytes.size - 1) {
+                            val length = rawBytes[i].toInt() and 0xFF
+                            if (length == 0) break
+                            if (i + length >= rawBytes.size) break
+                            
+                            val adType = rawBytes[i + 1].toInt() and 0xFF
+                            
+                            // AD type 0xFF = Manufacturer Specific Data
+                            if (adType == 0xFF && length >= 19) { // 1 (length) + 1 (type) + 2 (manufacturer ID) + 16 (UUID) = 20 bytes minimum
+                                val manufacturerId = ((rawBytes[i + 2].toInt() and 0xFF) shl 8) or (rawBytes[i + 3].toInt() and 0xFF)
+                                if (manufacturerId == 0xFFFF && length >= 19) {
+                                    // Extract UUID bytes (skip length, type, and manufacturer ID)
+                                    val uuidBytes = ByteArray(16)
+                                    System.arraycopy(rawBytes, i + 4, uuidBytes, 0, 16)
+                                    extractedDeviceUuid = extractUuidFromBytes(uuidBytes)
+                                    if (extractedDeviceUuid != null) {
+                                        Log.d(tag, "Extracted UUID from raw advertisement bytes (method 3): $extractedDeviceUuid")
+                                        break
+                                    }
+                                }
+                            }
+                            
+                            i += length + 1 // Move to next AD structure
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(tag, "Method 3 failed to parse raw advertisement bytes", e)
                 }
             }
         }
         
-        Log.d(tag, "BLE scan result: $deviceName ($deviceAddress) RSSI: $rssi, Services: $serviceUuids, UUID: $extractedDeviceUuid")
+        Log.d(tag, "BLE scan result: $deviceName ($deviceAddress) RSSI: $rssi, Services: ${serviceUuids.size} (may be empty on Android 13+), UUID: $extractedDeviceUuid")
         
-        // Discovery: Check for manufacturer data with our UUID (manufacturer ID 0xFFFF)
-        // Since we removed device name from advertisement to save space, we match by manufacturer data
-        // Service UUID is still available in GATT server for connections
+        // CRITICAL: Device identification MUST use manufacturer data, NOT service UUIDs
+        // On Android 13+, service UUIDs are often null/empty even when device is advertising
         val hasOurManufacturerData = extractedDeviceUuid != null
         
-        // Also check device name as fallback (some devices might still advertise name)
+        // Fallback: Check device name (may be hidden by OEMs, so not reliable)
         val matchesName = deviceName.lowercase().startsWith("offlink")
         
+        // Only accept devices with manufacturer data OR matching name
+        // Do NOT rely on service UUIDs for identification
         if (hasOurManufacturerData || matchesName) {
             Log.d(tag, "Found Offlink device: $deviceName (UUID: $extractedDeviceUuid)")
             
@@ -652,7 +738,7 @@ class BlePeripheralManager(private val context: Context) {
                 "id" to deviceId, // Use UUID if available, otherwise MAC
                 "name" to deviceName,
                 "rssi" to rssi,
-                "serviceUuids" to serviceUuids,
+                "serviceUuids" to serviceUuids, // May be empty on Android 13+ - do NOT rely on this
                 "deviceUuid" to (extractedDeviceUuid ?: ""), // Include UUID separately for reference
                 "macAddress" to deviceAddress, // Keep MAC for connection purposes
                 "matchedBy" to if (hasOurManufacturerData) "manufacturerData" else "name",
@@ -662,6 +748,61 @@ class BlePeripheralManager(private val context: Context) {
             mainHandler.post {
                 scanResultListener?.invoke(resultMap)
             }
+        } else {
+            // Log devices that don't match (for debugging on Android 13+)
+            if (Build.VERSION.SDK_INT >= 33) {
+                Log.d(tag, "Device rejected (no manufacturer data or matching name): $deviceName ($deviceAddress)")
+                // Log raw scan record info for debugging
+                scanRecord?.let { record ->
+                    try {
+                        val allManufacturerData = record.getManufacturerSpecificData()
+                        val manufacturerCount = allManufacturerData?.size() ?: 0
+                        Log.d(tag, "  Available manufacturer IDs: $manufacturerCount")
+                        allManufacturerData?.let { manufacturerData ->
+                            val size = manufacturerData.size()
+                            if (size > 0) {
+                                for (i in 0 until size) {
+                                    val id = manufacturerData.keyAt(i)
+                                    val data = manufacturerData.valueAt(i)
+                                    val dataSize = data?.size ?: 0
+                                    Log.d(tag, "    Manufacturer ID: 0x${id.toString(16)}, Data size: $dataSize")
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.w(tag, "  Could not read manufacturer data: ${e.message}")
+                    }
+                }
+            }
+        }
+    }
+    
+    // Helper function to extract UUID from byte array
+    private fun extractUuidFromBytes(uuidBytes: ByteArray): String? {
+        return try {
+            if (uuidBytes.size < 16) {
+                Log.w(tag, "Manufacturer data too short: ${uuidBytes.size} bytes (need 16)")
+                return null
+            }
+            
+            // Extract 16-byte UUID
+            val bytes = ByteArray(16)
+            System.arraycopy(uuidBytes, 0, bytes, 0, 16)
+            
+            // Convert 16-byte array back to UUID (big-endian)
+            var msb: Long = 0
+            var lsb: Long = 0
+            for (i in 0..7) {
+                msb = msb or ((bytes[i].toLong() and 0xFF) shl (56 - i * 8))
+            }
+            for (i in 0..7) {
+                lsb = lsb or ((bytes[8 + i].toLong() and 0xFF) shl (56 - i * 8))
+            }
+            val uuid = UUID(msb, lsb)
+            uuid.toString().lowercase()
+        } catch (e: Exception) {
+            Log.w(tag, "Failed to extract UUID from bytes", e)
+            null
         }
     }
     

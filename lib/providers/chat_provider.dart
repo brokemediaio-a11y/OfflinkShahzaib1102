@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
+import 'dart:io';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:uuid/uuid.dart';
 import '../models/message_model.dart';
@@ -285,6 +287,7 @@ class ChatNotifier extends StateNotifier<ChatState> {
       if (jsonMap != null) {
         // Parse from JSON
         message = MessageModel.fromJson(jsonMap);
+        
         // Mark as received (not sent by this device)
         // Keep the original receiverId (it's our MAC address when we receive)
         message = message.copyWith(

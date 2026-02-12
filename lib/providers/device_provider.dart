@@ -67,9 +67,15 @@ class DeviceNotifier extends StateNotifier<DeviceState> {
       Logger.info('Device scan started');
     } catch (e) {
       _scanTimer?.cancel();
+      // Extract user-friendly error message
+      String errorMessage = e.toString();
+      if (errorMessage.contains('Exception: ')) {
+        errorMessage = errorMessage.replaceFirst('Exception: ', '');
+      }
+      
       state = state.copyWith(
         isScanning: false,
-        error: 'Failed to start scan: ${e.toString()}',
+        error: errorMessage,
       );
       Logger.error('Error starting scan', e);
     }

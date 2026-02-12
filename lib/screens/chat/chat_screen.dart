@@ -177,7 +177,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
   @override
   void dispose() {
-    // Remove _messageSubscription?.cancel();
     _messageController.dispose();
     _scrollController.dispose();
     super.dispose();
@@ -328,55 +327,55 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
               ),
               child: SafeArea(
                 child: Row(
-                  children: [
-                    Expanded(
-                      child: TextField(
-                        controller: _messageController,
-                        decoration: InputDecoration(
-                          hintText: AppStrings.typeMessage,
-                          border: OutlineInputBorder(
-                            borderRadius:
-                                BorderRadius.circular(AppConstants.defaultBorderRadius),
-                            borderSide: BorderSide.none,
-                          ),
-                          filled: true,
-                          fillColor: AppColors.background,
-                          contentPadding: const EdgeInsets.symmetric(
-                            horizontal: 16,
-                            vertical: 12,
-                          ),
-                        ),
-                        maxLines: null,
-                        textCapitalization: TextCapitalization.sentences,
-                        onSubmitted: (_) => _sendMessage(),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Container(
-                      decoration: BoxDecoration(
-                        color: AppColors.primary,
-                        shape: BoxShape.circle,
-                      ),
-                      child: IconButton(
-                        onPressed: chatState.isSending ? null : _sendMessage,
-                        icon: chatState.isSending
-                            ? const SizedBox(
-                                width: 20,
-                                height: 20,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2,
-                                  valueColor:
-                                      AlwaysStoppedAnimation<Color>(AppColors.textLight),
+                        children: [
+                          Expanded(
+                            child: TextField(
+                              controller: _messageController,
+                              decoration: InputDecoration(
+                                hintText: AppStrings.typeMessage,
+                                border: OutlineInputBorder(
+                                  borderRadius:
+                                      BorderRadius.circular(AppConstants.defaultBorderRadius),
+                                  borderSide: BorderSide.none,
                                 ),
-                              )
-                            : const Icon(
-                                Icons.send,
-                                color: AppColors.textLight,
+                                filled: true,
+                                fillColor: AppColors.background,
+                                contentPadding: const EdgeInsets.symmetric(
+                                  horizontal: 16,
+                                  vertical: 12,
+                                ),
                               ),
+                              maxLines: null,
+                              textCapitalization: TextCapitalization.sentences,
+                              onSubmitted: (_) => _sendMessage(),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Container(
+                            decoration: BoxDecoration(
+                              color: AppColors.primary,
+                              shape: BoxShape.circle,
+                            ),
+                            child: IconButton(
+                              onPressed: chatState.isSending ? null : _sendMessage,
+                              icon: chatState.isSending
+                                  ? const SizedBox(
+                                      width: 20,
+                                      height: 20,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        valueColor:
+                                            AlwaysStoppedAnimation<Color>(AppColors.textLight),
+                                      ),
+                                    )
+                                  : const Icon(
+                                      Icons.send,
+                                      color: AppColors.textLight,
+                                    ),
+                            ),
+                          ),
+                        ],
                       ),
-                    ),
-                  ],
-                ),
               ),
             ),
         ],

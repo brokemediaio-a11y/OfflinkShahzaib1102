@@ -192,11 +192,14 @@ class BluetoothService {
           ? result.device.platformName
           : 'Unknown Device';
       
+      // Android 13+ often doesn't expose Service UUIDs in scan results
+      // We should NOT rely on serviceUuids for device identification
       final serviceUuids = result.advertisementData.serviceUuids
           .map((u) => u.str.toUpperCase())
           .toList();
       
-      // Extract device UUID from manufacturer data (manufacturer ID 0xFFFF)
+      // CRITICAL: Extract device UUID from manufacturer data (manufacturer ID 0xFFFF)
+      // This is the ONLY reliable way to identify devices on Android 13+
       // Format: 16 bytes representing the UUID (big-endian, MSB first, then LSB)
       String? deviceUuid;
       try {
@@ -245,9 +248,17 @@ class BluetoothService {
       }
       
       // CRITICAL: Only use UUID, never MAC as device ID
-      // If no UUID found, skip this device (it's not an Offlink device)
+      // On Android 13+, Service UUIDs are often empty - we MUST use manufacturer data
+      // If no UUID found in manufacturer data, skip this device (it's not an Offlink device)
       if (deviceUuid == null) {
-        Logger.debug('Skipping device without UUID: $deviceName ($macAddress)');
+        Logger.debug('Skipping device without UUID in manufacturer data: $deviceName ($macAddress)');
+        Logger.debug('  Service UUIDs: ${serviceUuids.length} (may be empty on Android 13+)');
+        try {
+          final mfgData = result.advertisementData.manufacturerData;
+          Logger.debug('  Manufacturer data keys: ${mfgData.keys.toList()}');
+        } catch (e) {
+          Logger.debug('  Could not read manufacturer data: $e');
+        }
         continue; // Skip devices without UUID
       }
       

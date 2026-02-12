@@ -1,7 +1,9 @@
 package com.offlink.app
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
+import android.location.LocationManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -14,16 +16,22 @@ import io.flutter.plugin.common.MethodChannel
 class MainActivity : FlutterActivity() {
 
     private val methodChannelName = "com.offlink.ble_peripheral"
+    private val classicBluetoothChannelName = "com.offlink.classic_bluetooth"
     private val permissionsChannelName = "com.offlink.permissions"
     private val eventChannelName = "com.offlink.ble_peripheral/messages"
     private val scanEventChannelName = "com.offlink.ble_peripheral/scan_results"
     private val connectionStateChannelName = "com.offlink.ble_peripheral/connection_state"
+    private val classicBluetoothMessageChannelName = "com.offlink.classic_bluetooth/messages"
+    private val classicBluetoothConnectionStateChannelName = "com.offlink.classic_bluetooth/connection_state"
     
     private val blePeripheralManager by lazy { BlePeripheralManager(applicationContext) }
+    private val classicBluetoothManager by lazy { ClassicBluetoothManager(applicationContext) }
     private val mainHandler = Handler(Looper.getMainLooper())
     private var messageSink: EventChannel.EventSink? = null
     private var scanResultSink: EventChannel.EventSink? = null
     private var connectionStateSink: EventChannel.EventSink? = null
+    private var classicBluetoothMessageSink: EventChannel.EventSink? = null
+    private var classicBluetoothConnectionStateSink: EventChannel.EventSink? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -135,6 +143,15 @@ class MainActivity : FlutterActivity() {
                     "checkNearbyDevicesPermission" -> {
                         result.success(checkNearbyDevicesPermission())
                     }
+                    
+                    "isLocationEnabled" -> {
+                        result.success(isLocationEnabled())
+                    }
+                    
+                    "checkBluetoothPermissions" -> {
+                        result.success(checkBluetoothPermissions())
+                    }
+                    
                     else -> result.notImplemented()
                 }
             }
@@ -208,10 +225,97 @@ class MainActivity : FlutterActivity() {
                 blePeripheralManager.setConnectionStateListener(null)
             }
         })
+        
+        // Classic Bluetooth Method Channel
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, classicBluetoothChannelName)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "initialize" -> {
+                        val initialized = classicBluetoothManager.initialize()
+                        result.success(initialized)
+                    }
+                    
+                    "connect" -> {
+                        val address = call.argument<String>("address")
+                        Thread {
+                            val connected = if (address != null) {
+                                classicBluetoothManager.connect(address)
+                            } else {
+                                false
+                            }
+                            mainHandler.post {
+                                result.success(connected)
+                            }
+                        }.start()
+                    }
+                    
+                    "disconnect" -> {
+                        classicBluetoothManager.disconnect()
+                        result.success(null)
+                    }
+                    
+                    "sendMessage" -> {
+                        val message = call.argument<String>("message")
+                        val sent = if (message != null) {
+                            classicBluetoothManager.sendMessage(message)
+                        } else {
+                            false
+                        }
+                        result.success(sent)
+                    }
+                    
+                    "isConnected" -> {
+                        result.success(classicBluetoothManager.isConnected())
+                    }
+                    
+                    else -> result.notImplemented()
+                }
+            }
+        
+        // Classic Bluetooth Message Event Channel
+        EventChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            classicBluetoothMessageChannelName
+        ).setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(arguments: Any?, events: EventChannel.EventSink) {
+                classicBluetoothMessageSink = events
+                classicBluetoothManager.setMessageListener { message ->
+                    mainHandler.post {
+                        classicBluetoothMessageSink?.success(message)
+                    }
+                }
+            }
+            
+            override fun onCancel(arguments: Any?) {
+                classicBluetoothMessageSink = null
+                classicBluetoothManager.setMessageListener(null)
+            }
+        })
+        
+        // Classic Bluetooth Connection State Event Channel
+        EventChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            classicBluetoothConnectionStateChannelName
+        ).setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(arguments: Any?, events: EventChannel.EventSink) {
+                classicBluetoothConnectionStateSink = events
+                classicBluetoothManager.setConnectionStateListener { state ->
+                    mainHandler.post {
+                        classicBluetoothConnectionStateSink?.success(state)
+                    }
+                }
+            }
+            
+            override fun onCancel(arguments: Any?) {
+                classicBluetoothConnectionStateSink = null
+                classicBluetoothManager.setConnectionStateListener(null)
+            }
+        })
     }
 
     override fun onDestroy() {
         blePeripheralManager.shutdown()
+        classicBluetoothManager.shutdown()
         super.onDestroy()
     }
 
@@ -249,5 +353,53 @@ class MainActivity : FlutterActivity() {
         }
 
         return false
+    }
+    
+    private fun isLocationEnabled(): Boolean {
+        val locationManager = getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+        return locationManager?.isProviderEnabled(LocationManager.GPS_PROVIDER) == true ||
+               locationManager?.isProviderEnabled(LocationManager.NETWORK_PROVIDER) == true
+    }
+    
+    private fun checkBluetoothPermissions(): Boolean {
+        val sdkInt = Build.VERSION.SDK_INT
+        
+        if (sdkInt >= 31) {
+            // Android 12+ requires BLUETOOTH_SCAN, BLUETOOTH_CONNECT, BLUETOOTH_ADVERTISE
+            val scanGranted = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.BLUETOOTH_SCAN
+            ) == PackageManager.PERMISSION_GRANTED
+            
+            val connectGranted = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.BLUETOOTH_CONNECT
+            ) == PackageManager.PERMISSION_GRANTED
+            
+            val advertiseGranted = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.BLUETOOTH_ADVERTISE
+            ) == PackageManager.PERMISSION_GRANTED
+            
+            val locationGranted = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED
+            
+            return scanGranted && connectGranted && advertiseGranted && locationGranted
+        } else {
+            // Android 11 and below
+            val bluetoothGranted = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.BLUETOOTH
+            ) == PackageManager.PERMISSION_GRANTED
+            
+            val locationGranted = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED
+            
+            return bluetoothGranted && locationGranted
+        }
     }
 }
