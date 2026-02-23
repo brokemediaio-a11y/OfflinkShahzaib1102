@@ -3,7 +3,10 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../core/app_colors.dart';
 import '../../core/app_strings.dart';
 import '../../providers/device_provider.dart';
+import '../../services/storage/device_storage.dart';
 import '../../utils/permissions_helper.dart';
+import '../../utils/logger.dart';
+import '../auth/username_registration_screen.dart';
 import '../auth/permissions_screen.dart';
 import '../home/home_screen.dart';
 
@@ -24,6 +27,20 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
   Future<void> _initializeApp() async {
     // Wait a bit for splash screen to be visible
     await Future.delayed(const Duration(seconds: 2));
+
+    // Check if user has completed registration (username setup)
+    final isRegistrationComplete = DeviceStorage.isRegistrationComplete();
+    Logger.info('Registration complete: $isRegistrationComplete');
+
+    if (!mounted) return;
+
+    if (!isRegistrationComplete) {
+      // First time launch - go to username registration
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (_) => const UsernameRegistrationScreen()),
+      );
+      return;
+    }
 
     // Check permissions before initializing communication stack
     final allPermissionsGranted = await PermissionsHelper.areAllPermissionsGranted();

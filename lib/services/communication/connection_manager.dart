@@ -5,11 +5,14 @@ import 'package:device_info_plus/device_info_plus.dart';
 import '../../core/constants.dart';
 import '../../models/device_model.dart';
 import '../../models/message_model.dart';
+import '../../models/peer_connection_model.dart';
 import '../../utils/logger.dart';
 import '../../utils/permissions_helper.dart';
 import '../storage/scan_log_storage.dart';
 import '../storage/device_storage.dart';
 import '../storage/message_storage.dart';
+import '../routing/routing_manager.dart';
+import 'transport_manager.dart';
 import 'ble_peripheral_service.dart';
 import 'bluetooth_service.dart';
 import 'classic_bluetooth_service.dart';
@@ -55,8 +58,12 @@ class ConnectionManager {
   final ClassicBluetoothService _classicBluetoothService = ClassicBluetoothService();
   final ScanLogStorage _scanLogStorage = ScanLogStorage.instance;
 
+  // NEW: Routing and Transport layers
+  final RoutingManager _routingManager = RoutingManager();
+  final TransportManager _transportManager = TransportManager();
+
   ConnectionType _currentConnectionType = ConnectionType.none;
-  DeviceModel? _connectedDevice;
+  DeviceModel? _connectedDevice; // Kept for backward compatibility, delegates to TransportManager
 
   final _connectionController = StreamController<ConnectionState>.broadcast();
   final _messageController = StreamController<String>.broadcast();
@@ -94,6 +101,14 @@ class ConnectionManager {
       final bleInitialized = await _bluetoothService.initialize();
       final wifiInitialized = await _wifiDirectService.initialize();
       final classicBluetoothInitialized = await _classicBluetoothService.initialize();
+
+      // NEW: Set up routing manager listener for locally delivered messages
+      _routingManager.localMessages.listen((message) {
+        Logger.info('RoutingManager: Locally delivered message for ${message.finalReceiverId}');
+        // Convert back to JSON string for backward compatibility with existing code
+        final messageJson = jsonEncode(message.toJson());
+        _messageController.add(messageJson);
+      });
 
       _bluetoothService.incomingMessages.listen((message) {
         Logger.info('Message received via BluetoothService (central): $message');
@@ -465,6 +480,16 @@ class ConnectionManager {
         _isPeripheralConnection = false; // Classic Bluetooth is peer-to-peer
         _connectionController.add(ConnectionState.connected);
 
+        // NEW: Register with TransportManager
+        final peerConnection = _transportManager.createPeerConnection(
+          device: device,
+          transportType: TransportType.classicBluetooth,
+          role: ConnectionRole.central, // Treat as central for simplicity
+          connectionObject: null,
+        );
+        _transportManager.addNeighbor(peerConnection);
+        Logger.info('ConnectionManager: Registered Classic Bluetooth connection with TransportManager');
+
         Logger.info('✅✅✅ Classic Bluetooth connection TRACKED: $deviceName ($deviceId)');
       } else {
         Logger.info('🔴 Classic Bluetooth disconnected: $deviceName ($deviceAddress)');
@@ -472,6 +497,11 @@ class ConnectionManager {
         if (_currentConnectionType == ConnectionType.classicBluetooth &&
             _connectedDevice != null &&
             _connectedDevice!.address == deviceAddress) {
+          
+          // NEW: Remove from TransportManager
+          _transportManager.removeNeighbor(_connectedDevice!.id);
+          Logger.info('ConnectionManager: Removed Classic Bluetooth neighbor from TransportManager');
+          
           _currentConnectionType = ConnectionType.none;
           _connectedDevice = null;
           _connectionController.add(ConnectionState.disconnected);
@@ -578,6 +608,16 @@ class ConnectionManager {
         _isPeripheralConnection = true;  // Mark as peripheral connection
         _connectionController.add(ConnectionState.connected);
         
+        // NEW: Register with TransportManager
+        final peerConnection = _transportManager.createPeerConnection(
+          device: device,
+          transportType: TransportType.ble,
+          role: ConnectionRole.peripheral,
+          connectionObject: null, // Peripheral doesn't have a BluetoothDevice object
+        );
+        _transportManager.addNeighbor(peerConnection);
+        Logger.info('ConnectionManager: Registered BLE peripheral connection with TransportManager');
+        
         print('✅✅✅ [CONN_MGR] Peripheral connection TRACKED: $finalDeviceName ($deviceUuid)');
         print('   [CONN_MGR] Device address: $deviceAddress');
         print('   [CONN_MGR] Connection type: peripheral (central connected to us)');
@@ -600,6 +640,11 @@ class ConnectionManager {
         if (_isPeripheralConnection && 
             _connectedDevice != null && 
             _connectedDevice!.address == deviceAddress) {
+          
+          // NEW: Remove from TransportManager
+          _transportManager.removeNeighbor(_connectedDevice!.id);
+          Logger.info('ConnectionManager: Removed peripheral neighbor from TransportManager');
+          
           _currentConnectionType = ConnectionType.none;
           _connectedDevice = null;
           _isPeripheralConnection = false;
@@ -685,6 +730,18 @@ class ConnectionManager {
             }
           }
           
+          // NEW: Register with TransportManager
+          if (connectedDevice != null) {
+            final peerConnection = _transportManager.createPeerConnection(
+              device: connectedDevice,
+              transportType: TransportType.ble,
+              role: ConnectionRole.central,
+              connectionObject: _bluetoothService.getConnectedDevice(),
+            );
+            _transportManager.addNeighbor(peerConnection);
+            Logger.info('ConnectionManager: Registered BLE central connection with TransportManager');
+          }
+          
           // IMPORTANT: Restart advertising after connecting as central
           // This allows the other device to discover and connect back to us
           Logger.info('Connection successful. Restarting advertising so other device can connect back...');
@@ -723,12 +780,36 @@ class ConnectionManager {
               }
             }
           }
+          
+          // NEW: Register with TransportManager
+          if (_connectedDevice != null) {
+            final peerConnection = _transportManager.createPeerConnection(
+              device: _connectedDevice!,
+              transportType: TransportType.classicBluetooth,
+              role: ConnectionRole.central,
+              connectionObject: _classicBluetoothService.connectedDevice,
+            );
+            _transportManager.addNeighbor(peerConnection);
+            Logger.info('ConnectionManager: Registered Classic Bluetooth connection with TransportManager');
+          }
         }
       } else if (device.type == DeviceType.wifiDirect) {
         connected = await _wifiDirectService.connectToDevice(device);
         if (connected) {
           _currentConnectionType = ConnectionType.wifiDirect;
           _connectedDevice = await _wifiDirectService.getConnectedDevice();
+          
+          // NEW: Register with TransportManager
+          if (_connectedDevice != null) {
+            final peerConnection = _transportManager.createPeerConnection(
+              device: _connectedDevice!,
+              transportType: TransportType.wifiDirect,
+              role: ConnectionRole.central,
+              connectionObject: _connectedDevice,
+            );
+            _transportManager.addNeighbor(peerConnection);
+            Logger.info('ConnectionManager: Registered WiFi Direct connection with TransportManager');
+          }
         }
       }
 
@@ -765,6 +846,12 @@ class ConnectionManager {
         await _wifiDirectService.disconnect();
       }
 
+      // NEW: Clear TransportManager neighbors
+      if (_connectedDevice != null) {
+        _transportManager.removeNeighbor(_connectedDevice!.id);
+        Logger.info('ConnectionManager: Removed neighbor from TransportManager');
+      }
+
       _currentConnectionType = ConnectionType.none;
       _connectedDevice = null;
       _isPeripheralConnection = false;
@@ -783,42 +870,82 @@ class ConnectionManager {
 
   Future<bool> sendMessage(String message) async {
     try {
-      // Check if this is a voice message (chunked)
-      Map<String, dynamic>? messageJson;
-      try {
-        messageJson = jsonDecode(message) as Map<String, dynamic>;
-      } catch (e) {
-        // Not JSON, treat as regular text message
-      }
-
-      // Send message based on connection type
-      if (_currentConnectionType == ConnectionType.ble) {
-        if (_isPeripheralConnection) {
-          // We have a central connected to our GATT server → send via peripheral
-          Logger.info('Sending message via peripheral (GATT server)');
-          return await _blePeripheralService.sendMessage(message);
-        } else {
-          // We are central → use BluetoothService
-          Logger.info('Sending message via central (BLE client)');
-          return await _bluetoothService.sendMessage(message);
-        }
-      } else if (_currentConnectionType == ConnectionType.classicBluetooth) {
-        Logger.info('Sending message via Classic Bluetooth');
-        return await _classicBluetoothService.sendMessage(message);
-      } else if (_currentConnectionType == ConnectionType.wifiDirect) {
-        return await _wifiDirectService.sendMessage(message);
-      } else {
-        Logger.error('Not connected to any device');
+      Logger.info('ConnectionManager: Sending message');
+      
+      // The message should already be in JSON format (from ChatProvider)
+      // We just need to send it via the appropriate transport
+      
+      // Check if we have any neighbors
+      if (!_transportManager.hasNeighbors()) {
+        Logger.error('ConnectionManager: No neighbors connected');
         return false;
       }
-    } catch (e) {
-      Logger.error('Error sending message', e);
+
+      // Get the primary neighbor (single-connection mode)
+      final peer = _transportManager.getPrimaryNeighbor();
+      if (peer == null) {
+        Logger.error('ConnectionManager: No primary neighbor found');
+        return false;
+      }
+
+      // Convert message string to bytes
+      final messageBytes = Uint8List.fromList(message.codeUnits);
+      
+      // Send via TransportManager
+      Logger.info('ConnectionManager: Sending ${messageBytes.length} bytes to peer ${peer.peerId}');
+      final success = await _transportManager.sendToPeer(peer.peerId, messageBytes);
+      
+      if (success) {
+        Logger.info('ConnectionManager: Message sent successfully');
+      } else {
+        Logger.error('ConnectionManager: Failed to send message');
+      }
+      
+      return success;
+    } catch (e, stackTrace) {
+      Logger.error('ConnectionManager: Error sending message', e, stackTrace);
       return false;
     }
   }
 
   void _handleIncomingMessage(String message) {
-    _messageController.add(message);
+    try {
+      Logger.info('ConnectionManager: Handling incoming message');
+      
+      // Parse the JSON message
+      final jsonMap = _parseJsonString(message);
+      if (jsonMap == null) {
+        Logger.warning('ConnectionManager: Could not parse message JSON, forwarding as-is for backward compatibility');
+        _messageController.add(message);
+        return;
+      }
+
+      // Convert to MessageModel
+      final messageModel = MessageModel.fromJson(jsonMap);
+      
+      // Route through RoutingManager for deduplication and forwarding logic
+      unawaited(_routingManager.routeMessage(messageModel));
+      
+    } catch (e, stackTrace) {
+      Logger.error('ConnectionManager: Error handling incoming message', e, stackTrace);
+      // Fallback: forward as-is for backward compatibility
+      _messageController.add(message);
+    }
+  }
+
+  Map<String, dynamic>? _parseJsonString(String jsonString) {
+    try {
+      final cleaned = jsonString.trim();
+      String jsonToParse = cleaned;
+      if (cleaned.startsWith('"') && cleaned.endsWith('"')) {
+        jsonToParse = cleaned.substring(1, cleaned.length - 1);
+        jsonToParse = jsonToParse.replaceAll('\\"', '"').replaceAll('\\n', '\n');
+      }
+      return jsonDecode(jsonToParse) as Map<String, dynamic>;
+    } catch (e) {
+      Logger.debug('ConnectionManager: Error parsing JSON string: ${e.toString()}');
+      return null;
+    }
   }
 
   bool isConnected() {
@@ -924,7 +1051,7 @@ class ConnectionManager {
 
       final deviceName = await _resolveDeviceName();
       final started = await _blePeripheralService.startAdvertising(
-        deviceName: deviceName,
+        deviceName: deviceName as String?,
       );
       _isAdvertising = started;
       if (!started) {
@@ -1042,7 +1169,7 @@ class ConnectionManager {
       }
       
       final deviceName = await _resolveDeviceName();
-      final started = await _blePeripheralService.startAdvertising(deviceName: deviceName);
+      final started = await _blePeripheralService.startAdvertising(deviceName: deviceName as String?);
       _isAdvertising = started;
       if (started) {
         Logger.info('Peripheral role resumed successfully');

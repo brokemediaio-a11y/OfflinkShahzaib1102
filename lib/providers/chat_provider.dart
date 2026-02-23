@@ -1,7 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
-import 'dart:io';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:uuid/uuid.dart';
 import '../models/message_model.dart';
@@ -191,14 +189,22 @@ class ChatNotifier extends StateNotifier<ChatState> {
         }
       }
 
+      // NEW: Create message with routing fields for mesh networking
+      final messageId = const Uuid().v4();
       final message = MessageModel(
-        id: const Uuid().v4(),
+        id: messageId, // Legacy field for backward compatibility
         content: content.trim(),
-        senderId: _myDeviceId, // Our own device ID
-        receiverId: finalReceiverId, // The device we're sending to (now using connected device's ID)
+        senderId: _myDeviceId, // Legacy field for backward compatibility
+        receiverId: finalReceiverId, // Legacy field for backward compatibility
         timestamp: DateTime.now(),
         status: MessageStatus.sending,
         isSent: true,
+        // NEW: Routing fields for mesh networking
+        messageId: messageId, // Unique message identifier for deduplication
+        originalSenderId: _myDeviceId, // Device that created the message
+        finalReceiverId: finalReceiverId, // Intended destination device
+        hopCount: 0, // Starting hop count
+        maxHops: 3, // Maximum hops allowed (TTL)
       );
 
       // Add message to state immediately

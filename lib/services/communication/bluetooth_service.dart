@@ -202,6 +202,7 @@ class BluetoothService {
       // This is the ONLY reliable way to identify devices on Android 13+
       // Format: 16 bytes representing the UUID (big-endian, MSB first, then LSB)
       String? deviceUuid;
+      String? extractedUsername;
       try {
         final manufacturerData = result.advertisementData.manufacturerData;
         if (manufacturerData.containsKey(0xFFFF)) {
@@ -241,6 +242,21 @@ class BluetoothService {
                 '${node.toRadixString(16).padLeft(12, '0')}'.toLowerCase();
             
             Logger.debug('Extracted UUID from FBP manufacturer data: $deviceUuid');
+            
+            // Extract username from manufacturer data (after UUID)
+            // Format: UUID (16 bytes) + username length (1 byte) + username (variable)
+            try {
+              if (uuidBytes.length > 17) {
+                final usernameLength = uuidBytes[16] & 0xFF;
+                if (usernameLength > 0 && uuidBytes.length >= 17 + usernameLength) {
+                  final usernameBytes = uuidBytes.sublist(17, 17 + usernameLength);
+                  extractedUsername = String.fromCharCodes(usernameBytes);
+                  Logger.debug('Extracted username from FBP manufacturer data: $extractedUsername');
+                }
+              }
+            } catch (e) {
+              Logger.debug('Could not extract username from advertisement: $e');
+            }
           }
         }
       } catch (e) {
@@ -270,15 +286,28 @@ class BluetoothService {
       
       // Check if we have a stored name for this device first
       final storedName = DeviceStorage.getDeviceDisplayName(uuid);
-      String displayName = storedName ?? deviceName;
+      // Use extracted username if available, otherwise use stored name, otherwise use device name
+      String displayName = extractedUsername ?? storedName ?? deviceName;
       
+      // Store the extracted username if we got one
+      if (extractedUsername != null && 
+          extractedUsername.isNotEmpty && 
+          extractedUsername != 'Unknown Device' && 
+          extractedUsername != uuid && 
+          extractedUsername != macAddress &&
+          storedName == null) {
+        unawaited(DeviceStorage.setDeviceDisplayName(uuid, extractedUsername));
+        displayName = extractedUsername;
+        Logger.debug('Storing extracted username: $uuid -> $extractedUsername');
+      }
       // Store the device name if we got a proper name (not "Unknown Device", not empty, not just UUID/MAC)
-      if (deviceName.isNotEmpty && 
+      else if (deviceName.isNotEmpty && 
           deviceName != 'Unknown Device' && 
           deviceName != uuid && 
           deviceName != macAddress &&
           !uuid.contains(':') && // Only for UUID-based IDs
-          storedName == null) {
+          storedName == null &&
+          extractedUsername == null) { // Only store if we didn't extract a username
         unawaited(DeviceStorage.setDeviceDisplayName(uuid, deviceName));
         displayName = deviceName; // Use the discovered name immediately
         Logger.debug('Storing discovered device name: $uuid -> $deviceName');

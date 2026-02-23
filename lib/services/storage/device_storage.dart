@@ -5,6 +5,7 @@ import '../../utils/logger.dart';
 class DeviceStorage {
   static const String _deviceIdKey = 'device_id';
   static const String _displayNameKey = 'display_name';
+  static const String _registrationCompleteKey = 'registration_complete';
   static const String _deviceBoxName = 'device_preferences';
   static Box? _deviceBox;
 
@@ -85,6 +86,37 @@ class DeviceStorage {
       Logger.info('Display name set to: $name');
     } catch (e) {
       Logger.error('Error setting display name', e);
+    }
+  }
+
+  /// Check if user registration is complete
+  static bool isRegistrationComplete() {
+    try {
+      return _deviceBox?.get(_registrationCompleteKey, defaultValue: false) as bool;
+    } catch (e) {
+      Logger.error('Error checking registration status', e);
+      return false;
+    }
+  }
+
+  /// Set registration complete status
+  static Future<void> setRegistrationComplete(bool complete) async {
+    try {
+      await _deviceBox?.put(_registrationCompleteKey, complete);
+      Logger.info('Registration complete status set to: $complete');
+    } catch (e) {
+      Logger.error('Error setting registration status', e);
+    }
+  }
+
+  /// Clear registration (for testing/reset purposes)
+  static Future<void> clearRegistration() async {
+    try {
+      await _deviceBox?.delete(_registrationCompleteKey);
+      await _deviceBox?.delete(_displayNameKey);
+      Logger.info('Registration data cleared');
+    } catch (e) {
+      Logger.error('Error clearing registration', e);
     }
   }
 

@@ -7,16 +7,7 @@ import 'models/message_model.dart';
 import 'services/storage/message_storage.dart';
 import 'services/storage/device_storage.dart';
 import 'models/conversation_model.dart';
-import 'providers/conversations_provider.dart';
-import 'providers/connection_provider.dart';
-import 'screens/messages/messages_screen.dart';
-import 'screens/chat/chat_screen.dart';
-import 'models/device_model.dart';
-import 'core/app_strings.dart';
-import 'core/constants.dart';
 import 'utils/logger.dart';
-import 'dart:async';
-import 'dart:convert';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -39,6 +30,29 @@ void main() async {
   // Initialize storage
   await MessageStorage.init();
   await DeviceStorage.init();
+  
+  // MIGRATION: Clear message storage for multi-hop architecture update
+  // This is acceptable for FYP demo purposes
+  // The new MessageModel has additional routing fields that are incompatible with old messages
+  try {
+    final messageBox = await Hive.openBox<MessageModel>('messages');
+    if (messageBox.isNotEmpty) {
+      Logger.info('MIGRATION: Clearing ${messageBox.length} old messages for multi-hop update');
+      await messageBox.clear();
+      Logger.info('MIGRATION: Message storage cleared successfully');
+    }
+    
+    // Also clear conversations since they reference old messages
+    final conversationBox = await Hive.openBox<ConversationModel>('conversations');
+    if (conversationBox.isNotEmpty) {
+      Logger.info('MIGRATION: Clearing ${conversationBox.length} old conversations');
+      await conversationBox.clear();
+      Logger.info('MIGRATION: Conversations cleared successfully');
+    }
+  } catch (e) {
+    Logger.error('MIGRATION: Error clearing storage', e);
+    // Continue anyway - app will work with empty storage
+  }
   
   runApp(
     const ProviderScope(

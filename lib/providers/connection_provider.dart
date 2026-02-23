@@ -258,6 +258,11 @@ class ConnectionNotifier extends StateNotifier<ConnectionProviderState> {
   }
 }
 
+// Provider for ConnectionManager singleton
+final connectionManagerProvider = Provider<ConnectionManager>((ref) {
+  return ConnectionManager();
+});
+
 // Provider for ConnectionNotifier
 final connectionProvider = StateNotifierProvider<ConnectionNotifier, ConnectionProviderState>((ref) {
   final connectionManager = ref.watch(connectionManagerProvider);

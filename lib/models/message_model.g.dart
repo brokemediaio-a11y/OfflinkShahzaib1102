@@ -24,13 +24,18 @@ class MessageModelAdapter extends TypeAdapter<MessageModel> {
       timestamp: fields[4] as DateTime,
       status: fields[5] as MessageStatus,
       isSent: fields[6] as bool,
+      messageId: fields[7] as String?,
+      originalSenderId: fields[8] as String?,
+      finalReceiverId: fields[9] as String?,
+      hopCount: fields[10] as int,
+      maxHops: fields[11] as int,
     );
   }
 
   @override
   void write(BinaryWriter writer, MessageModel obj) {
     writer
-      ..writeByte(7)
+      ..writeByte(12)
       ..writeByte(0)
       ..write(obj.id)
       ..writeByte(1)
@@ -44,7 +49,17 @@ class MessageModelAdapter extends TypeAdapter<MessageModel> {
       ..writeByte(5)
       ..write(obj.status)
       ..writeByte(6)
-      ..write(obj.isSent);
+      ..write(obj.isSent)
+      ..writeByte(7)
+      ..write(obj.messageId)
+      ..writeByte(8)
+      ..write(obj.originalSenderId)
+      ..writeByte(9)
+      ..write(obj.finalReceiverId)
+      ..writeByte(10)
+      ..write(obj.hopCount)
+      ..writeByte(11)
+      ..write(obj.maxHops);
   }
 
   @override
