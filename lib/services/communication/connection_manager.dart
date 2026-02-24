@@ -916,7 +916,7 @@ class ConnectionManager {
       final jsonMap = _parseJsonString(message);
       if (jsonMap == null) {
         Logger.warning('ConnectionManager: Could not parse message JSON, forwarding as-is for backward compatibility');
-        _messageController.add(message);
+    _messageController.add(message);
         return;
       }
 
