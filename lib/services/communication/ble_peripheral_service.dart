@@ -180,16 +180,24 @@ class BlePeripheralService {
     }
   }
 
+  /// @deprecated BLE is the Control Plane (discovery only) in the
+  /// Dual-Radio Architecture. Chat messages MUST be sent via Wi-Fi Direct
+  /// through [WifiDirectService] → [TransportManager].
+  ///
+  /// This method is intentionally disabled. Calling it will log an error
+  /// and return false. Do NOT route chat payload over BLE.
+  @Deprecated(
+    'BLE is discovery-only. Use WifiDirectService.sendMessage() instead. '
+    'Chat data must not travel over the BLE GATT channel.',
+  )
   Future<bool> sendMessage(String message) async {
-    try {
-      final result = await _channel.invokeMethod<bool>('sendMessage', {
-        'message': message,
-      });
-      return result ?? false;
-    } catch (e) {
-      Logger.error('Error sending message via peripheral', e);
-      return false;
-    }
+    Logger.error(
+      'BlePeripheralService.sendMessage() called — '
+      'BLE does NOT carry chat payload in the Dual-Radio Architecture. '
+      'Route messages through WifiDirectService → TransportManager.',
+    );
+    // Do NOT forward to native — the GATT channel is discovery-only.
+    return false;
   }
   
   // ==================== NATIVE SCANNER METHODS ====================

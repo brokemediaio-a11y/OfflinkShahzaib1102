@@ -3,7 +3,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/device_model.dart';
 import '../services/communication/connection_manager.dart';
 import '../utils/logger.dart';
-import 'device_provider.dart';
 import 'conversations_provider.dart';
 import 'chat_provider.dart';
 import '../models/message_model.dart';

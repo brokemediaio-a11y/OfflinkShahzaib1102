@@ -27,8 +27,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Device Connected'),
-        content: Text('Connected to ${device.name}\n\nOpen chat to start messaging?'),
+        title: const Text('Wi-Fi Direct Connected'),
+        content: Text(
+          'Connected to ${device.name} via Wi-Fi Direct.\n\nOpen chat to start messaging?',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(context).pop(),
@@ -51,10 +53,33 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   }
 
   Future<void> _connectToDevice(DeviceModel device) async {
+    // Show "connecting via Wi-Fi Direct" feedback immediately
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            const SizedBox(
+              width: 16,
+              height: 16,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                color: Colors.white,
+              ),
+            ),
+            const SizedBox(width: 12),
+            Text('Connecting to ${device.name} via Wi-Fi Direct…'),
+          ],
+        ),
+        duration: const Duration(seconds: 15),
+        backgroundColor: AppColors.primary,
+      ),
+    );
+
     final connectionNotifier = ref.read(connectionProvider.notifier);
     final connected = await connectionNotifier.connectToDevice(device);
 
     if (!mounted) return;
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
 
     if (connected) {
       Navigator.of(context).push(
@@ -64,9 +89,13 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       );
     } else {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(AppStrings.connectionError),
+        SnackBar(
+          content: Text(
+            'Wi-Fi Direct connection to ${device.name} failed. '
+            'Ensure both devices have Wi-Fi Direct enabled.',
+          ),
           backgroundColor: AppColors.error,
+          duration: const Duration(seconds: 5),
         ),
       );
     }
@@ -128,8 +157,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           if (connectionState.state == ConnectionStateType.connected &&
               connectionState.connectedDevice != null)
             IconButton(
-              icon: const Icon(Icons.chat),
-              tooltip: 'Open Chat',
+              icon: const Icon(Icons.wifi_tethering),
+              tooltip: 'Open Chat (Wi-Fi Direct)',
               onPressed: () {
                 Navigator.of(context).push(
                   MaterialPageRoute(
@@ -227,6 +256,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               ],
             ),
           ),
+          // ── BLE scanning indicator ────────────────────────────────
           if (deviceState.isScanning)
             Container(
               padding: const EdgeInsets.symmetric(vertical: 8),
@@ -241,8 +271,71 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                   ),
                   SizedBox(width: 8),
                   Text(
-                    AppStrings.scanning,
+                    'Scanning for nearby peers via BLE…',
                     style: TextStyle(color: AppColors.info),
+                  ),
+                ],
+              ),
+            ),
+
+          // ── Wi-Fi Direct connection status banner ─────────────────
+          if (connectionState.state == ConnectionStateType.connecting)
+            Container(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              color: Colors.orange.withOpacity(0.15),
+              child: Row(
+                children: [
+                  const SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: Colors.orange,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  const Expanded(
+                    child: Text(
+                      'Connecting via Wi-Fi Direct…',
+                      style: TextStyle(
+                        color: Colors.orange,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            )
+          else if (connectionState.state == ConnectionStateType.connected &&
+              connectionState.connectedDevice != null)
+            Container(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              color: Colors.green.withOpacity(0.12),
+              child: Row(
+                children: [
+                  const Icon(Icons.wifi_tethering,
+                      color: Colors.green, size: 18),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      'Connected to '
+                      '${connectionState.connectedDevice!.name} '
+                      'via Wi-Fi Direct',
+                      style: const TextStyle(
+                        color: Colors.green,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: () =>
+                        ref.read(connectionProvider.notifier).disconnect(),
+                    child: const Text(
+                      'Disconnect',
+                      style: TextStyle(color: Colors.red, fontSize: 12),
+                    ),
                   ),
                 ],
               ),
@@ -341,22 +434,17 @@ class _DeviceCard extends StatelessWidget {
           padding: const EdgeInsets.all(16),
           child: Row(
             children: [
+              // Device avatar: BLE icon (all discovered via BLE)
               Container(
                 width: 48,
                 height: 48,
                 decoration: BoxDecoration(
-                  color: device.type == DeviceType.ble
-                      ? AppColors.primary.withOpacity(0.1)
-                      : AppColors.secondary.withOpacity(0.1),
+                  color: AppColors.primary.withOpacity(0.1),
                   shape: BoxShape.circle,
                 ),
-                child: Icon(
-                  device.type == DeviceType.ble
-                      ? Icons.bluetooth
-                      : Icons.wifi,
-                  color: device.type == DeviceType.ble
-                      ? AppColors.primary
-                      : AppColors.secondary,
+                child: const Icon(
+                  Icons.bluetooth_searching,
+                  color: AppColors.primary,
                 ),
               ),
               const SizedBox(width: 16),
@@ -364,6 +452,7 @@ class _DeviceCard extends StatelessWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
+                    // Device name
                     Text(
                       device.name,
                       style: const TextStyle(
@@ -375,38 +464,64 @@ class _DeviceCard extends StatelessWidget {
                     const SizedBox(height: 4),
                     Row(
                       children: [
-                        const Icon(
-                          Icons.signal_cellular_alt,
-                          size: 14,
-                          color: AppColors.textSecondary,
-                        ),
-                        const SizedBox(width: 4),
-                        Text(
-                          '${device.rssi} dBm',
-                          style: const TextStyle(
-                            fontSize: 12,
+                        // RSSI badge
+                        if (device.rssi != 0) ...[
+                          const Icon(
+                            Icons.signal_cellular_alt,
+                            size: 14,
                             color: AppColors.textSecondary,
                           ),
-                        ),
-                        const SizedBox(width: 16),
-                        Container(
-                          padding:
-                              const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                          decoration: BoxDecoration(
-                            color: device.type == DeviceType.ble
-                                ? AppColors.primary.withOpacity(0.1)
-                                : AppColors.secondary.withOpacity(0.1),
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                          child: Text(
-                            device.type == DeviceType.ble ? 'BLE' : 'Wi-Fi',
-                            style: TextStyle(
-                              fontSize: 10,
-                              fontWeight: FontWeight.bold,
-                              color: device.type == DeviceType.ble
-                                  ? AppColors.primary
-                                  : AppColors.secondary,
+                          const SizedBox(width: 4),
+                          Text(
+                            '${device.rssi} dBm',
+                            style: const TextStyle(
+                              fontSize: 12,
+                              color: AppColors.textSecondary,
                             ),
+                          ),
+                          const SizedBox(width: 10),
+                        ],
+                        // "BLE Discovered" badge
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 6, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: AppColors.primary.withOpacity(0.08),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: const Text(
+                            'BLE Discovered',
+                            style: TextStyle(
+                              fontSize: 9,
+                              fontWeight: FontWeight.bold,
+                              color: AppColors.primary,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        // "Tap → Wi-Fi Direct" hint
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 6, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: Colors.green.withOpacity(0.08),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: const Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(Icons.wifi_tethering,
+                                  size: 10, color: Colors.green),
+                              SizedBox(width: 3),
+                              Text(
+                                'Wi-Fi Direct',
+                                style: TextStyle(
+                                  fontSize: 9,
+                                  fontWeight: FontWeight.bold,
+                                  color: Colors.green,
+                                ),
+                              ),
+                            ],
                           ),
                         ),
                       ],

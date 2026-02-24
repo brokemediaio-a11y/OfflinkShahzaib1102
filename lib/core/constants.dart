@@ -9,6 +9,14 @@ class AppConstants {
   static const Duration bleScanTimeout = Duration(seconds: 10);
   static const Duration connectionTimeout = Duration(seconds: 30);
   
+  // Wi-Fi Direct Configuration
+  /// TCP port used by WifiDirectManager for bidirectional chat communication.
+  /// Must match WifiDirectManager.TCP_PORT in Kotlin.
+  static const int wifiDirectTcpPort = 8988;
+
+  /// Fixed Group Owner IP assigned by Android Wi-Fi Direct stack.
+  static const String wifiDirectGroupOwnerIp = '192.168.49.1';
+
   // Message Configuration
   static const int maxMessageLength = 1000;
   static const int maxFileSize = 10 * 1024 * 1024; // 10MB

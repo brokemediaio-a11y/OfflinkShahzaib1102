@@ -24,14 +24,25 @@ class MainActivity : FlutterActivity() {
     private val classicBluetoothMessageChannelName = "com.offlink.classic_bluetooth/messages"
     private val classicBluetoothConnectionStateChannelName = "com.offlink.classic_bluetooth/connection_state"
     
+    // ── Wi-Fi Direct channel names ────────────────────────────────────
+    private val wifiDirectMethodChannelName = "com.offlink.wifi_direct"
+    private val wifiDirectMessagesChannelName = "com.offlink.wifi_direct/messages"
+    private val wifiDirectConnectionStateChannelName = "com.offlink.wifi_direct/connection_state"
+    private val wifiDirectPeersChannelName = "com.offlink.wifi_direct/peers"
+
     private val blePeripheralManager by lazy { BlePeripheralManager(applicationContext) }
     private val classicBluetoothManager by lazy { ClassicBluetoothManager(applicationContext) }
+    private val wifiDirectManager by lazy { WifiDirectManager(applicationContext) }
     private val mainHandler = Handler(Looper.getMainLooper())
     private var messageSink: EventChannel.EventSink? = null
     private var scanResultSink: EventChannel.EventSink? = null
     private var connectionStateSink: EventChannel.EventSink? = null
     private var classicBluetoothMessageSink: EventChannel.EventSink? = null
     private var classicBluetoothConnectionStateSink: EventChannel.EventSink? = null
+    // ── Wi-Fi Direct event sinks ──────────────────────────────────────
+    private var wifiDirectMessageSink: EventChannel.EventSink? = null
+    private var wifiDirectConnectionStateSink: EventChannel.EventSink? = null
+    private var wifiDirectPeersSink: EventChannel.EventSink? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -311,11 +322,137 @@ class MainActivity : FlutterActivity() {
                 classicBluetoothManager.setConnectionStateListener(null)
             }
         })
+
+        // ── Wi-Fi Direct ──────────────────────────────────────────────
+
+        // Wi-Fi Direct Method Channel
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, wifiDirectMethodChannelName)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "initialize" -> {
+                        val initialized = wifiDirectManager.initialize()
+                        result.success(initialized)
+                    }
+
+                    "discoverPeers" -> {
+                        wifiDirectManager.startDiscovery()
+                        result.success(mapOf("success" to true))
+                    }
+
+                    "stopDiscovery" -> {
+                        wifiDirectManager.stopDiscovery()
+                        result.success(null)
+                    }
+
+                    "initiateConnection" -> {
+                        val targetName = call.argument<String>("targetName")
+                        if (targetName == null) {
+                            result.error("INVALID_ARGS", "targetName is required", null)
+                            return@setMethodCallHandler
+                        }
+                        // Find the peer by name from the current peer list and connect
+                        Thread {
+                            try {
+                                // Start discovery first so peers list is populated,
+                                // then connect once the peers-changed event fires.
+                                // For now we connect directly if the peer is already known.
+                                wifiDirectManager.connectByName(targetName)
+                                mainHandler.post { result.success(mapOf("success" to true)) }
+                            } catch (e: Exception) {
+                                mainHandler.post {
+                                    result.success(mapOf("success" to false, "error" to (e.message ?: "unknown")))
+                                }
+                            }
+                        }.start()
+                    }
+
+                    "disconnect" -> {
+                        wifiDirectManager.disconnect()
+                        result.success(null)
+                    }
+
+                    "sendMessage" -> {
+                        val message = call.argument<String>("message")
+                        val sent = if (message != null) {
+                            wifiDirectManager.sendMessage(message)
+                        } else {
+                            false
+                        }
+                        result.success(sent)
+                    }
+
+                    "isConnected" -> {
+                        result.success(wifiDirectManager.isConnected())
+                    }
+
+                    "isSocketActive" -> {
+                        result.success(wifiDirectManager.isSocketActive())
+                    }
+
+                    "getGroupInfo" -> {
+                        result.success(wifiDirectManager.getGroupInfo())
+                    }
+
+                    else -> result.notImplemented()
+                }
+            }
+
+        // Wi-Fi Direct Messages Event Channel
+        EventChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            wifiDirectMessagesChannelName
+        ).setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(arguments: Any?, events: EventChannel.EventSink) {
+                wifiDirectMessageSink = events
+                wifiDirectManager.messageListener = { message ->
+                    mainHandler.post { wifiDirectMessageSink?.success(message) }
+                }
+            }
+            override fun onCancel(arguments: Any?) {
+                wifiDirectMessageSink = null
+                wifiDirectManager.messageListener = null
+            }
+        })
+
+        // Wi-Fi Direct Connection State Event Channel
+        EventChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            wifiDirectConnectionStateChannelName
+        ).setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(arguments: Any?, events: EventChannel.EventSink) {
+                wifiDirectConnectionStateSink = events
+                wifiDirectManager.connectionStateListener = { state ->
+                    mainHandler.post { wifiDirectConnectionStateSink?.success(state) }
+                }
+            }
+            override fun onCancel(arguments: Any?) {
+                wifiDirectConnectionStateSink = null
+                wifiDirectManager.connectionStateListener = null
+            }
+        })
+
+        // Wi-Fi Direct Peers Event Channel
+        EventChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            wifiDirectPeersChannelName
+        ).setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(arguments: Any?, events: EventChannel.EventSink) {
+                wifiDirectPeersSink = events
+                wifiDirectManager.peerListListener = { peers ->
+                    mainHandler.post { wifiDirectPeersSink?.success(peers) }
+                }
+            }
+            override fun onCancel(arguments: Any?) {
+                wifiDirectPeersSink = null
+                wifiDirectManager.peerListListener = null
+            }
+        })
     }
 
     override fun onDestroy() {
         blePeripheralManager.shutdown()
         classicBluetoothManager.shutdown()
+        wifiDirectManager.shutdown()
         super.onDestroy()
     }
 

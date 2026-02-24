@@ -160,12 +160,10 @@ class ConnectionStatusScreen extends ConsumerWidget {
                           ),
                           const SizedBox(height: 4),
                           Text(
-                            connectionState.connectionType == ConnectionType.ble
-                                ? 'Bluetooth Low Energy (BLE)'
-                                : connectionState.connectionType ==
-                                        ConnectionType.wifiDirect
-                                    ? 'Wi-Fi Direct'
-                                    : 'None',
+                            connectionState.connectionType ==
+                                    ConnectionType.wifiDirect
+                                ? 'Wi-Fi Direct'
+                                : 'None',
                             style: const TextStyle(
                               fontSize: 14,
                               color: AppColors.textPrimary,

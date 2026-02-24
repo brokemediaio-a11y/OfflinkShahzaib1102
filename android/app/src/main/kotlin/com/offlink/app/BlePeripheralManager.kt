@@ -296,19 +296,22 @@ class BlePeripheralManager(private val context: Context) {
         }
     }
 
+    /**
+     * @deprecated BLE is the Control Plane (discovery only) in the Dual-Radio
+     * Architecture.  Chat messages MUST travel over Wi-Fi Direct via
+     * [WifiDirectManager].  This method is intentionally disabled — it logs
+     * a warning and returns false without notifying any GATT characteristic.
+     *
+     * Retained only to satisfy existing MethodChannel dispatch in MainActivity
+     * so the app does not crash if an old call path accidentally reaches here.
+     */
+    @Deprecated("BLE carries NO chat payload. Use WifiDirectManager.sendMessage().")
     fun sendMessage(message: String): Boolean {
-        val characteristic = messageCharacteristic ?: return false
-        val server = gattServer ?: return false
-        val payload = message.toByteArray(Charset.forName("UTF-8"))
-
-        characteristic.value = payload
-
-        var delivered = false
-        connectedDevices.forEach { device ->
-            val ok = server.notifyCharacteristicChanged(device, characteristic, false)
-            delivered = delivered || ok
-        }
-        return delivered
+        Log.w(tag, "⚠️ BlePeripheralManager.sendMessage() called — " +
+              "BLE is discovery-only in the Dual-Radio Architecture. " +
+              "Route chat data through WifiDirectManager instead.")
+        // Do NOT deliver over the GATT characteristic.
+        return false
     }
 
     fun shutdown() {
@@ -1035,11 +1038,24 @@ class BlePeripheralManager(private val context: Context) {
             super.onCharacteristicWriteRequest(
                 device, requestId, characteristic, preparedWrite, responseNeeded, offset, value
             )
+            // Always ACK the write so the remote GATT client does not stall.
             gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, null)
+
+            // ── DUAL-RADIO ARCHITECTURE: BLE carries NO chat payload ──────
+            // Incoming write requests on the GATT characteristic previously
+            // carried chat messages.  In the new architecture BLE is the
+            // Control Plane (discovery only); all chat data travels over
+            // Wi-Fi Direct → WifiDirectManager.
+            //
+            // We intentionally DROP the payload here.  If you ever need to
+            // re-enable BLE as a secondary fallback transport, remove the
+            // early-return below and restore the messageListener call.
             if (characteristic.uuid == characteristicUuid) {
-                val message = String(value, Charset.forName("UTF-8"))
-                Log.d(tag, "Message received from ${device.address}: $message")
-                messageListener?.invoke(message)
+                val msgLen = value.size
+                Log.w(tag, "⚠️ BLE write received ($msgLen bytes) from ${device.address} " +
+                      "— payload DISCARDED (BLE is discovery-only). " +
+                      "Sender should use Wi-Fi Direct for chat messages.")
+                // messageListener?.invoke(...)  ← disabled: BLE is not a data transport
             }
         }
     }

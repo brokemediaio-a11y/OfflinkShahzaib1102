@@ -3,221 +3,351 @@ import 'package:flutter/services.dart';
 import '../../models/device_model.dart';
 import '../../utils/logger.dart';
 
+/// Wi-Fi Direct connection state emitted by the native layer.
+class WifiDirectConnectionState {
+  final bool connected;
+  final String? role;         // "group_owner" | "client"
+  final String? ipAddress;    // Group Owner IP (192.168.49.1 for GO)
+  final bool socketActive;    // True once TCP socket is established
+  final String? status;       // "connecting" | null
+  final String? error;
+
+  WifiDirectConnectionState({
+    required this.connected,
+    this.role,
+    this.ipAddress,
+    this.socketActive = false,
+    this.status,
+    this.error,
+  });
+
+  factory WifiDirectConnectionState.fromMap(Map<dynamic, dynamic> map) {
+    return WifiDirectConnectionState(
+      connected: (map['connected'] as bool?) ?? false,
+      role: map['role'] as String?,
+      ipAddress: map['ipAddress'] as String?,
+      socketActive: (map['socketActive'] as bool?) ?? false,
+      status: map['status'] as String?,
+      error: map['error'] as String?,
+    );
+  }
+
+  bool get isGroupOwner => role == 'group_owner';
+  bool get isClient => role == 'client';
+  bool get isFullyConnected => connected && socketActive;
+}
+
+/// Wi-Fi Direct peer discovered by the native P2P layer.
+class WifiDirectPeer {
+  final String deviceName;
+  final String deviceAddress;
+  final int status;
+
+  WifiDirectPeer({
+    required this.deviceName,
+    required this.deviceAddress,
+    required this.status,
+  });
+
+  factory WifiDirectPeer.fromMap(Map<dynamic, dynamic> map) {
+    return WifiDirectPeer(
+      deviceName: map['deviceName'] as String? ?? 'Unknown',
+      deviceAddress: map['deviceAddress'] as String? ?? '',
+      status: map['status'] as int? ?? 3,
+    );
+  }
+}
+
+/// WifiDirectService — Data Plane (Messaging Transport)
+///
+/// This is the sole data transport for chat messages.
+///
+/// Responsibilities:
+///   - Peer negotiation via Android WifiP2pManager
+///   - Group Owner / Client role handling
+///   - TCP socket establishment and lifecycle
+///   - Byte-level send and receive
+///   - Lifecycle callbacks to ConnectionManager
+///
+/// Integration path:
+///   ConnectionManager → WifiDirectService → WifiDirectManager.kt (native)
 class WifiDirectService {
   static final WifiDirectService _instance = WifiDirectService._internal();
   factory WifiDirectService() => _instance;
   WifiDirectService._internal();
 
-  static const MethodChannel _channel = MethodChannel('com.offlink.wifi_direct');
-  
-  final _discoveredDevices = <String, DeviceModel>{};
-  final _deviceController = StreamController<List<DeviceModel>>.broadcast();
-  final _messageController = StreamController<String>.broadcast();
+  // ── Method & Event Channels ───────────────────────────────────────
+  static const _methodChannel =
+      MethodChannel('com.offlink.wifi_direct');
+  static const _messageEventChannel =
+      EventChannel('com.offlink.wifi_direct/messages');
+  static const _connectionStateEventChannel =
+      EventChannel('com.offlink.wifi_direct/connection_state');
+  static const _peersEventChannel =
+      EventChannel('com.offlink.wifi_direct/peers');
 
-  Stream<List<DeviceModel>> get discoveredDevices => _deviceController.stream;
+  // ── Dart-side streams ─────────────────────────────────────────────
+  final _messageController =
+      StreamController<String>.broadcast();
+  final _connectionStateController =
+      StreamController<WifiDirectConnectionState>.broadcast();
+  final _peersController =
+      StreamController<List<WifiDirectPeer>>.broadcast();
+
+  StreamSubscription? _messageSubscription;
+  StreamSubscription? _connectionStateSubscription;
+  StreamSubscription? _peersSubscription;
+
+  bool _initialized = false;
+
+  // Last known connection state (for synchronous queries)
+  WifiDirectConnectionState _lastState = WifiDirectConnectionState(
+    connected: false,
+  );
+
+  /// Stream of JSON-encoded chat messages received from the peer.
   Stream<String> get incomingMessages => _messageController.stream;
 
-  bool _isInitialized = false;
-  bool _isScanning = false;
+  /// Stream of Wi-Fi Direct connection state changes.
+  Stream<WifiDirectConnectionState> get connectionState =>
+      _connectionStateController.stream;
 
-  // Initialize Wi-Fi Direct
+  /// Stream of discovered Wi-Fi Direct peers (P2P layer discovery).
+  Stream<List<WifiDirectPeer>> get discoveredPeers => _peersController.stream;
+
+  // ═════════════════════════════════════════════════════════════════
+  // Initialization
+  // ═════════════════════════════════════════════════════════════════
+
   Future<bool> initialize() async {
+    if (_initialized) return true;
     try {
-      if (_isInitialized) return true;
+      final result =
+          await _methodChannel.invokeMethod<bool>('initialize');
+      _initialized = result ?? false;
 
-      // Wi-Fi Direct requires native Android implementation
-      // For now, return false to indicate it's not available
-      Logger.warning('Wi-Fi Direct is not implemented - requires native Android code');
-      return false;
-      
-      // Uncomment when native code is implemented:
-      // // Set up message handler for incoming messages
-      // _channel.setMethodCallHandler(_handleMethodCall);
-      // final result = await _channel.invokeMethod<bool>('initialize');
-      // _isInitialized = result ?? false;
-      // return _isInitialized;
-    } catch (e) {
-      Logger.error('Error initializing Wi-Fi Direct service', e);
-      return false;
-    }
-  }
-
-  // Handle method calls from native side
-  Future<void> _handleMethodCall(MethodCall call) async {
-    try {
-      switch (call.method) {
-        case 'onDeviceFound':
-          final deviceData = call.arguments as Map;
-          final device = DeviceModel(
-            id: deviceData['address'] as String,
-            name: deviceData['name'] as String? ?? 'Unknown Device',
-            address: deviceData['address'] as String,
-            type: DeviceType.wifiDirect,
-            rssi: deviceData['rssi'] as int? ?? 0,
-            lastSeen: DateTime.now(),
-          );
-          _discoveredDevices[device.id] = device;
-          _deviceController.add(_discoveredDevices.values.toList());
-          break;
-
-        case 'onMessageReceived':
-          final message = call.arguments as String;
-          _messageController.add(message);
-          Logger.debug('Received message via Wi-Fi Direct: $message');
-          break;
-
-        case 'onConnectionChanged':
-          final isConnected = call.arguments as bool;
-          Logger.info('Wi-Fi Direct connection changed: $isConnected');
-          break;
-
-        default:
-          Logger.warning('Unknown method call: ${call.method}');
-      }
-    } catch (e) {
-      Logger.error('Error handling method call', e);
-    }
-  }
-
-  // Start scanning for devices
-  Future<void> startScan() async {
-    try {
-      // Wi-Fi Direct is not implemented - requires native Android code
-      Logger.warning('Wi-Fi Direct scanning is not available - requires native implementation');
-      _isScanning = false;
-      return;
-      
-      // Uncomment when native code is implemented:
-      // if (!_isInitialized) {
-      //   await initialize();
-      // }
-      // if (_isScanning) {
-      //   Logger.warning('Scan already in progress');
-      //   return;
-      // }
-      // _discoveredDevices.clear();
-      // _isScanning = true;
-      // await _channel.invokeMethod('startScan');
-      // Logger.info('Wi-Fi Direct scan started');
-    } catch (e) {
-      Logger.error('Error starting Wi-Fi Direct scan', e);
-      _isScanning = false;
-      // Don't rethrow - fail silently since it's not implemented
-    }
-  }
-
-  // Stop scanning
-  Future<void> stopScan() async {
-    try {
-      if (!_isScanning) return;
-
-      await _channel.invokeMethod('stopScan');
-      _isScanning = false;
-      Logger.info('Wi-Fi Direct scan stopped');
-    } catch (e) {
-      Logger.error('Error stopping Wi-Fi Direct scan', e);
-    }
-  }
-
-  // Connect to a device
-  Future<bool> connectToDevice(DeviceModel device) async {
-    try {
-      if (!_isInitialized) {
-        await initialize();
-      }
-
-      final result = await _channel.invokeMethod<bool>(
-        'connectToDevice',
-        {
-          'address': device.address,
-          'name': device.name,
-        },
-      );
-
-      if (result ?? false) {
-        Logger.info('Connected to device via Wi-Fi Direct: ${device.name}');
+      if (_initialized) {
+        _setupEventListeners();
+        Logger.info('WifiDirectService: initialized');
       } else {
-        Logger.error('Failed to connect to device: ${device.name}');
+        Logger.warning('WifiDirectService: native initialization returned false');
       }
-
-      return result ?? false;
+      return _initialized;
     } catch (e) {
-      Logger.error('Error connecting to device', e);
+      Logger.error('WifiDirectService: initialize error', e);
       return false;
     }
   }
 
-  // Disconnect from device
+  void _setupEventListeners() {
+    // ── Incoming messages ──────────────────────────────────────────
+    _messageSubscription?.cancel();
+    _messageSubscription =
+        _messageEventChannel.receiveBroadcastStream().listen(
+      (event) {
+        if (event is String) {
+          Logger.debug(
+              'WifiDirectService: received message (${event.length} chars)');
+          _messageController.add(event);
+        }
+      },
+      onError: (e) => Logger.error('WifiDirectService: message stream error', e),
+    );
+
+    // ── Connection state ──────────────────────────────────────────
+    _connectionStateSubscription?.cancel();
+    _connectionStateSubscription =
+        _connectionStateEventChannel.receiveBroadcastStream().listen(
+      (event) {
+        if (event is Map) {
+          final state = WifiDirectConnectionState.fromMap(event);
+          _lastState = state;
+          Logger.info(
+              'WifiDirectService: connection state — '
+              'connected=${state.connected}, role=${state.role}, '
+              'socketActive=${state.socketActive}, error=${state.error}');
+          _connectionStateController.add(state);
+        }
+      },
+      onError: (e) =>
+          Logger.error('WifiDirectService: connection state stream error', e),
+    );
+
+    // ── Wi-Fi P2P peers ───────────────────────────────────────────
+    _peersSubscription?.cancel();
+    _peersSubscription =
+        _peersEventChannel.receiveBroadcastStream().listen(
+      (event) {
+        if (event is List) {
+          final peers = event
+              .whereType<Map>()
+              .map((m) => WifiDirectPeer.fromMap(m))
+              .toList();
+          Logger.info(
+              'WifiDirectService: ${peers.length} Wi-Fi P2P peer(s) discovered');
+          _peersController.add(peers);
+        }
+      },
+      onError: (e) => Logger.error('WifiDirectService: peers stream error', e),
+    );
+  }
+
+  // ═════════════════════════════════════════════════════════════════
+  // Discovery (P2P layer — separate from BLE)
+  // ═════════════════════════════════════════════════════════════════
+
+  /// Start Wi-Fi Direct peer discovery (P2P layer).
+  /// This is called automatically by [initiateConnection].
+  Future<Map<String, dynamic>> discoverPeers() async {
+    try {
+      final result =
+          await _methodChannel.invokeMethod<Map>('discoverPeers');
+      return result != null
+          ? Map<String, dynamic>.from(result)
+          : {'success': false, 'error': 'no result'};
+    } catch (e) {
+      Logger.error('WifiDirectService: discoverPeers error', e);
+      return {'success': false, 'error': e.toString()};
+    }
+  }
+
+  // ═════════════════════════════════════════════════════════════════
+  // Connection
+  // ═════════════════════════════════════════════════════════════════
+
+  /// Initiate a Wi-Fi Direct connection to the peer identified by [targetName].
+  ///
+  /// [targetName] is the peer's display name as broadcast via BLE.
+  /// The native layer will discover nearby P2P peers and connect to
+  /// the one whose deviceName matches [targetName].
+  Future<Map<String, dynamic>> initiateConnection({
+    required String targetName,
+  }) async {
+    if (!_initialized) {
+      Logger.error('WifiDirectService: not initialized');
+      return {'success': false, 'error': 'Not initialized'};
+    }
+    try {
+      Logger.info(
+          'WifiDirectService: initiating connection to peer "$targetName"');
+      final result = await _methodChannel.invokeMethod<Map>(
+        'initiateConnection',
+        {'targetName': targetName},
+      );
+      final map = result != null
+          ? Map<String, dynamic>.from(result)
+          : {'success': false, 'error': 'no result'};
+      Logger.info('WifiDirectService: initiateConnection result = $map');
+      return map;
+    } catch (e) {
+      Logger.error('WifiDirectService: initiateConnection error', e);
+      return {'success': false, 'error': e.toString()};
+    }
+  }
+
+  /// Disconnect and remove the P2P group.
   Future<void> disconnect() async {
     try {
-      await _channel.invokeMethod('disconnect');
-      Logger.info('Disconnected from Wi-Fi Direct device');
+      await _methodChannel.invokeMethod('disconnect');
+      Logger.info('WifiDirectService: disconnected');
     } catch (e) {
-      Logger.error('Error disconnecting', e);
+      Logger.error('WifiDirectService: disconnect error', e);
     }
   }
 
-  // Send message
-  Future<bool> sendMessage(String message) async {
-    try {
-      if (!_isInitialized) {
-        Logger.error('Wi-Fi Direct not initialized');
-        return false;
-      }
+  // ═════════════════════════════════════════════════════════════════
+  // Data Transport
+  // ═════════════════════════════════════════════════════════════════
 
-      final result = await _channel.invokeMethod<bool>(
+  /// Send a chat message string over the active Wi-Fi Direct socket.
+  ///
+  /// Returns true if the message was handed to the native send queue.
+  /// Does NOT wait for TCP acknowledgement.
+  Future<bool> sendMessage(String message) async {
+    if (!_initialized) {
+      Logger.error('WifiDirectService: not initialized — cannot send');
+      return false;
+    }
+    try {
+      final result = await _methodChannel.invokeMethod<bool>(
         'sendMessage',
         {'message': message},
       );
-
-      if (result ?? false) {
-        Logger.debug('Message sent via Wi-Fi Direct: $message');
+      final ok = result ?? false;
+      if (ok) {
+        Logger.debug(
+            'WifiDirectService: message queued for socket delivery (${message.length} chars)');
       } else {
-        Logger.error('Failed to send message via Wi-Fi Direct');
+        Logger.error('WifiDirectService: native sendMessage returned false');
       }
-
-      return result ?? false;
+      return ok;
     } catch (e) {
-      Logger.error('Error sending message', e);
+      Logger.error('WifiDirectService: sendMessage error', e);
       return false;
     }
   }
 
-  // Check if connected
+  // ═════════════════════════════════════════════════════════════════
+  // Status queries
+  // ═════════════════════════════════════════════════════════════════
+
   Future<bool> isConnected() async {
     try {
-      final result = await _channel.invokeMethod<bool>('isConnected');
-      return result ?? false;
-    } catch (e) {
-      Logger.error('Error checking connection status', e);
+      return await _methodChannel.invokeMethod<bool>('isConnected') ?? false;
+    } catch (_) {
       return false;
     }
   }
 
-  // Get connected device
-  Future<DeviceModel?> getConnectedDevice() async {
+  Future<bool> isSocketActive() async {
     try {
-      final deviceData = await _channel.invokeMethod<Map>('getConnectedDevice');
-      if (deviceData == null) return null;
-
-      return DeviceModel(
-        id: deviceData['address'] as String,
-        name: deviceData['name'] as String? ?? 'Connected Device',
-        address: deviceData['address'] as String,
-        type: DeviceType.wifiDirect,
-        isConnected: true,
-      );
-    } catch (e) {
-      Logger.error('Error getting connected device', e);
-      return null;
+      return await _methodChannel.invokeMethod<bool>('isSocketActive') ?? false;
+    } catch (_) {
+      return false;
     }
   }
 
-  // Dispose
+  /// Returns the last known connection state without an async call.
+  WifiDirectConnectionState get lastKnownState => _lastState;
+
+  /// True once both P2P group is formed AND TCP socket is established.
+  bool get isFullyConnected => _lastState.isFullyConnected;
+
+  // ═════════════════════════════════════════════════════════════════
+  // Legacy compatibility (kept for DeviceModel-based callers)
+  // ═════════════════════════════════════════════════════════════════
+
+  /// Connect to device — wraps [initiateConnection] using device name.
+  Future<bool> connectToDevice(DeviceModel device) async {
+    final result = await initiateConnection(targetName: device.name);
+    return result['success'] == true;
+  }
+
+  /// Get a DeviceModel for the currently connected peer.
+  /// Returns null if not fully connected.
+  Future<DeviceModel?> getConnectedDevice() async {
+    if (!isFullyConnected) return null;
+    final state = _lastState;
+    return DeviceModel(
+      id: 'wifi_direct_peer',
+      name: 'Wi-Fi Direct Peer',
+      address: state.ipAddress,
+      type: DeviceType.wifiDirect,
+      isConnected: true,
+    );
+  }
+
+  // ═════════════════════════════════════════════════════════════════
+  // Lifecycle
+  // ═════════════════════════════════════════════════════════════════
+
   void dispose() {
-    _deviceController.close();
+    _messageSubscription?.cancel();
+    _connectionStateSubscription?.cancel();
+    _peersSubscription?.cancel();
     _messageController.close();
+    _connectionStateController.close();
+    _peersController.close();
     disconnect();
   }
 }
-
