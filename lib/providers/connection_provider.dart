@@ -101,12 +101,11 @@ class ConnectionNotifier extends StateNotifier<ConnectionProviderState> {
 
   void _handleIncomingMessageGlobally(String messageJson) {
     try {
-      Logger.info('Global message handler received: $messageJson');
-      
-      // Parse the message
+      Logger.info('ConnectionProvider: global message handler received message');
+
       final jsonMap = _parseJsonString(messageJson);
       if (jsonMap == null) {
-        Logger.warning('Could not parse message JSON');
+        Logger.warning('ConnectionProvider: could not parse message JSON');
         return;
       }
 
@@ -116,49 +115,61 @@ class ConnectionNotifier extends StateNotifier<ConnectionProviderState> {
         status: MessageStatus.delivered,
       );
 
-      // Save to storage
+      // Save to storage first so it is persisted regardless of UI state.
       MessageStorage.saveMessage(message);
 
-      // Determine device name (check stored name first, then connected device, then fallback)
-      final senderId = message.isSent ? message.receiverId : message.senderId;
-      final storedName = DeviceStorage.getDeviceDisplayName(senderId);
+      // ── Conversation key: the OTHER party's UUID ─────────────────
+      // For an inbound message (isSent == false):
+      //   • senderId / originalSenderId is the peer's UUID.
+      // We use originalSenderId with a fallback to senderId — both are UUID.
+      final peerUuid = message.originalSenderId.isNotEmpty
+          ? message.originalSenderId
+          : message.senderId;
+
+      Logger.info(
+          'ConnectionProvider: incoming message from peerUuid=$peerUuid, '
+          'content="${message.content}"');
+
+      // ── Peer display name resolution (UUID-only, no MAC) ─────────
       String deviceName;
-      
+      final storedName = DeviceStorage.getDeviceDisplayName(peerUuid);
       if (storedName != null && storedName.isNotEmpty) {
         deviceName = storedName;
-      } else if (state.connectedDevice != null && 
-          (state.connectedDevice!.id == message.senderId || 
-           state.connectedDevice!.id == message.receiverId) &&
+      } else if (state.connectedDevice != null &&
+          state.connectedDevice!.id == peerUuid &&
+          state.connectedDevice!.name.isNotEmpty &&
           state.connectedDevice!.name != 'Unknown Device' &&
-          state.connectedDevice!.name != senderId) {
+          state.connectedDevice!.name != peerUuid) {
         deviceName = state.connectedDevice!.name;
-        // Store the name for future use
-        DeviceStorage.setDeviceDisplayName(senderId, deviceName);
+        // Cache the resolved name for future lookups.
+        unawaited(DeviceStorage.setDeviceDisplayName(peerUuid, deviceName));
       } else {
-        deviceName = senderId; // Fallback to deviceId
+        deviceName = peerUuid; // Fallback: show UUID until name is known
       }
 
-      // Update conversations list
+      // ── Update conversations list ─────────────────────────────────
       _ref.read(conversationsProvider.notifier).updateConversation(message, deviceName);
 
-      // Try to notify the chat provider for this device if it exists
-      // The chat provider is a family provider, so we need the device ID
+      // ── Deliver to the open chat screen (if any) ─────────────────
+      // chatProvider is keyed by peerUuid.  If the chat screen for this
+      // peer is mounted, the provider exists and will show the message.
+      // If not, the message is already persisted and will load on open.
       try {
-        // Try to access the chat provider for the sender device
-        // If the chat screen is open for this device, the provider will exist
-        final chatNotifier = _ref.read(chatProvider(senderId).notifier);
-        // Call receiveMessage with the original JSON
+        final chatNotifier = _ref.read(chatProvider(peerUuid).notifier);
         chatNotifier.receiveMessage(messageJson);
-        Logger.info('Notified chat provider for device: $senderId');
+        Logger.info(
+            'ConnectionProvider: delivered message to chatProvider($peerUuid)');
       } catch (e) {
-        // Chat provider doesn't exist for this device (chat screen not open)
-        // This is fine - messages are saved and will load when chat opens
-        Logger.debug('Chat provider not active for device: $senderId');
+        Logger.debug(
+            'ConnectionProvider: chatProvider($peerUuid) not active — '
+            'message persisted for later load');
       }
-      
-      Logger.info('Message processed globally: ${message.content}');
+
+      Logger.info(
+          'ConnectionProvider: message processed — peerUuid=$peerUuid, '
+          'content="${message.content}"');
     } catch (e, stackTrace) {
-      Logger.error('Error in global message handler', e, stackTrace);
+      Logger.error('ConnectionProvider: error in global message handler', e, stackTrace);
     }
   }
 
@@ -179,29 +190,32 @@ class ConnectionNotifier extends StateNotifier<ConnectionProviderState> {
 
   Future<bool> connectToDevice(DeviceModel device) async {
     try {
+      // Emit "connecting" immediately so the UI shows a spinner.
+      // We must NOT emit "connected" here — that transition is driven
+      // exclusively by the Wi-Fi Direct state stream in _setupListeners()
+      // once the native layer confirms SOCKET_CONNECTED.
       state = state.copyWith(
         state: ConnectionStateType.connecting,
         error: null,
       );
 
-      final connected = await _connectionManager.connectToDevice(device);
+      final started = await _connectionManager.connectToDevice(device);
 
-      if (connected) {
-        state = state.copyWith(
-          state: ConnectionStateType.connected,
-          connectedDevice: _connectionManager.connectedDevice,
-          connectionType: _connectionManager.currentConnectionType,
-          error: null,
-        );
-        Logger.info('Connected to device: ${device.name}');
+      if (started) {
+        // Connection attempt was accepted by the native layer.
+        // Stay in "connecting" state — _setupListeners will emit "connected"
+        // only when the TCP socket is actually established (socketActive == true).
+        Logger.info(
+            'Wi-Fi Direct negotiation started for ${device.name} — '
+            'awaiting SOCKET_CONNECTED event…');
       } else {
         state = state.copyWith(
           state: ConnectionStateType.error,
-          error: 'Failed to connect to device',
+          error: 'Failed to start Wi-Fi Direct connection',
         );
       }
 
-      return connected;
+      return started;
     } catch (e) {
       state = state.copyWith(
         state: ConnectionStateType.error,

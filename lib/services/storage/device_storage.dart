@@ -139,19 +139,33 @@ class DeviceStorage {
     }
   }
 
-  /// UUID-MAC Mapping: Store MAC address for a UUID
+  // ── MAC Address Mapping (DEPRECATED — DO NOT USE IN ROUTING) ──────────────
+  //
+  // Android randomises MAC addresses (API 29+) and Wi-Fi Direct may return
+  // 02:00:00:00:00:00.  These methods exist ONLY for legacy BLE scanning
+  // services (bluetooth_service.dart, classic_bluetooth_service.dart) that
+  // still perform hardware-level matching.  They must NEVER be used as
+  // conversation keys, TransportManager neighbor keys, or message IDs.
+  //
+  // The authoritative device identity is the UUID returned by getDeviceId().
+  // All routing, chat keying, and message addressing must use UUID exclusively.
+
+  /// @deprecated MAC addresses are unreliable on modern Android.
+  /// Store only for legacy BLE scan services; never use for routing.
+  @Deprecated('Do not use MAC addresses for routing or conversation keying')
   static Future<void> setMacForUuid(String uuid, String macAddress) async {
     try {
       if (_deviceBox != null) {
         await _deviceBox!.put('uuid_mac_$uuid', macAddress);
-        Logger.debug('Stored MAC mapping: $uuid -> $macAddress');
+        Logger.debug('(legacy) Stored MAC mapping: $uuid -> $macAddress');
       }
     } catch (e) {
       Logger.error('Error storing UUID-MAC mapping', e);
     }
   }
 
-  /// UUID-MAC Mapping: Get MAC address for a UUID
+  /// @deprecated Use UUID as the sole device identity.
+  @Deprecated('Do not use MAC addresses for routing or conversation keying')
   static String? getMacForUuid(String uuid) {
     try {
       return _deviceBox?.get('uuid_mac_$uuid') as String?;
@@ -161,20 +175,17 @@ class DeviceStorage {
     }
   }
 
-  /// UUID-MAC Mapping: Get UUID for a MAC address
+  /// @deprecated Use UUID as the sole device identity.
+  @Deprecated('Do not use MAC addresses for routing or conversation keying')
   static String? getUuidForMac(String macAddress) {
     try {
       if (_deviceBox == null) return null;
-      
-      // Need to iterate through all keys to find matching MAC
-      // This is not ideal but Hive doesn't support reverse lookups efficiently
-      final keys = _deviceBox!.keys.where((key) => key.toString().startsWith('uuid_mac_'));
+      final keys =
+          _deviceBox!.keys.where((key) => key.toString().startsWith('uuid_mac_'));
       for (final key in keys) {
         final storedMac = _deviceBox!.get(key) as String?;
         if (storedMac == macAddress) {
-          // Extract UUID from key (format: 'uuid_mac_<uuid>')
-          final uuid = key.toString().replaceFirst('uuid_mac_', '');
-          return uuid;
+          return key.toString().replaceFirst('uuid_mac_', '');
         }
       }
       return null;
@@ -184,11 +195,12 @@ class DeviceStorage {
     }
   }
 
-  /// UUID-MAC Mapping: Remove mapping for a UUID
+  /// @deprecated Use UUID as the sole device identity.
+  @Deprecated('Do not use MAC addresses for routing or conversation keying')
   static Future<void> removeMacMapping(String uuid) async {
     try {
       await _deviceBox?.delete('uuid_mac_$uuid');
-      Logger.debug('Removed MAC mapping for UUID: $uuid');
+      Logger.debug('(legacy) Removed MAC mapping for UUID: $uuid');
     } catch (e) {
       Logger.error('Error removing MAC mapping', e);
     }

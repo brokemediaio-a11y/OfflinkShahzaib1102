@@ -162,10 +162,22 @@ class WifiDirectService {
         if (event is Map) {
           final state = WifiDirectConnectionState.fromMap(event);
           _lastState = state;
+
+          // Structured, high-signal log for debugging the native state machine.
+          // This mirrors the style of the updateConversation logs so we can
+          // correlate socket/phase with chat behaviour on each device.
+          final phase = event['connectionPhase'] as String? ?? 'UNKNOWN';
           Logger.info(
-              'WifiDirectService: connection state — '
-              'connected=${state.connected}, role=${state.role}, '
-              'socketActive=${state.socketActive}, error=${state.error}');
+            '🔌 WIFI_DIRECT_STATE: '
+            'connected=${state.connected}, '
+            'socketActive=${state.socketActive}, '
+            'role=${state.role}, '
+            'status=${state.status}, '
+            'ip=${state.ipAddress}, '
+            'error=${state.error}, '
+            'phase=$phase',
+          );
+
           _connectionStateController.add(state);
         }
       },
@@ -324,17 +336,19 @@ class WifiDirectService {
   }
 
   /// Get a DeviceModel for the currently connected peer.
-  /// Returns null if not fully connected.
+  ///
+  /// Returns null if the socket is not fully established.
+  ///
+  /// NOTE: This method intentionally does NOT fabricate a device identity.
+  /// The peer UUID is established via the UUID handshake in ConnectionManager
+  /// and is stored in ConnectionManager._connectedPeerId.
+  /// Callers that need a DeviceModel should use ConnectionManager.connectedDevice.
   Future<DeviceModel?> getConnectedDevice() async {
     if (!isFullyConnected) return null;
-    final state = _lastState;
-    return DeviceModel(
-      id: 'wifi_direct_peer',
-      name: 'Wi-Fi Direct Peer',
-      address: state.ipAddress,
-      type: DeviceType.wifiDirect,
-      isConnected: true,
-    );
+    // Peer UUID is unknown at this layer — it is resolved by ConnectionManager
+    // via the UUID handshake.  Return null to force callers to use
+    // ConnectionManager.connectedDevice which holds the resolved identity.
+    return null;
   }
 
   // ═════════════════════════════════════════════════════════════════

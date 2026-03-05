@@ -188,17 +188,177 @@ class ConnectionManager {
           'socketActive=${state.socketActive}, error=${state.error}');
 
       if (state.connected && state.socketActive) {
-        // Socket is open — full data-plane connection ready
-        final role = state.isGroupOwner
-            ? ConnectionRole.peripheral   // GO == Peripheral (server)
-            : ConnectionRole.central;     // Client == Central
+        // ── Socket open ────────────────────────────────────────────
+        // Always send a UUID handshake so the RECEIVING side (which never
+        // called connectToDevice) can learn our UUID before chat opens.
+        _sendUuidHandshake();
 
-        // Build / refresh the PeerConnection in TransportManager
-        final deviceId = _connectedPeerId ?? 'wifi_direct_peer';
+        if (_connectedPeerId != null) {
+          // ── INITIATOR side: we already know the peer UUID ─────────
+          final role = state.isGroupOwner
+              ? ConnectionRole.peripheral // GO == server
+              : ConnectionRole.central;   // client
+
+          final peerName =
+              _connectedDevice?.name ??
+              DeviceStorage.getDeviceDisplayName(_connectedPeerId!) ??
+              'Offlink Peer';
+
+          final device = DeviceModel(
+            id: _connectedPeerId!,
+            name: peerName,
+            type: DeviceType.wifiDirect,
+            isConnected: true,
+          );
+
+          final peerConnection = _transportManager.createPeerConnection(
+            device: device,
+            transportType: TransportType.wifiDirect,
+            role: role,
+            ipAddress: state.ipAddress,
+            socketActive: true,
+          );
+          _transportManager.addNeighbor(peerConnection);
+
+          _connectedDevice = device;
+          _currentConnectionType = ConnectionType.wifiDirect;
+          _connectionController.add(ConnectionState.connected);
+
+          Logger.info(
+              'ConnectionManager: ✅ Wi-Fi Direct fully connected (initiator) — '
+              'peerId=${_connectedPeerId!}, role=${role.name}, ip=${state.ipAddress}');
+        } else {
+          // ── RECEIVING side: peer UUID unknown until handshake ─────
+          // Register a placeholder so the transport layer is ready to
+          // send the handshake reply. State stays "connecting" until
+          // _handleUuidHandshake() resolves the real UUID.
+          final role = state.isGroupOwner
+              ? ConnectionRole.peripheral
+              : ConnectionRole.central;
+
+          const placeholderId = '__uuid_pending__';
+          final placeholderDevice = DeviceModel(
+            id: placeholderId,
+            name: 'Connecting…',
+            type: DeviceType.wifiDirect,
+            isConnected: true,
+          );
+          final peerConnection = _transportManager.createPeerConnection(
+            device: placeholderDevice,
+            transportType: TransportType.wifiDirect,
+            role: role,
+            ipAddress: state.ipAddress,
+            socketActive: true,
+          );
+          _transportManager.addNeighbor(peerConnection);
+          _currentConnectionType = ConnectionType.wifiDirect;
+
+          // Stay in "connecting" state — will flip to "connected" in
+          // _handleUuidHandshake() once the peer's UUID is received.
+          _connectionController.add(ConnectionState.connecting);
+          Logger.info(
+              'ConnectionManager: Wi-Fi Direct socket open (receiver) — '
+              'awaiting UUID handshake from initiator…');
+        }
+
+      } else if (state.connected && !state.socketActive) {
+        // P2P group formed but socket not yet open
+        _connectionController.add(ConnectionState.connecting);
+        Logger.info('ConnectionManager: Wi-Fi Direct group formed, awaiting socket…');
+
+      } else if (!state.connected) {
+        if (state.status == 'connecting') {
+          // ── connect() request accepted — P2P group is forming ────────
+          // This is a transitional state fired by the native layer when
+          // WifiP2pManager.connect() is accepted.  Do NOT clear
+          // _connectedPeerId — the initiator side needs it when the socket
+          // opens.  The UI should stay in "connecting" state.
+          _connectionController.add(ConnectionState.connecting);
+          Logger.info(
+              'ConnectionManager: Wi-Fi Direct connect() accepted — '
+              'awaiting group formation…');
+        } else {
+          // ── Actual disconnect or failure ─────────────────────────────
+          final reason = state.error ?? 'disconnected';
+          Logger.info('ConnectionManager: Wi-Fi Direct disconnected — $reason');
+
+          final idToRemove = _connectedPeerId ?? '__uuid_pending__';
+          _transportManager.removeNeighbor(idToRemove);
+
+          _currentConnectionType = ConnectionType.none;
+          _connectedDevice = null;
+          _connectedPeerId = null;
+
+          // Emit error vs. clean disconnect so the UI can show the right message
+          if (state.error != null) {
+            _connectionController.add(ConnectionState.error);
+          } else {
+            _connectionController.add(ConnectionState.disconnected);
+          }
+
+          // BLE continues scanning in background — no action needed here.
+          // User can reconnect by tapping the device again in the UI.
+        }
+      }
+    } catch (e, st) {
+      Logger.error('ConnectionManager: error handling Wi-Fi Direct state', e, st);
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // UUID Handshake — mutual UUID exchange over the socket
+  // ═══════════════════════════════════════════════════════════════════
+
+  /// Sends our UUID to the peer immediately after the socket opens.
+  /// Both sides do this so neither needs to know the other's UUID in advance.
+  void _sendUuidHandshake() {
+    try {
+      final myUuid = DeviceStorage.getDeviceId();
+      final handshake = jsonEncode({
+        '__type': '__uuid_handshake__',
+        'senderUuid': myUuid,
+      });
+      // Use the service directly — transport map may still be placeholder.
+      _wifiDirectService.sendMessage(handshake);
+      Logger.info('ConnectionManager: 🤝 sent UUID handshake (myUuid=$myUuid)');
+    } catch (e) {
+      Logger.error('ConnectionManager: failed to send UUID handshake', e);
+    }
+  }
+
+  /// Called when a `__uuid_handshake__` message is received from the peer.
+  /// Resolves the peer UUID so routing and the UI use the correct identity.
+  void _handleUuidHandshake(Map<String, dynamic> handshake) {
+    try {
+      final senderUuid = handshake['senderUuid'] as String?;
+      if (senderUuid == null || senderUuid.isEmpty) {
+        Logger.warning('ConnectionManager: UUID handshake missing senderUuid');
+        return;
+      }
+
+      Logger.info(
+          'ConnectionManager: 🤝 received UUID handshake — peerUuid=$senderUuid');
+
+      if (_connectedPeerId == null || _connectedPeerId == '__uuid_pending__') {
+        // ── RECEIVING side: update from placeholder to real UUID ───
+        final oldId = _connectedPeerId ?? '__uuid_pending__';
+        _connectedPeerId = senderUuid;
+
+        // Remove placeholder neighbor
+        _transportManager.removeNeighbor(oldId);
+
+        // Look up a stored name for this peer (if they were seen via BLE before)
+        final peerName =
+            DeviceStorage.getDeviceDisplayName(senderUuid) ?? 'Offlink Peer';
+
+        final lastState = _wifiDirectService.lastKnownState;
+        final role = lastState.isGroupOwner
+            ? ConnectionRole.peripheral
+            : ConnectionRole.central;
+
         final device = DeviceModel(
-          id: deviceId,
-          name: _connectedDevice?.name ?? 'Wi-Fi Direct Peer',
-          address: state.ipAddress,
+          id: senderUuid,
+          name: peerName,
           type: DeviceType.wifiDirect,
           isConnected: true,
         );
@@ -207,7 +367,7 @@ class ConnectionManager {
           device: device,
           transportType: TransportType.wifiDirect,
           role: role,
-          ipAddress: state.ipAddress,
+          ipAddress: lastState.ipAddress,
           socketActive: true,
         );
         _transportManager.addNeighbor(peerConnection);
@@ -217,32 +377,16 @@ class ConnectionManager {
         _connectionController.add(ConnectionState.connected);
 
         Logger.info(
-            'ConnectionManager: ✅ Wi-Fi Direct fully connected — '
-            'peerId=$deviceId, role=${role.name}, ip=${state.ipAddress}');
-
-      } else if (state.connected && !state.socketActive) {
-        // P2P group formed but socket not yet open
-        _connectionController.add(ConnectionState.connecting);
-        Logger.info('ConnectionManager: Wi-Fi Direct group formed, awaiting socket…');
-
-      } else if (!state.connected) {
-        // Disconnected
-        final reason = state.error ?? 'disconnected';
-        Logger.info('ConnectionManager: Wi-Fi Direct disconnected — $reason');
-
-        if (_connectedPeerId != null) {
-          _transportManager.removeNeighbor(_connectedPeerId!);
-        }
-        _currentConnectionType = ConnectionType.none;
-        _connectedDevice = null;
-        _connectedPeerId = null;
-        _connectionController.add(ConnectionState.disconnected);
-
-        // BLE continues scanning in background — no action needed here.
-        // User can reconnect by tapping the device again in the UI.
+            'ConnectionManager: ✅ peer UUID resolved from handshake — '
+            'peerId=$senderUuid, name=$peerName');
+      } else {
+        // ── INITIATOR side: handshake reply confirms peer is ready ──
+        Logger.info(
+            'ConnectionManager: peer confirmed UUID handshake '
+            '(our _connectedPeerId=${_connectedPeerId!})');
       }
-    } catch (e, st) {
-      Logger.error('ConnectionManager: error handling Wi-Fi Direct state', e, st);
+    } catch (e) {
+      Logger.error('ConnectionManager: error handling UUID handshake', e);
     }
   }
 
@@ -467,15 +611,9 @@ class ConnectionManager {
       Logger.info(
           'ConnectionManager: initiating Wi-Fi Direct connection to "${device.name}"');
 
-      // Store the peer UUID so we can key the TransportManager entry
+      // Store the peer UUID — this is the single authoritative identity key.
+      // UUID comes from BLE discovery; it is never a MAC address.
       _connectedPeerId = device.id;
-
-      // Persist UUID ↔ MAC mapping if we have both
-      if (device.address != null &&
-          device.address!.isNotEmpty &&
-          !device.id.contains(':')) {
-        DeviceStorage.setMacForUuid(device.id, device.address!);
-      }
 
       // Store display name
       if (device.name.isNotEmpty &&
@@ -624,6 +762,12 @@ class ConnectionManager {
             'forwarding raw for backward compat');
         _messageController.add(message);
         return;
+      }
+
+      // ── UUID handshake — intercept before routing ─────────────────
+      if (jsonMap['__type'] == '__uuid_handshake__') {
+        _handleUuidHandshake(jsonMap);
+        return; // Do NOT route to RoutingManager or ChatNotifier
       }
 
       final messageModel = MessageModel.fromJson(jsonMap);

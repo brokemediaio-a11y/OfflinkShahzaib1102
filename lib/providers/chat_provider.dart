@@ -92,12 +92,12 @@ class ChatNotifier extends StateNotifier<ChatState> {
     if (content.trim().isEmpty) return;
 
     try {
-      // IMPORTANT: Use _otherDeviceId as the receiverId to ensure consistency
-      // This ensures Device 2 replies to the same UUID it received the message from
-      // _otherDeviceId is set when the chat screen is opened and contains the senderId from the received message
-      String finalReceiverId = _otherDeviceId.isNotEmpty ? _otherDeviceId : receiverId;
-      
-      Logger.info('Sending message: receiverId=$finalReceiverId, _otherDeviceId=$_otherDeviceId, provided receiverId=$receiverId');
+      // The conversation key (_otherDeviceId) is always the peer's UUID.
+      // Use it directly as the message receiver — never fall back to a MAC or
+      // any other identifier.
+      final String finalReceiverId = _otherDeviceId;
+
+      Logger.info('ChatNotifier.sendMessage: receiverId=$finalReceiverId (_otherDeviceId=$_otherDeviceId)');
       
       // Check if we're connected to any device
       // IMPORTANT: If we're already connected (as central OR peripheral), use that connection
@@ -322,50 +322,46 @@ class ChatNotifier extends StateNotifier<ChatState> {
         return;
       }
 
-      // Check if message is for this conversation
-      // When receiving a message:
-      // - receiverId: Our MAC address (we're receiving it) - e.g., "58:8B:3F:38:CE:9D" (TECNO's MAC)
-      // - senderId: UUID or MAC of the sender - e.g., "731746e5-ddd3-4fe3-9ad1-870903140f63" (UUID from OPPO)
-      // - _otherDeviceId: MAC address of the device we're chatting with - e.g., "40:93:EF:97:B5:0D" (OPPO's MAC)
-      // - _myDeviceId: Our device UUID (not MAC)
-      
-      // Match messages by:
-      // 1. If receiverId matches the other device (we sent it to them) - receiverId = _otherDeviceId
-      // 2. If we're receiving (receiverId is a MAC address in format XX:XX:XX:XX:XX:XX), accept it
-      //    since we're in a 1-on-1 chat screen - this means it's addressed to us
-      // 3. If senderId matches the other device (they sent it to us) - senderId = _otherDeviceId
-      
-      final receiverMatchesOtherDevice = message.receiverId == _otherDeviceId;
-      final senderMatchesOtherDevice = message.senderId == _otherDeviceId;
-      
-      // Check if receiverId is a MAC address (format: XX:XX:XX:XX:XX:XX, 17 chars)
-      // If we're receiving a message with a MAC address as receiverId, it's addressed to us
-      // Since we're in a chat screen, accept all received messages (receiverId is MAC = we're receiving)
-      final receiverIdIsMacAddress = message.receiverId.contains(':') && 
-                                      message.receiverId.length == 17;
-      
-      // Accept message if:
-      // 1. Receiver matches other device (we sent it to them)
-      // 2. OR sender matches other device (they sent it to us)
-      // 3. OR we're receiving (receiverId is MAC address) - accept since we're in a 1-on-1 chat screen
-      final isForThisConversation = receiverMatchesOtherDevice || 
-                                     senderMatchesOtherDevice ||
-                                     (receiverIdIsMacAddress && !message.isSent);
-      
-      Logger.info('Message matching check: receiverId=${message.receiverId}, senderId=${message.senderId}, _otherDeviceId=$_otherDeviceId, isSent=${message.isSent}');
-      Logger.info('  - receiverMatchesOtherDevice: $receiverMatchesOtherDevice');
-      Logger.info('  - senderMatchesOtherDevice: $senderMatchesOtherDevice');
-      Logger.info('  - isForThisConversation: $isForThisConversation');
-      
+      // ── UUID-only conversation matching ────────────────────────────
+      //
+      // Identity rule: every device has exactly ONE identifier — its UUID.
+      // There are no MAC addresses, no role-based IDs.
+      //
+      // This provider is keyed on _otherDeviceId (UUID from BLE discovery or
+      // UUID resolved by the handshake in ConnectionManager).
+      //
+      // A message belongs to this conversation when:
+      //   • sender is the other device  (they sent it to us), OR
+      //   • receiver is the other device (we sent it to them)
+      //
+      // Because RoutingManager already filters on finalReceiverId == myUuid
+      // before emitting to ConnectionNotifier, and ConnectionNotifier routes
+      // to chatProvider(senderId), every message arriving here is already
+      // for this conversation.  The check below is a safety net.
+      final senderMatchesOtherDevice  = message.senderId  == _otherDeviceId ||
+                                         message.originalSenderId == _otherDeviceId;
+      final receiverMatchesOtherDevice = message.receiverId == _otherDeviceId ||
+                                         message.finalReceiverId == _otherDeviceId;
+      final isForThisConversation = senderMatchesOtherDevice || receiverMatchesOtherDevice;
+
+      Logger.info(
+          'ChatNotifier.receiveMessage: '
+          'senderId=${message.senderId}, receiverId=${message.receiverId}, '
+          '_otherDeviceId=$_otherDeviceId → '
+          'senderMatch=$senderMatchesOtherDevice, '
+          'receiverMatch=$receiverMatchesOtherDevice');
+
       if (!isForThisConversation) {
-        Logger.info('Message not for this conversation. Sender: ${message.senderId}, Receiver: ${message.receiverId}, Chatting with: $_otherDeviceId, isSent: ${message.isSent}');
-        Logger.info('Message content: ${message.content}');
-        // Still save it to storage, but don't add to current state
+        Logger.warning(
+            'ChatNotifier: message not for this conversation — '
+            'sender=${message.senderId}, receiver=${message.receiverId}, '
+            'chatWith=$_otherDeviceId');
+        // Save to storage so it can be loaded by the correct chat later.
         MessageStorage.saveMessage(message);
         return;
       }
-      
-      Logger.info('Message accepted for conversation. Content: ${message.content}');
+
+      Logger.info('ChatNotifier: message accepted. Content: ${message.content}');
 
       // Add to state
       final updatedMessages = [...state.messages, message];

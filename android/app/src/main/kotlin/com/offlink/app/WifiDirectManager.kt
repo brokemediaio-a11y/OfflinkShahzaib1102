@@ -26,24 +26,46 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
+
+/**
+ * WiFi Direct connection phase — strict state machine.
+ *
+ * All transitions are driven ONLY by:
+ *   - System broadcast callbacks (WIFI_P2P_CONNECTION_CHANGED_ACTION)
+ *   - WifiP2pInfo callbacks (onConnectionInfoAvailable)
+ *   - Socket success / failure events
+ *
+ * NO optimistic state. NO simple isConnected booleans.
+ */
+enum class ConnectionPhase {
+    IDLE,               // Initial / fully reset state
+    DISCOVERING,        // discoverPeers() initiated
+    CONNECTING,         // connect() request sent to WifiP2pManager
+    GROUP_FORMED,       // groupFormed == true in onConnectionInfoAvailable
+    SOCKET_CONNECTING,  // Socket thread started (ServerSocket listening / client dialing)
+    SOCKET_CONNECTED,   // socket.isConnected == true, streams open → ONLY valid connected state
+    DISCONNECTED,       // Explicit disconnect or broadcast disconnect event
+    FAILED              // Unrecoverable error — must reconnect from scratch
+}
 
 /**
  * WifiDirectManager — Data Plane (Messaging Transport)
  *
- * Implements Wi-Fi Direct (P2P) group negotiation and persistent TCP
- * socket communication for Offlink chat payload delivery.
- *
  * Architecture role:
- *   BLE  → discovers peers (UUID + username)
- *   Wi-Fi Direct → transports all chat messages
+ *   BLE  → discovers peers (UUID + username) — control plane only
+ *   Wi-Fi Direct → transports all chat messages — data plane
  *
- * Flow:
+ * Correct connection flow:
  *   1. Dart calls initiateConnection(targetDeviceName)
- *   2. discoverPeers() → WifiP2pBroadcastReceiver receives PEERS_CHANGED
- *   3. Peer with matching name is found → connect(WifiP2pConfig)
- *   4. WIFI_P2P_CONNECTION_CHANGED → requestConnectionInfo()
- *   5. Group Owner starts TCP server; client connects to GO IP
- *   6. Bidirectional line-delimited text over the socket
+ *   2. discoverPeers() → PEERS_CHANGED broadcast → handlePeerListUpdate()
+ *   3. Matching peer found → connect(WifiP2pConfig) → phase = CONNECTING
+ *   4. CONNECTION_CHANGED broadcast → networkInfo.isConnected == true
+ *   5. requestConnectionInfo() → groupFormed == true → phase = GROUP_FORMED
+ *   6. Group Owner: start ServerSocket → phase = SOCKET_CONNECTING
+ *      Client: dial groupOwnerAddress → phase = SOCKET_CONNECTING
+ *   7. Socket connected → phase = SOCKET_CONNECTED → notify Dart
+ *   8. Dart opens Chat screen ONLY after SOCKET_CONNECTED
  */
 class WifiDirectManager(private val context: Context) {
 
@@ -58,9 +80,11 @@ class WifiDirectManager(private val context: Context) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val executor: ExecutorService = Executors.newCachedThreadPool()
 
-    // Connection state
+    // ── State Machine ────────────────────────────────────────────────────────
+    // Single source of truth. NO other flags drive connection logic.
+    private val connectionPhase = AtomicReference(ConnectionPhase.IDLE)
+
     private val isP2pEnabled = AtomicBoolean(false)
-    private val isConnected = AtomicBoolean(false)
     private val isGroupOwner = AtomicBoolean(false)
     private var groupOwnerAddress: String? = null
     private var targetDeviceName: String? = null
@@ -78,6 +102,13 @@ class WifiDirectManager(private val context: Context) {
     private val discoveryRetryCount = AtomicInteger(0)
     private val maxDiscoveryRetries = 4
 
+    // Safety timeout: reset if we stay CONNECTING with no response for 15 s
+    private var connectingTimeoutRunnable: Runnable? = null
+
+    // Auto-retry counter — resets on a fresh user-initiated connect or disconnect
+    private val connectRetryCount = AtomicInteger(0)
+    private val maxConnectRetries = 5   // covers stale-INVITED cleanup + simultaneous-tap deadlock
+
     // Callbacks → Dart
     var peerListListener: ((List<Map<String, Any>>) -> Unit)? = null
     var connectionStateListener: ((Map<String, Any>) -> Unit)? = null
@@ -94,6 +125,7 @@ class WifiDirectManager(private val context: Context) {
     // Public API
     // ═══════════════════════════════════════════════════════════════
 
+    @SuppressLint("MissingPermission")
     fun initialize(): Boolean {
         if (initialized) return true
 
@@ -108,7 +140,7 @@ class WifiDirectManager(private val context: Context) {
             Looper.getMainLooper()
         ) {
             Log.w(tag, "Wi-Fi P2P channel disconnected — will attempt reinit")
-            isConnected.set(false)
+            connectionPhase.set(ConnectionPhase.DISCONNECTED)
             isSocketActive.set(false)
             notifyConnectionState(connected = false, error = "P2P channel disconnected")
         }
@@ -121,6 +153,25 @@ class WifiDirectManager(private val context: Context) {
         registerReceiver()
         initialized = true
         Log.d(tag, "WifiDirectManager initialised")
+
+        // ── Clean up any stale group from a previous session ─────────────────
+        // If the app was killed while a Wi-Fi Direct group was active, the
+        // Android framework keeps that group alive.  Peers will then show as
+        // INVITED or CONNECTED on the next launch, causing a spurious infinite
+        // connect-loop before any user action.  Remove the group first; start
+        // passive discovery only after the framework confirms a clean slate.
+        wifiP2pManager!!.removeGroup(p2pChannel!!, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                Log.d(tag, "Stale Wi-Fi Direct group removed — starting passive discovery")
+                mainHandler.postDelayed({ discoverPeers() }, 1000)
+            }
+            override fun onFailure(reason: Int) {
+                // No group to remove — that is fine; start discovery normally.
+                Log.d(tag, "No stale group on init (${failureReason(reason)}) — starting passive discovery")
+                mainHandler.postDelayed({ discoverPeers() }, 1000)
+            }
+        })
+
         return true
     }
 
@@ -132,18 +183,43 @@ class WifiDirectManager(private val context: Context) {
 
         val attempt = discoveryRetryCount.get() + 1
         Log.d(tag, "Starting Wi-Fi Direct peer discovery… (attempt $attempt/$maxDiscoveryRetries)")
+
         mgr.discoverPeers(ch, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
                 Log.d(tag, "Peer discovery initiated successfully")
                 discoveryRetryCount.set(0)
+                // Only advance to DISCOVERING if we are not already further along
+                val phase = connectionPhase.get()
+                if (phase == ConnectionPhase.IDLE || phase == ConnectionPhase.DISCONNECTED ||
+                    phase == ConnectionPhase.FAILED) {
+                    connectionPhase.set(ConnectionPhase.DISCOVERING)
+                }
+
+                // ── Proactive INVITED-peer check ──────────────────────────────
+                // On some OEM devices (e.g. Infinix SMART 7 HD) the framework
+                // does NOT reliably fire PEERS_CHANGED for spontaneous invitations
+                // received while the device is in passive-discovery mode.
+                // By explicitly requesting the peer list 500 ms after discovery
+                // starts we catch any INVITED peer that arrived while we were
+                // restarting, enabling true one-tap connection.
+                mainHandler.postDelayed({
+                    val ph = connectionPhase.get()
+                    if (ph != ConnectionPhase.CONNECTING &&
+                        ph != ConnectionPhase.GROUP_FORMED &&
+                        ph != ConnectionPhase.SOCKET_CONNECTING &&
+                        ph != ConnectionPhase.SOCKET_CONNECTED) {
+                        Log.d(tag, "Post-discovery probe: checking for INVITED peers…")
+                        wifiP2pManager?.requestPeers(p2pChannel) { peerList ->
+                            handlePeerListUpdate(peerList)
+                        }
+                    }
+                }, 500)
             }
             override fun onFailure(reason: Int) {
                 Log.e(tag, "Peer discovery failed: ${failureReason(reason)}")
                 when {
                     reason == WifiP2pManager.BUSY &&
                     discoveryRetryCount.incrementAndGet() <= maxDiscoveryRetries -> {
-                        // Framework is busy (previous operation still in flight).
-                        // Back off and retry so auto-connect can eventually fire.
                         val delayMs = 1500L * discoveryRetryCount.get()
                         Log.d(tag, "Peer discovery BUSY — retrying in ${delayMs}ms " +
                               "(attempt ${discoveryRetryCount.get()}/$maxDiscoveryRetries)")
@@ -151,19 +227,12 @@ class WifiDirectManager(private val context: Context) {
                     }
                     else -> {
                         discoveryRetryCount.set(0)
-                        if (reason != WifiP2pManager.BUSY) {
-                            notifyConnectionState(
-                                connected = false,
-                                error = "Peer discovery failed: ${failureReason(reason)}"
-                            )
-                        }
-                        // Max retries exhausted for BUSY — notify dart
-                        if (reason == WifiP2pManager.BUSY) {
-                            notifyConnectionState(
-                                connected = false,
-                                error = "Peer discovery unavailable (framework busy after $maxDiscoveryRetries retries)"
-                            )
-                        }
+                        val errorMsg = if (reason == WifiP2pManager.BUSY)
+                            "Peer discovery unavailable (framework busy after $maxDiscoveryRetries retries)"
+                        else
+                            "Peer discovery failed: ${failureReason(reason)}"
+                        connectionPhase.set(ConnectionPhase.FAILED)
+                        notifyConnectionState(connected = false, error = errorMsg)
                     }
                 }
             }
@@ -173,21 +242,35 @@ class WifiDirectManager(private val context: Context) {
 
     /**
      * Initiate a Wi-Fi Direct connection to the peer whose Wi-Fi name
-     * matches [targetName].  If the peer list is empty, peer discovery is
-     * started first and auto-connect will fire when a matching peer appears.
+     * matches [targetName].
+     *
+     * This call returns immediately. The actual connection sequence is
+     * driven by system broadcasts and callbacks. Flutter MUST wait for
+     * a SOCKET_CONNECTED event before opening the Chat screen.
      */
     @SuppressLint("MissingPermission")
     fun initiateConnection(targetName: String): Map<String, Any> {
         if (!initialized) return mapOf("success" to false, "error" to "Not initialized")
 
         targetDeviceName = targetName
-        discoveryRetryCount.set(0)   // reset retry counter for this new attempt
+        discoveryRetryCount.set(0)
+        connectRetryCount.set(0)   // fresh user-initiated attempt — reset retry counter
         Log.d(tag, "Initiate connection to peer with name: '$targetName'")
 
-        // Already connected?
-        if (isConnected.get() && isSocketActive.get()) {
-            Log.d(tag, "Already connected — no action needed")
+        // ── Guard: only skip if we have a live, working socket connection ──────
+        // Any state short of SOCKET_CONNECTED must attempt (re)connection.
+        if (connectionPhase.get() == ConnectionPhase.SOCKET_CONNECTED) {
+            Log.d(tag, "Already socket-connected — no action needed")
             return mapOf("success" to true, "alreadyConnected" to true)
+        }
+
+        // If we are mid-connection (CONNECTING or SOCKET_CONNECTING), allow it
+        // to complete rather than kicking off a redundant attempt.
+        val phase = connectionPhase.get()
+        if (phase == ConnectionPhase.CONNECTING || phase == ConnectionPhase.SOCKET_CONNECTING ||
+            phase == ConnectionPhase.GROUP_FORMED) {
+            Log.d(tag, "Connection already in progress (phase=$phase) — waiting for callbacks")
+            return mapOf("success" to true, "waiting" to true)
         }
 
         // Try to find matching peer in current list
@@ -215,7 +298,20 @@ class WifiDirectManager(private val context: Context) {
         val mgr = wifiP2pManager ?: return mapOf("success" to false, "error" to "Manager null")
         val ch  = p2pChannel   ?: return mapOf("success" to false, "error" to "Channel null")
 
-        Log.d(tag, "Connecting to Wi-Fi Direct peer: $deviceAddress")
+        // ── Guard: prevent concurrent / duplicate connect() calls ────────────
+        // handlePeerListUpdate can be called twice in quick succession (two rapid
+        // PEERS_CHANGED broadcasts) before the async onSuccess flips the phase.
+        // If we are already negotiating, silently ignore the duplicate.
+        val currentPhase = connectionPhase.get()
+        if (currentPhase == ConnectionPhase.CONNECTING ||
+            currentPhase == ConnectionPhase.GROUP_FORMED ||
+            currentPhase == ConnectionPhase.SOCKET_CONNECTING ||
+            currentPhase == ConnectionPhase.SOCKET_CONNECTED) {
+            Log.d(tag, "connectToPeer: already in $currentPhase — ignoring duplicate call for $deviceAddress")
+            return mapOf("success" to true, "duplicate" to true)
+        }
+
+        Log.d(tag, "connect() called — target MAC: $deviceAddress")
         val config = WifiP2pConfig().apply {
             this.deviceAddress = deviceAddress
             wps.setup = WpsInfo.PBC
@@ -223,11 +319,80 @@ class WifiDirectManager(private val context: Context) {
 
         mgr.connect(ch, config, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
-                Log.d(tag, "Wi-Fi Direct connection request sent to $deviceAddress")
+                Log.d(tag, "Wi-Fi Direct connect() request accepted for $deviceAddress")
+                connectionPhase.set(ConnectionPhase.CONNECTING)
                 notifyConnectionState(connected = false, status = "connecting")
+
+                // Safety net: if no GROUP_FORMED within 15 s, auto-retry with
+                // exponential back-off to break the scan-scan collision where both
+                // devices are simultaneously scanning and neither is listening.
+                // After maxConnectRetries failures we give up and report an error.
+                connectingTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+                connectingTimeoutRunnable = Runnable {
+                    if (connectionPhase.get() != ConnectionPhase.CONNECTING) return@Runnable
+
+                    val attempt = connectRetryCount.incrementAndGet()
+                    Log.w(tag, "⏰ CONNECTING timeout — attempt $attempt/$maxConnectRetries")
+
+                    // ── Check if the peer itself has sent us an invitation ────────
+                    // Handles the simultaneous-tap scenario: both devices called
+                    // connect() at the same time and each blocked the other's attempt.
+                    // If our peer is now showing as INVITED in the peer list, accept
+                    // their invitation directly instead of retrying from scratch.
+                    val invitedByPeer = synchronized(availablePeers) {
+                        availablePeers.firstOrNull { it.status == WifiP2pDevice.INVITED }
+                    }
+
+                    // Save targetDeviceName BEFORE resetState() clears it.
+                    // Retries need it to know which peer to auto-connect to.
+                    val savedTarget = targetDeviceName
+                    closeSocket()
+                    resetState() // targetDeviceName is now null; restore it below for retries
+
+                    if (invitedByPeer != null && attempt < maxConnectRetries) {
+                        // Accept the peer's invitation.
+                        // ⚠️  Do NOT reset connectRetryCount here — invitation attempts
+                        // must count toward maxConnectRetries to prevent an infinite loop
+                        // caused by a stale INVITED state from a previous session.
+                        Log.d(tag, "⏰ Timeout: peer already invited us — accepting ${invitedByPeer.deviceName}'s invitation (attempt $attempt/$maxConnectRetries)")
+                        targetDeviceName = savedTarget // restore so auto-connect guard works
+                        connectToPeer(invitedByPeer.deviceAddress)
+                        return@Runnable
+                    }
+
+                    if (attempt >= maxConnectRetries) {
+                        // Exhausted retries — give up (targetDeviceName already null from resetState).
+                        Log.e(tag, "Max connect retries ($maxConnectRetries) reached — giving up")
+                        connectRetryCount.set(0)
+
+                        if (savedTarget != null) {
+                            // User tapped a device — tell Flutter so the UI can show an error.
+                            notifyConnectionState(connected = false, error = "Connection failed after $attempt attempts")
+                        } else {
+                            // Passive INVITED acceptance failed (likely stale state from a
+                            // previous session). Do NOT surface an error to the user —
+                            // just silently restart passive discovery.
+                            Log.w(tag, "Passive INVITED acceptance exhausted — clearing stale state and restarting discovery")
+                            mainHandler.postDelayed({ discoverPeers() }, 2000)
+                        }
+                    } else {
+                        // Keep the UI in "connecting" state — retry silently.
+                        // Restore targetDeviceName so auto-connect fires when peers are found.
+                        // Use increasing back-off so the two devices don't stay
+                        // in lock-step scan-scan cycles.
+                        targetDeviceName = savedTarget
+                        notifyConnectionState(connected = false, status = "connecting")
+                        val delayMs = 3000L + (attempt * 2000L) // 5 s, 7 s, …
+                        Log.d(tag, "Auto-retrying Wi-Fi Direct discovery in ${delayMs}ms…")
+                        mainHandler.postDelayed({ discoverPeers() }, delayMs)
+                    }
+                }.also { mainHandler.postDelayed(it, 15_000) }
             }
             override fun onFailure(reason: Int) {
-                Log.e(tag, "Wi-Fi Direct connection to $deviceAddress failed: ${failureReason(reason)}")
+                Log.e(tag, "Wi-Fi Direct connect() to $deviceAddress failed: ${failureReason(reason)}")
+                connectingTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+                connectingTimeoutRunnable = null
+                connectionPhase.set(ConnectionPhase.FAILED)
                 notifyConnectionState(connected = false, error = "Connect failed: ${failureReason(reason)}")
             }
         })
@@ -239,8 +404,12 @@ class WifiDirectManager(private val context: Context) {
      * Messages are newline-delimited UTF-8 strings.
      */
     fun sendMessage(message: String): Boolean {
+        if (connectionPhase.get() != ConnectionPhase.SOCKET_CONNECTED) {
+            Log.e(tag, "sendMessage: not socket-connected (phase=${connectionPhase.get()})")
+            return false
+        }
         if (!isSocketActive.get()) {
-            Log.e(tag, "sendMessage: socket is not active")
+            Log.e(tag, "sendMessage: isSocketActive is false")
             return false
         }
         val w = socketWriter ?: run {
@@ -261,11 +430,14 @@ class WifiDirectManager(private val context: Context) {
         return true
     }
 
-    fun isConnected(): Boolean = isConnected.get()
+    /** True only when a TCP socket is confirmed open. */
+    fun isConnected(): Boolean = connectionPhase.get() == ConnectionPhase.SOCKET_CONNECTED
+
     fun isSocketActive(): Boolean = isSocketActive.get()
     fun isGroupOwner(): Boolean = isGroupOwner.get()
     fun getGroupOwnerAddress(): String? = groupOwnerAddress
     fun isP2pEnabled(): Boolean = isP2pEnabled.get()
+    fun getConnectionPhase(): String = connectionPhase.get().name
 
     /**
      * Convenience alias used by MainActivity to initiate connection by name.
@@ -280,7 +452,7 @@ class WifiDirectManager(private val context: Context) {
      */
     @SuppressLint("MissingPermission")
     fun getGroupInfo(): Map<String, Any>? {
-        if (!isConnected.get()) return null
+        if (connectionPhase.get() != ConnectionPhase.SOCKET_CONNECTED) return null
         var result: Map<String, Any>? = null
         val latch = java.util.concurrent.CountDownLatch(1)
         wifiP2pManager?.requestGroupInfo(p2pChannel) { group ->
@@ -316,7 +488,10 @@ class WifiDirectManager(private val context: Context) {
 
     fun disconnect() {
         Log.d(tag, "Disconnecting Wi-Fi Direct…")
+        // Mark disconnected immediately so in-flight callbacks don't trigger reconnect
+        connectionPhase.set(ConnectionPhase.DISCONNECTED)
         targetDeviceName = null
+        connectRetryCount.set(0)
         closeSocket()
 
         val mgr = wifiP2pManager
@@ -353,7 +528,8 @@ class WifiDirectManager(private val context: Context) {
     // ═══════════════════════════════════════════════════════════════
 
     private fun startSocketServer() {
-        Log.d(tag, "Wi-Fi P2P: I am Group Owner — starting TCP server on port $TCP_PORT")
+        Log.d(tag, "GROUP OWNER — starting TCP ServerSocket on port $TCP_PORT")
+        connectionPhase.set(ConnectionPhase.SOCKET_CONNECTING)
 
         notifyConnectionState(
             connected = true,
@@ -367,24 +543,28 @@ class WifiDirectManager(private val context: Context) {
                 closeSocket()
                 val srv = ServerSocket(TCP_PORT)
                 serverSocket = srv
-                Log.d(tag, "TCP server listening…")
+                Log.d(tag, "TCP ServerSocket listening on port $TCP_PORT…")
 
                 val client = srv.accept()
-                Log.d(tag, "Wi-Fi Direct client connected to TCP server")
+                Log.d(tag, "CLIENT connected to TCP server from ${client.inetAddress?.hostAddress}")
                 activeSocket = client
                 initSocketStreams(client)
 
             } catch (e: Exception) {
-                if (isConnected.get()) {
+                if (isSocketActive.get() ||
+                    connectionPhase.get() == ConnectionPhase.SOCKET_CONNECTING) {
                     Log.e(tag, "TCP server error", e)
                     handleSocketError(e)
+                } else {
+                    Log.d(tag, "TCP server closed (expected — disconnect/reset in progress)")
                 }
             }
         }
     }
 
     private fun startSocketClient(goIp: String) {
-        Log.d(tag, "Wi-Fi P2P: I am Client — connecting TCP to Group Owner at $goIp:$TCP_PORT")
+        Log.d(tag, "CLIENT — dialing TCP Group Owner at $goIp:$TCP_PORT")
+        connectionPhase.set(ConnectionPhase.SOCKET_CONNECTING)
 
         notifyConnectionState(
             connected = true,
@@ -396,13 +576,16 @@ class WifiDirectManager(private val context: Context) {
         executor.execute {
             val maxAttempts = 12
             var attempt = 0
-            while (attempt < maxAttempts && !isSocketActive.get()) {
+            while (attempt < maxAttempts &&
+                   !isSocketActive.get() &&
+                   connectionPhase.get() == ConnectionPhase.SOCKET_CONNECTING) {
                 attempt++
                 try {
+                    Log.d(tag, "TCP connect attempt $attempt/$maxAttempts to $goIp:$TCP_PORT…")
                     Thread.sleep(1000)
                     val sock = Socket(goIp, TCP_PORT)
                     activeSocket = sock
-                    Log.d(tag, "TCP connected to GO at $goIp:$TCP_PORT (attempt $attempt)")
+                    Log.d(tag, "TCP socket connected to GO at $goIp:$TCP_PORT (attempt $attempt)")
                     initSocketStreams(sock)
                     break
                 } catch (e: Exception) {
@@ -413,6 +596,9 @@ class WifiDirectManager(private val context: Context) {
                     }
                 }
             }
+            if (!isSocketActive.get() && attempt < maxAttempts) {
+                Log.d(tag, "TCP client loop exited early (phase=${connectionPhase.get()})")
+            }
         }
     }
 
@@ -422,9 +608,13 @@ class WifiDirectManager(private val context: Context) {
             val reader   = BufferedReader(InputStreamReader(sock.getInputStream(), "UTF-8"))
             isSocketActive.set(true)
 
-            Log.d(tag, "Wi-Fi Direct socket streams ready")
+            // ── Transition to SOCKET_CONNECTED ──────────────────────────
+            connectionPhase.set(ConnectionPhase.SOCKET_CONNECTED)
+            Log.d(tag, "✅ Socket streams ready — phase=SOCKET_CONNECTED " +
+                  "role=${if (isGroupOwner.get()) "GROUP_OWNER" else "CLIENT"} " +
+                  "ip=$groupOwnerAddress")
 
-            // Notify Dart: fully connected and socket live
+            // Notify Dart: socket is live → Flutter may now open Chat screen
             mainHandler.post {
                 notifyConnectionState(
                     connected = true,
@@ -434,11 +624,16 @@ class WifiDirectManager(private val context: Context) {
                 )
             }
 
-            // Receive loop
+            // ── Receive loop ─────────────────────────────────────────────
             executor.execute {
                 try {
                     while (isSocketActive.get()) {
-                        val line = reader.readLine() ?: break
+                        val line = reader.readLine()
+                        if (line == null) {
+                            // Peer closed the connection cleanly
+                            Log.w(tag, "readLine() returned null — peer closed socket")
+                            break
+                        }
                         Log.d(tag, "Wi-Fi Direct received: ${line.take(80)}")
                         mainHandler.post { messageListener?.invoke(line) }
                     }
@@ -446,9 +641,18 @@ class WifiDirectManager(private val context: Context) {
                     if (isSocketActive.get()) {
                         Log.e(tag, "Socket read error", e)
                         handleSocketError(e)
+                        return@execute
                     }
                 }
-                Log.d(tag, "Wi-Fi Direct receive loop ended")
+
+                // If the loop exited (null or exception already handled above)
+                // and the socket is still marked active, the peer closed without error.
+                if (isSocketActive.get()) {
+                    Log.w(tag, "Read loop ended while socket still marked active — cleaning up")
+                    handleSocketError(Exception("Peer closed connection"))
+                } else {
+                    Log.d(tag, "Wi-Fi Direct receive loop ended normally")
+                }
             }
 
         } catch (e: Exception) {
@@ -458,26 +662,60 @@ class WifiDirectManager(private val context: Context) {
     }
 
     private fun closeSocket() {
-        isSocketActive.set(false)
+        val wasActive = isSocketActive.getAndSet(false)
+        if (wasActive) Log.d(tag, "Closing active socket…")
         try { socketWriter?.close() } catch (_: Exception) {}
         try { activeSocket?.close() } catch (_: Exception) {}
         try { serverSocket?.close() } catch (_: Exception) {}
         socketWriter = null
         activeSocket = null
         serverSocket = null
+        if (wasActive) Log.d(tag, "Socket closed")
     }
 
-    private fun resetState() {
-        isConnected.set(false)
+    /**
+     * Reset the state machine to DISCONNECTED.
+     *
+     * @param restartPassiveDiscovery  When true, schedule a [discoverPeers] call
+     *   1.5 s after the reset so this device stays visible and can receive incoming
+     *   Wi-Fi Direct invitations (one-tap passive-accept flow).
+     *   Pass false when the caller explicitly manages the next action (e.g. user
+     *   initiated disconnect, or the retry mechanism already schedules its own scan).
+     */
+    private fun resetState(restartPassiveDiscovery: Boolean = false) {
+        connectingTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        connectingTimeoutRunnable = null
+        connectionPhase.set(ConnectionPhase.DISCONNECTED)
         isGroupOwner.set(false)
         groupOwnerAddress = null
         isSocketActive.set(false)
+        // Always clear the pending target so stale connection intent from a
+        // previous session (e.g. hot-reload) doesn't keep looping forever.
+        // Callers that want to preserve the target for a retry must save it
+        // before calling resetState() and restore it afterwards.
+        targetDeviceName = null
+        Log.d(tag, "State reset — phase=DISCONNECTED")
+
+        // Keep passive discovery alive so we can detect incoming INVITED peers.
+        // Without this, a spurious CONNECTION_CHANGED reset silences the device and
+        // it can no longer auto-accept an invitation from the tapping device.
+        // 800 ms delay: short enough to catch a pending invitation quickly,
+        // long enough to avoid hammering the framework before it settles.
+        if (restartPassiveDiscovery && initialized) {
+            mainHandler.postDelayed({
+                val ph = connectionPhase.get()
+                if (ph == ConnectionPhase.DISCONNECTED || ph == ConnectionPhase.IDLE) {
+                    Log.d(tag, "Post-reset: restarting passive discovery…")
+                    discoverPeers()
+                }
+            }, 800)
+        }
     }
 
     private fun handleSocketError(e: Exception) {
-        Log.e(tag, "Socket error: ${e.message}")
+        Log.e(tag, "Socket error — resetting. Reason: ${e.message}")
         closeSocket()
-        isConnected.set(false)
+        connectionPhase.set(ConnectionPhase.FAILED)
         mainHandler.post {
             notifyConnectionState(connected = false, error = "Socket error: ${e.message}")
         }
@@ -520,13 +758,16 @@ class WifiDirectManager(private val context: Context) {
 
     private fun notifyConnectionState(
         connected: Boolean,
-        role: String?    = null,
+        role: String?      = null,
         ipAddress: String? = null,
         socketActive: Boolean? = null,
-        status: String?  = null,
-        error: String?   = null
+        status: String?    = null,
+        error: String?     = null
     ) {
-        val map = mutableMapOf<String, Any>("connected" to connected)
+        val map = mutableMapOf<String, Any>(
+            "connected"       to connected,
+            "connectionPhase" to connectionPhase.get().name
+        )
         role?.let         { map["role"]         = it }
         ipAddress?.let    { map["ipAddress"]    = it }
         socketActive?.let { map["socketActive"] = it }
@@ -555,6 +796,13 @@ class WifiDirectManager(private val context: Context) {
                     val state = intent.getIntExtra(WifiP2pManager.EXTRA_WIFI_STATE, -1)
                     isP2pEnabled.set(state == WifiP2pManager.WIFI_P2P_STATE_ENABLED)
                     Log.d(tag, "Wi-Fi P2P state: ${if (isP2pEnabled.get()) "ENABLED" else "DISABLED"}")
+                    if (!isP2pEnabled.get()) {
+                        // Wi-Fi Direct was turned off — full reset
+                        Log.w(tag, "Wi-Fi Direct DISABLED — resetting state machine")
+                        closeSocket()
+                        resetState()
+                        notifyConnectionState(connected = false, error = "Wi-Fi Direct disabled")
+                    }
                 }
 
                 WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION -> {
@@ -566,6 +814,10 @@ class WifiDirectManager(private val context: Context) {
 
                 WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION -> {
                     val networkInfo = extractNetworkInfo(intent)
+                    Log.d(tag, "CONNECTION_CHANGED broadcast — " +
+                          "networkInfo.isConnected=${networkInfo?.isConnected}, " +
+                          "phase=${connectionPhase.get()}")
+
                     if (networkInfo?.isConnected == true) {
                         Log.d(tag, "Wi-Fi P2P network connected — requesting connection info…")
                         wifiP2pManager?.requestConnectionInfo(p2pChannel) { info ->
@@ -573,9 +825,38 @@ class WifiDirectManager(private val context: Context) {
                         }
                     } else {
                         Log.d(tag, "Wi-Fi P2P network disconnected")
+                        val phase = connectionPhase.get()
+
+                        // During active P2P negotiation the Android framework fires
+                        // a spurious "disconnected" broadcast before the new group
+                        // is established. Ignore it so we don't tear down a
+                        // connection that is still forming.
+                        //
+                        // DISCOVERING is included because calling connect() while
+                        // the device is still in discovery mode triggers this
+                        // broadcast.  If we let it through, the Flutter layer sees
+                        // a false "disconnected" event, clears _connectedPeerId, and
+                        // later fails to emit ConnectionState.connected even though
+                        // the socket forms successfully (race condition).
+                        if (phase == ConnectionPhase.DISCOVERING ||
+                            phase == ConnectionPhase.CONNECTING ||
+                            phase == ConnectionPhase.GROUP_FORMED ||
+                            phase == ConnectionPhase.SOCKET_CONNECTING) {
+                            Log.d(tag, "Spurious disconnect during P2P negotiation " +
+                                  "(phase=$phase) — ignoring")
+                            return
+                        }
+
+                        val wasConnected = phase == ConnectionPhase.SOCKET_CONNECTED
                         closeSocket()
-                        resetState()
+                        // Always restart passive discovery after a reset so this device
+                        // keeps receiving PEERS_CHANGED broadcasts and can auto-accept
+                        // incoming invitations (one-tap flow).
+                        resetState(restartPassiveDiscovery = true)
                         notifyConnectionState(connected = false)
+                        if (wasConnected) {
+                            Log.w(tag, "Active socket lost — peer may have disconnected")
+                        }
                     }
                 }
 
@@ -617,6 +898,21 @@ class WifiDirectManager(private val context: Context) {
             Log.d(tag, "  • ${p.deviceName} (${p.deviceAddress}) status=${p.status}")
         }
 
+        // ── Re-discovery when no peers are found ──────────────────────────────
+        // If we have a target but the scan returned nothing, the other device
+        // is probably also scanning (both devices scanning simultaneously means
+        // neither is listening).  Schedule a re-scan with a short pause so the
+        // radios can settle into listen/scan alternation.
+        val phase0 = connectionPhase.get()
+        if (availablePeers.isEmpty() && targetDeviceName != null &&
+            phase0 != ConnectionPhase.SOCKET_CONNECTED &&
+            phase0 != ConnectionPhase.CONNECTING &&
+            phase0 != ConnectionPhase.SOCKET_CONNECTING &&
+            phase0 != ConnectionPhase.GROUP_FORMED) {
+            Log.d(tag, "No peers found — scheduling rediscovery in 4 s…")
+            mainHandler.postDelayed({ discoverPeers() }, 4000)
+        }
+
         // Notify Dart
         val peersForDart = availablePeers.map { peer ->
             mapOf(
@@ -627,45 +923,93 @@ class WifiDirectManager(private val context: Context) {
         }
         mainHandler.post { peerListListener?.invoke(peersForDart) }
 
-        // Auto-connect if we have a pending target name
-        val target = targetDeviceName
-        if (target != null && !isConnected.get()) {
+        val phase  = connectionPhase.get()
+
+        // ── Accept incoming Wi-Fi Direct invitations (passive side) ──────────
+        // When another device has called connect() targeting us, Android places
+        // that peer in our list with status == INVITED (1).
+        // Calling connect() back completes the WPS-PBC exchange — no user
+        // interaction needed — enabling one-side-tap connection.
+        if (phase != ConnectionPhase.SOCKET_CONNECTED &&
+            phase != ConnectionPhase.CONNECTING &&
+            phase != ConnectionPhase.SOCKET_CONNECTING &&
+            phase != ConnectionPhase.GROUP_FORMED) {
+            val invitedPeer = synchronized(availablePeers) {
+                availablePeers.firstOrNull { it.status == WifiP2pDevice.INVITED }
+            }
+            if (invitedPeer != null) {
+                Log.d(tag, "🤝 Incoming Wi-Fi Direct invitation from: " +
+                      "${invitedPeer.deviceName} (${invitedPeer.deviceAddress}) — accepting")
+                connectToPeer(invitedPeer.deviceAddress)
+                return
+            }
+        }
+
+        // ── Auto-connect on initiator side ────────────────────────────────────
+        // Only fire when the user explicitly initiated a connection (targetDeviceName set).
+        // Passive discovery (targetDeviceName == null) must NOT auto-connect to
+        // random peers; INVITED detection above handles the passive accept case.
+        val canAutoConnect = targetDeviceName != null &&
+            phase != ConnectionPhase.SOCKET_CONNECTED &&
+            phase != ConnectionPhase.CONNECTING &&
+            phase != ConnectionPhase.SOCKET_CONNECTING &&
+            phase != ConnectionPhase.GROUP_FORMED &&
+            availablePeers.isNotEmpty()
+
+        if (canAutoConnect) {
             val match = synchronized(availablePeers) {
-                availablePeers.firstOrNull {
-                    it.deviceName.contains(target, ignoreCase = true)
-                }
+                availablePeers.firstOrNull()
             }
             if (match != null) {
-                Log.d(tag, "Auto-connecting to matching peer: ${match.deviceName}")
+                Log.d(
+                    tag,
+                    "Auto-connecting to: ${match.deviceName} " +
+                    "(${match.deviceAddress}) phase=$phase, requestedName=$targetDeviceName"
+                )
                 connectToPeer(match.deviceAddress)
             } else {
-                Log.w(tag, "No peer matching '$target' found. Available: ${availablePeers.map { it.deviceName }}")
+                Log.w(tag, "Auto-connect skipped — peer list empty (phase=$phase)")
             }
+        } else if (targetDeviceName != null) {
+            Log.d(tag, "Auto-connect skipped — phase=$phase, target=$targetDeviceName")
         }
     }
 
     private fun handleConnectionInfo(info: WifiP2pInfo) {
         Log.d(
             tag,
-            "Wi-Fi P2P connection info: groupFormed=${info.groupFormed}, " +
+            "onConnectionInfoAvailable — " +
+            "groupFormed=${info.groupFormed}, " +
             "isGroupOwner=${info.isGroupOwner}, " +
             "groupOwnerAddress=${info.groupOwnerAddress?.hostAddress}"
         )
 
         if (!info.groupFormed) {
-            Log.w(tag, "Group not yet formed, waiting…")
+            Log.w(tag, "groupFormed=false — ignoring (not yet formed)")
             return
         }
 
-        isConnected.set(true)
+        // Ignore duplicate callbacks if we are already past GROUP_FORMED
+        val phase = connectionPhase.get()
+        if (phase == ConnectionPhase.SOCKET_CONNECTING ||
+            phase == ConnectionPhase.SOCKET_CONNECTED) {
+            Log.d(tag, "handleConnectionInfo: already in $phase — ignoring duplicate callback")
+            return
+        }
+
+        // Group is forming — cancel the CONNECTING timeout (no longer needed)
+        connectingTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        connectingTimeoutRunnable = null
+
+        connectionPhase.set(ConnectionPhase.GROUP_FORMED)
         isGroupOwner.set(info.isGroupOwner)
         groupOwnerAddress = info.groupOwnerAddress?.hostAddress
 
         Log.d(
             tag,
-            "Wi-Fi Direct group formed! " +
-            "Role: ${if (info.isGroupOwner) "GROUP OWNER" else "CLIENT"}, " +
-            "GO address: $groupOwnerAddress"
+            "✅ Wi-Fi Direct GROUP FORMED — " +
+            "role=${if (info.isGroupOwner) "GROUP_OWNER" else "CLIENT"}, " +
+            "groupOwnerAddress=$groupOwnerAddress"
         )
 
         if (info.isGroupOwner) {
@@ -675,7 +1019,8 @@ class WifiDirectManager(private val context: Context) {
             if (goIp != null) {
                 startSocketClient(goIp)
             } else {
-                Log.e(tag, "Group owner IP is null — cannot establish socket")
+                Log.e(tag, "groupOwnerAddress is null — cannot start socket client")
+                connectionPhase.set(ConnectionPhase.FAILED)
                 notifyConnectionState(connected = false, error = "Group owner IP unavailable")
             }
         }

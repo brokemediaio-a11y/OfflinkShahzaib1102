@@ -23,37 +23,15 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   
   // Remove the initState listener setup - it's not allowed there
   
-  void _showConnectionDialog(DeviceModel device) {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Wi-Fi Direct Connected'),
-        content: Text(
-          'Connected to ${device.name} via Wi-Fi Direct.\n\nOpen chat to start messaging?',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('Later'),
-          ),
-          ElevatedButton(
-            onPressed: () {
-              Navigator.of(context).pop();
-              Navigator.of(context).push(
-                MaterialPageRoute(
-                  builder: (_) => ChatScreen(device: device),
-                ),
-              );
-            },
-            child: const Text('Open Chat'),
-          ),
-        ],
-      ),
-    );
-  }
+  // Tracks which device the user last tapped — used by ref.listen to navigate.
+  DeviceModel? _pendingConnectionDevice;
 
   Future<void> _connectToDevice(DeviceModel device) async {
-    // Show "connecting via Wi-Fi Direct" feedback immediately
+    // Remember the intended peer so ref.listen can navigate when the socket
+    // is confirmed open (SOCKET_CONNECTED).  Do NOT navigate here.
+    _pendingConnectionDevice = device;
+
+    // Show a persistent "connecting…" snackbar — dismissed when state changes.
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Row(
@@ -70,49 +48,88 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             Text('Connecting to ${device.name} via Wi-Fi Direct…'),
           ],
         ),
-        duration: const Duration(seconds: 15),
+        duration: const Duration(seconds: 60),
         backgroundColor: AppColors.primary,
       ),
     );
 
     final connectionNotifier = ref.read(connectionProvider.notifier);
-    final connected = await connectionNotifier.connectToDevice(device);
+    final started = await connectionNotifier.connectToDevice(device);
 
     if (!mounted) return;
-    ScaffoldMessenger.of(context).hideCurrentSnackBar();
 
-    if (connected) {
-      Navigator.of(context).push(
-        MaterialPageRoute(
-          builder: (_) => ChatScreen(device: device),
-        ),
-      );
-    } else {
+    if (!started) {
+      // The native layer rejected the attempt immediately.
+      _pendingConnectionDevice = null;
+      ScaffoldMessenger.of(context).hideCurrentSnackBar();
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            'Wi-Fi Direct connection to ${device.name} failed. '
-            'Ensure both devices have Wi-Fi Direct enabled.',
+            'Could not start Wi-Fi Direct connection to ${device.name}. '
+            'Ensure Wi-Fi Direct is enabled on both devices.',
           ),
           backgroundColor: AppColors.error,
           duration: const Duration(seconds: 5),
         ),
       );
     }
+    // If started == true we stay in "connecting" state.
+    // ref.listen (in build) will fire when state transitions to
+    // ConnectionStateType.connected (i.e., socket is confirmed open).
   }
 
   @override
   Widget build(BuildContext context) {
     final deviceState = ref.watch(deviceProvider);
     final connectionState = ref.watch(connectionProvider);
-    
-    // Move ref.listen inside build method
+
+    // ── React to Wi-Fi Direct state changes ───────────────────────────────
+    // Navigate to Chat ONLY when the state machine confirms SOCKET_CONNECTED.
+    // This fires from _handleWifiDirectState in ConnectionManager, which only
+    // emits ConnectionState.connected when socketActive == true.
     ref.listen<ConnectionProviderState>(connectionProvider, (previous, next) {
+      if (!mounted) return;
+
       if (previous?.state != ConnectionStateType.connected &&
-          next.state == ConnectionStateType.connected &&
-          next.connectedDevice != null &&
-          mounted) {
-        _showConnectionDialog(next.connectedDevice!);
+          next.state == ConnectionStateType.connected) {
+        // Socket confirmed open — dismiss the "connecting…" snackbar.
+        ScaffoldMessenger.of(context).hideCurrentSnackBar();
+
+        // Resolve the device to open chat with:
+        //   1. Use the pending device the user tapped (has the correct UUID).
+        //   2. Fall back to the connected device from state (may have generic name).
+        final chatDevice = _pendingConnectionDevice ?? next.connectedDevice;
+        _pendingConnectionDevice = null;
+
+        if (chatDevice != null) {
+          Navigator.of(context).push(
+            MaterialPageRoute(
+              builder: (_) => ChatScreen(device: chatDevice),
+            ),
+          );
+        }
+      } else if (next.state == ConnectionStateType.error ||
+                 next.state == ConnectionStateType.disconnected) {
+        // Connection failed or was lost — dismiss spinner and show error.
+        ScaffoldMessenger.of(context).hideCurrentSnackBar();
+
+        if (_pendingConnectionDevice != null &&
+            next.state == ConnectionStateType.error) {
+          final name = _pendingConnectionDevice!.name;
+          _pendingConnectionDevice = null;
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                'Wi-Fi Direct connection to $name failed. '
+                'Ensure both devices have Wi-Fi Direct enabled.',
+              ),
+              backgroundColor: AppColors.error,
+              duration: const Duration(seconds: 5),
+            ),
+          );
+        } else {
+          _pendingConnectionDevice = null;
+        }
       }
     });
 
