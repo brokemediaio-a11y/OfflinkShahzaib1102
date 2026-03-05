@@ -1057,28 +1057,29 @@ class ConnectionManager {
 
   Future<bool> _shouldUseNativeScanner() async {
     if (!Platform.isAndroid) return false;
+    // Always prefer the native BLE scanner on Android.
+    //
+    // Reasons:
+    //  1. flutter_blue_plus (FBP) only exposes manufacturer data from the
+    //     PRIMARY advertisement in advertisementData.manufacturerData.
+    //     Scan-response manufacturer data (key 0xFFFE, which carries the
+    //     username) is NOT reliably surfaced by FBP on many devices.
+    //  2. On some Samsung / OEM devices, the FBP scan registers but then
+    //     terminates in milliseconds (hardware/firmware quirk), giving no
+    //     useful scan window.
+    //
+    // The native scanner reads Android's merged ScanRecord directly via
+    // getManufacturerSpecificData(0xFFFE), which works on all tested
+    // devices. FBP (BleDiscoveryService) is kept as the fallback for
+    // devices where the native scanner registration itself fails.
     try {
       final info = await DeviceInfoPlugin().androidInfo;
-      final m = info.manufacturer.toLowerCase();
-      final mo = info.model.toLowerCase();
-      final b = info.brand.toLowerCase();
       Logger.info(
-          'Device: manufacturer=$m, model=$mo, brand=$b');
-      const patterns = [
-        'tecno', 'infinix', 'itel', 'transsion', 'cla', 'camon',
-      ];
-      for (final p in patterns) {
-        if (m.contains(p) || mo.contains(p) || b.contains(p)) {
-          Logger.info(
-              'Detected problematic device ($p) — will use native scanner');
-          return true;
-        }
-      }
-      return false;
-    } catch (e) {
-      Logger.warning('Error detecting device type: $e');
-      return false;
-    }
+          'Device: manufacturer=${info.manufacturer}, '
+          'model=${info.model}, brand=${info.brand} — '
+          'using native BLE scanner');
+    } catch (_) {}
+    return true;
   }
 
   Future<bool> _shouldStopAdvertisingForScan() async {

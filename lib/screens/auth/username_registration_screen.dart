@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import '../../core/app_colors.dart';
 import '../../services/storage/device_storage.dart';
 import '../../utils/logger.dart';
@@ -77,7 +78,7 @@ class _UsernameRegistrationScreenState extends State<UsernameRegistrationScreen>
     return Scaffold(
       backgroundColor: AppColors.background,
       body: SafeArea(
-        child: Padding(
+        child: SingleChildScrollView(
           padding: const EdgeInsets.all(24.0),
           child: Form(
             key: _formKey,
@@ -85,6 +86,7 @@ class _UsernameRegistrationScreenState extends State<UsernameRegistrationScreen>
               mainAxisAlignment: MainAxisAlignment.center,
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
+                const SizedBox(height: 32),
                 // App Logo/Icon
                 Icon(
                   Icons.person_add_rounded,
@@ -120,6 +122,10 @@ class _UsernameRegistrationScreenState extends State<UsernameRegistrationScreen>
                 TextFormField(
                   controller: _usernameController,
                   enabled: !_isLoading,
+                  maxLength: 20,
+                  inputFormatters: [
+                    LengthLimitingTextInputFormatter(20),
+                  ],
                   decoration: InputDecoration(
                     labelText: 'Username',
                     hintText: 'Enter your username',
@@ -244,6 +250,7 @@ class _UsernameRegistrationScreenState extends State<UsernameRegistrationScreen>
                     ],
                   ),
                 ),
+                const SizedBox(height: 32),
               ],
             ),
           ),

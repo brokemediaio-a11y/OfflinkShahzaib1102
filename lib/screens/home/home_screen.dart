@@ -595,25 +595,31 @@ class _DeviceCard extends StatelessWidget {
                       ),
                     ),
                     const SizedBox(height: 4),
-                    Row(
+                    Wrap(
+                      spacing: 6,
+                      runSpacing: 4,
+                      crossAxisAlignment: WrapCrossAlignment.center,
                       children: [
                         // RSSI badge
-                        if (device.rssi != 0) ...[
-                          const Icon(
-                            Icons.signal_cellular_alt,
-                            size: 14,
-                            color: AppColors.textSecondary,
+                        if (device.rssi != 0)
+                          Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Icon(
+                                Icons.signal_cellular_alt,
+                                size: 14,
+                                color: AppColors.textSecondary,
+                              ),
+                              const SizedBox(width: 4),
+                              Text(
+                                '${device.rssi} dBm',
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  color: AppColors.textSecondary,
+                                ),
+                              ),
+                            ],
                           ),
-                          const SizedBox(width: 4),
-                          Text(
-                            '${device.rssi} dBm',
-                            style: const TextStyle(
-                              fontSize: 12,
-                              color: AppColors.textSecondary,
-                            ),
-                          ),
-                          const SizedBox(width: 10),
-                        ],
                         // "BLE Discovered" badge
                         Container(
                           padding: const EdgeInsets.symmetric(
@@ -631,8 +637,7 @@ class _DeviceCard extends StatelessWidget {
                             ),
                           ),
                         ),
-                        const SizedBox(width: 6),
-                        // "Tap → Wi-Fi Direct" hint
+                        // "Wi-Fi Direct" hint badge
                         Container(
                           padding: const EdgeInsets.symmetric(
                               horizontal: 6, vertical: 2),

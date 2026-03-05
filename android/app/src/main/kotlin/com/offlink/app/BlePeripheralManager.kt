@@ -209,70 +209,72 @@ class BlePeripheralManager(private val context: Context) {
             .setConnectable(true)
             .build()
 
-        // BLE advertisement data limit is 31 bytes total
-        // Device name "Offlink" (7 bytes) + AD structure overhead (2 bytes) = 9 bytes
-        // Manufacturer data: AD type (1 byte) + length (1 byte) + manufacturer ID (2 bytes) + UUID (16 bytes) = 20 bytes
-        // Total: 9 + 20 = 29 bytes - should fit, but some devices have stricter limits
-        // Solution: Remove device name completely, use only manufacturer data
-        // Discovery will work by scanning for manufacturer ID 0xFFFF
+        // ── BLE advertisement byte-budget breakdown ──────────────────────────────
+        // The primary advertisement PDU has a 31-byte payload limit:
+        //   Flags AD struct  : 3 bytes (auto-added by Android)
+        //   Mfr-data overhead: 4 bytes (length + 0xFF type + 2-byte mfr ID)
+        //   UUID payload     : 16 bytes
+        //   Total            : 23 bytes  ← leaves only 7 bytes for username
+        //
+        // Solution: Put UUID in the PRIMARY advertisement (mfr ID 0xFFFF) and
+        // put the username in the SCAN RESPONSE (mfr ID 0xFFFE).
+        // Active scanners (LOW_LATENCY mode) receive scan responses automatically,
+        // so no scanner-side changes are needed.
+        // This allows usernames up to ~26 UTF-8 bytes (practically unlimited).
+        // ─────────────────────────────────────────────────────────────────────────
+
         val dataBuilder = AdvertiseData.Builder()
-            .setIncludeDeviceName(false) // Don't include device name to ensure we fit in 31 bytes
-        
-        // Add device UUID and username to advertisement data as manufacturer data
-        // Use a custom manufacturer ID (0xFFFF is reserved for testing)
-        // Format: UUID (16 bytes) + username length (1 byte) + username (variable, max 10 bytes)
-        // Total: 16 + 1 + 10 = 27 bytes max, fits in 31-byte limit
+            .setIncludeDeviceName(false)
+
+        var scanResponse: AdvertiseData? = null
+
         if (deviceUuid != null && deviceUuid!!.isNotEmpty()) {
             try {
-                // Parse UUID string and convert to 16-byte array
+                // ── Primary advertisement: UUID only (manufacturer ID 0xFFFF) ──
                 val uuid = UUID.fromString(deviceUuid)
                 val uuidBytes = ByteArray(16)
                 val msb = uuid.mostSignificantBits
                 val lsb = uuid.leastSignificantBits
-                
-                // Convert long to bytes (most significant first)
                 for (i in 0..7) {
                     uuidBytes[i] = ((msb shr (56 - i * 8)) and 0xFF).toByte()
                 }
                 for (i in 0..7) {
                     uuidBytes[8 + i] = ((lsb shr (56 - i * 8)) and 0xFF).toByte()
                 }
-                
-                // Append username after UUID
-                // Truncate to max 10 bytes to fit in BLE limit
-                val usernameBytes = if (!deviceName.isNullOrEmpty() && deviceName != "Offlink") {
-                    val nameBytes = deviceName.toByteArray(Charset.forName("UTF-8"))
-                    if (nameBytes.size > 10) {
-                        nameBytes.copyOf(10) // Truncate to 10 bytes
-                    } else {
-                        nameBytes
-                    }
-                } else {
-                    ByteArray(0) // No username
+                dataBuilder.addManufacturerData(0xFFFF, uuidBytes)
+                Log.d(tag, "Primary ad: UUID=$deviceUuid (16 bytes)")
+
+                // ── Scan response: username (manufacturer ID 0xFFFE) ──
+                // Budget: 31 bytes total, 4 bytes overhead → 27 bytes for payload
+                // We cap at 20 bytes so multi-byte Unicode characters still fit safely.
+                if (!deviceName.isNullOrEmpty() && deviceName != "Offlink") {
+                    val rawBytes = deviceName.toByteArray(Charsets.UTF_8)
+                    val usernameBytes = if (rawBytes.size > 20) rawBytes.copyOf(20) else rawBytes
+                    // Format: [username_length (1 byte), username_bytes...]
+                    val payload = ByteArray(1 + usernameBytes.size)
+                    payload[0] = usernameBytes.size.toByte()
+                    System.arraycopy(usernameBytes, 0, payload, 1, usernameBytes.size)
+                    scanResponse = AdvertiseData.Builder()
+                        .setIncludeDeviceName(false)
+                        .addManufacturerData(0xFFFE, payload)
+                        .build()
+                    Log.d(tag, "Scan response: username=$deviceName (${usernameBytes.size} bytes)")
                 }
-                
-                // Combine: UUID (16 bytes) + username length (1 byte) + username (variable)
-                val combinedData = ByteArray(16 + 1 + usernameBytes.size)
-                System.arraycopy(uuidBytes, 0, combinedData, 0, 16)
-                combinedData[16] = usernameBytes.size.toByte() // Store username length
-                if (usernameBytes.isNotEmpty()) {
-                    System.arraycopy(usernameBytes, 0, combinedData, 17, usernameBytes.size)
-                }
-                
-                // Use manufacturer ID 0xFFFF (reserved for testing)
-                dataBuilder.addManufacturerData(0xFFFF, combinedData)
-                Log.d(tag, "Added device UUID and username to advertisement: UUID=$deviceUuid, username=$deviceName (${usernameBytes.size} bytes)")
             } catch (e: Exception) {
-                Log.w(tag, "Failed to add device UUID and username to advertisement", e)
+                Log.w(tag, "Failed to build advertisement data", e)
             }
         }
-        
+
         val data = dataBuilder.build()
 
         Log.d(tag, "Starting BLE advertising with service UUID: $serviceUuidLocal")
 
         try {
-            advertiserLocal.startAdvertising(settings, data, advertiseCallback)
+            if (scanResponse != null) {
+                advertiserLocal.startAdvertising(settings, data, scanResponse, advertiseCallback)
+            } else {
+                advertiserLocal.startAdvertising(settings, data, advertiseCallback)
+            }
             return true
         } catch (ex: Exception) {
             Log.e(tag, "Exception starting advertising", ex)
@@ -754,23 +756,36 @@ class BlePeripheralManager(private val context: Context) {
             
             // Use extracted UUID as device ID, fallback to MAC address if UUID not found
             val deviceId = extractedDeviceUuid ?: deviceAddress
-            
-            // Extract username from manufacturer data
+
+            // ── Extract username from SCAN RESPONSE (manufacturer ID 0xFFFE) ──
+            // Format: [username_length (1 byte), username_bytes...]
+            // Fallback: legacy format where username was packed after UUID in 0xFFFF data.
             var extractedUsername = deviceName
-            val manufacturerData = scanRecord?.getManufacturerSpecificData(0xFFFF)
-            if (manufacturerData != null && manufacturerData.size > 17) {
-                // Format: UUID (16 bytes) + username length (1 byte) + username (variable)
-                try {
-                    val usernameLength = manufacturerData[16].toInt() and 0xFF
-                    if (usernameLength > 0 && manufacturerData.size >= 17 + usernameLength) {
+            try {
+                val scanRespData = scanRecord?.getManufacturerSpecificData(0xFFFE)
+                if (scanRespData != null && scanRespData.isNotEmpty()) {
+                    val usernameLength = scanRespData[0].toInt() and 0xFF
+                    if (usernameLength > 0 && scanRespData.size >= 1 + usernameLength) {
                         val usernameBytes = ByteArray(usernameLength)
-                        System.arraycopy(manufacturerData, 17, usernameBytes, 0, usernameLength)
-                        extractedUsername = String(usernameBytes, Charset.forName("UTF-8"))
-                        Log.d(tag, "Extracted username from manufacturer data: $extractedUsername")
+                        System.arraycopy(scanRespData, 1, usernameBytes, 0, usernameLength)
+                        extractedUsername = String(usernameBytes, Charsets.UTF_8)
+                        Log.d(tag, "Extracted username from scan response (0xFFFE): $extractedUsername")
                     }
-                } catch (e: Exception) {
-                    Log.w(tag, "Failed to extract username from manufacturer data", e)
+                } else {
+                    // Legacy fallback: username was appended after UUID in 0xFFFF manufacturer data
+                    val legacyData = scanRecord?.getManufacturerSpecificData(0xFFFF)
+                    if (legacyData != null && legacyData.size > 17) {
+                        val usernameLength = legacyData[16].toInt() and 0xFF
+                        if (usernameLength > 0 && legacyData.size >= 17 + usernameLength) {
+                            val usernameBytes = ByteArray(usernameLength)
+                            System.arraycopy(legacyData, 17, usernameBytes, 0, usernameLength)
+                            extractedUsername = String(usernameBytes, Charsets.UTF_8)
+                            Log.d(tag, "Extracted username from legacy manufacturer data (0xFFFF): $extractedUsername")
+                        }
+                    }
                 }
+            } catch (e: Exception) {
+                Log.w(tag, "Failed to extract username from manufacturer data", e)
             }
             
             val resultMap = mapOf(

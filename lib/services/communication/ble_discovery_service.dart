@@ -236,20 +236,43 @@ class BleDiscoveryService {
 
       try {
         final mfgData = result.advertisementData.manufacturerData;
+
+        // ── Step 1: Extract Device UUID from primary advertisement (0xFFFF) ──
         if (mfgData.containsKey(0xFFFF)) {
           final uuidBytes = mfgData[0xFFFF]!;
           if (uuidBytes.length >= 16) {
             deviceUuid = _bytesToUuid(uuidBytes.sublist(0, 16));
 
-            // Username follows: [uuidLen=16][usernameLen=1][username bytes…]
+            // Legacy format: username was packed after UUID in 0xFFFF
+            // [UUID=16 bytes][usernameLen=1 byte][username bytes…]
             if (uuidBytes.length > 17) {
               final usernameLen = uuidBytes[16] & 0xFF;
               if (usernameLen > 0 && uuidBytes.length >= 17 + usernameLen) {
                 extractedUsername = String.fromCharCodes(
                     uuidBytes.sublist(17, 17 + usernameLen));
                 Logger.debug(
-                    'BleDiscoveryService: extracted username "$extractedUsername" from manufacturer data');
+                    'BleDiscoveryService: extracted username "$extractedUsername" '
+                    'from legacy 0xFFFF manufacturer data');
               }
+            }
+          }
+        }
+
+        // ── Step 2: Extract username from scan response (0xFFFE) ──
+        // New format: UUID in primary ad (0xFFFF), username in scan response (0xFFFE)
+        // Format: [usernameLen=1 byte][username bytes…]
+        // flutter_blue_plus merges primary ad + scan response into one map,
+        // so both 0xFFFF and 0xFFFE are accessible here.
+        if (mfgData.containsKey(0xFFFE)) {
+          final payload = mfgData[0xFFFE]!;
+          if (payload.isNotEmpty) {
+            final usernameLen = payload[0] & 0xFF;
+            if (usernameLen > 0 && payload.length >= 1 + usernameLen) {
+              extractedUsername = String.fromCharCodes(
+                  payload.sublist(1, 1 + usernameLen));
+              Logger.debug(
+                  'BleDiscoveryService: extracted username "$extractedUsername" '
+                  'from scan response (0xFFFE)');
             }
           }
         }
@@ -267,25 +290,43 @@ class BleDiscoveryService {
       // Store UUID ↔ MAC mapping for future Wi-Fi Direct/BLE operations
       unawaited(DeviceStorage.setMacForUuid(deviceUuid, macAddress));
 
-      // Resolve display name (extracted username > stored name > BLE name)
+      // ── Resolve display name (extracted username > stored name > BLE name) ──
       final storedName = DeviceStorage.getDeviceDisplayName(deviceUuid);
       final bleName = result.device.platformName.isNotEmpty
           ? result.device.platformName
-          : 'Unknown Device';
-      String displayName = extractedUsername ?? storedName ?? bleName;
+          : null;
 
-      if (extractedUsername != null &&
-          extractedUsername.isNotEmpty &&
-          extractedUsername != 'Unknown Device' &&
-          storedName == null) {
-        unawaited(DeviceStorage.setDeviceDisplayName(deviceUuid, extractedUsername));
-        displayName = extractedUsername;
-      } else if (storedName == null &&
-          extractedUsername == null &&
-          bleName.isNotEmpty &&
-          bleName != 'Unknown Device') {
-        unawaited(DeviceStorage.setDeviceDisplayName(deviceUuid, bleName));
-        displayName = bleName;
+      // Prefer freshly extracted username; fall back to stored name, then BLE
+      // device name.  "Unknown Device" / "Unknown" are never used as the final
+      // display name — they're treated as absent.
+      bool _isUnknown(String? s) =>
+          s == null || s.isEmpty || s == 'Unknown Device' || s == 'Unknown';
+
+      String displayName;
+      if (!_isUnknown(extractedUsername)) {
+        displayName = extractedUsername!;
+        // Persist if not already stored (or if stored name was a placeholder)
+        if (_isUnknown(storedName)) {
+          unawaited(DeviceStorage.setDeviceDisplayName(deviceUuid, displayName));
+        }
+      } else if (!_isUnknown(storedName)) {
+        displayName = storedName!;
+      } else if (!_isUnknown(bleName)) {
+        displayName = bleName!;
+        unawaited(DeviceStorage.setDeviceDisplayName(deviceUuid, displayName));
+      } else {
+        displayName = 'Unknown Device';
+      }
+
+      // If the device is already in the list with an "Unknown" placeholder and
+      // we now have a real name, update the entry so the UI reflects it.
+      final existing = _discoveredDevices[deviceUuid];
+      if (existing != null &&
+          _isUnknown(existing.name) &&
+          !_isUnknown(displayName)) {
+        Logger.info(
+            'BleDiscoveryService: updating placeholder name for $deviceUuid '
+            '"${existing.name}" → "$displayName"');
       }
 
       final device = DeviceModel(
