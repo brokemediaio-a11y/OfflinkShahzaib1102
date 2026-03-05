@@ -109,6 +109,15 @@ class WifiDirectManager(private val context: Context) {
     private val connectRetryCount = AtomicInteger(0)
     private val maxConnectRetries = 5   // covers stale-INVITED cleanup + simultaneous-tap deadlock
 
+    // ─── Passive Discovery Heartbeat ──────────────────────────────────────────
+    // Android's discoverPeers() has an internal expiry (~60-120 s on most OEMs).
+    // After it expires the device stops beaconing, making it invisible to remote
+    // scans even though the app is running.  Re-running it every 60 s keeps this
+    // device discoverable without any user interaction, enabling the one-tap
+    // "initiator-only" connect flow.
+    private val passiveDiscoveryIntervalMs = 60_000L
+    private var passiveDiscoveryRunnable: Runnable? = null
+
     // Callbacks → Dart
     var peerListListener: ((List<Map<String, Any>>) -> Unit)? = null
     var connectionStateListener: ((Map<String, Any>) -> Unit)? = null
@@ -171,6 +180,10 @@ class WifiDirectManager(private val context: Context) {
                 mainHandler.postDelayed({ discoverPeers() }, 1000)
             }
         })
+
+        // Start the passive-discovery heartbeat so this device keeps broadcasting
+        // its Wi-Fi Direct beacon even when the user never taps "Scan for Devices".
+        schedulePassiveDiscovery()
 
         return true
     }
@@ -517,6 +530,7 @@ class WifiDirectManager(private val context: Context) {
 
     fun shutdown() {
         Log.d(tag, "Shutting down WifiDirectManager")
+        cancelPassiveDiscovery()
         disconnect()
         unregisterReceiver()
         try { executor.shutdownNow() } catch (_: Exception) {}
@@ -671,6 +685,34 @@ class WifiDirectManager(private val context: Context) {
         activeSocket = null
         serverSocket = null
         if (wasActive) Log.d(tag, "Socket closed")
+    }
+
+    /**
+     * Start (or restart) the passive-discovery heartbeat.
+     * Schedules a [discoverPeers] call every [passiveDiscoveryIntervalMs] so this
+     * device keeps broadcasting its Wi-Fi Direct beacon even when idle, allowing
+     * the remote side to find it without the user pressing "Scan for Devices".
+     */
+    private fun schedulePassiveDiscovery() {
+        cancelPassiveDiscovery()
+        passiveDiscoveryRunnable = Runnable {
+            val phase = connectionPhase.get()
+            if (initialized &&
+                phase != ConnectionPhase.CONNECTING &&
+                phase != ConnectionPhase.GROUP_FORMED &&
+                phase != ConnectionPhase.SOCKET_CONNECTING &&
+                phase != ConnectionPhase.SOCKET_CONNECTED) {
+                Log.d(tag, "Passive discovery heartbeat — restarting discoverPeers() (phase=$phase)")
+                discoverPeers()
+            }
+            // Always reschedule so the heartbeat survives regardless of phase.
+            schedulePassiveDiscovery()
+        }.also { mainHandler.postDelayed(it, passiveDiscoveryIntervalMs) }
+    }
+
+    private fun cancelPassiveDiscovery() {
+        passiveDiscoveryRunnable?.let { mainHandler.removeCallbacks(it) }
+        passiveDiscoveryRunnable = null
     }
 
     /**
