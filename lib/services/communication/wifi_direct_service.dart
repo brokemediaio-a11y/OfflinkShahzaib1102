@@ -85,6 +85,8 @@ class WifiDirectService {
       EventChannel('com.offlink.wifi_direct/connection_state');
   static const _peersEventChannel =
       EventChannel('com.offlink.wifi_direct/peers');
+  static const _invitationEventChannel =
+      EventChannel('com.offlink.wifi_direct/invitation');
 
   // ── Dart-side streams ─────────────────────────────────────────────
   final _messageController =
@@ -93,10 +95,13 @@ class WifiDirectService {
       StreamController<WifiDirectConnectionState>.broadcast();
   final _peersController =
       StreamController<List<WifiDirectPeer>>.broadcast();
+  final _invitationController =
+      StreamController<Map<String, String>>.broadcast();
 
   StreamSubscription? _messageSubscription;
   StreamSubscription? _connectionStateSubscription;
   StreamSubscription? _peersSubscription;
+  StreamSubscription? _invitationSubscription;
 
   bool _initialized = false;
 
@@ -114,6 +119,12 @@ class WifiDirectService {
 
   /// Stream of discovered Wi-Fi Direct peers (P2P layer discovery).
   Stream<List<WifiDirectPeer>> get discoveredPeers => _peersController.stream;
+
+  /// Fires on the RECEIVING device when a remote peer sends a connection
+  /// invitation.  Map keys: "deviceName" and "deviceAddress".
+  /// Flutter must respond by calling [acceptInvitation] or [rejectInvitation].
+  Stream<Map<String, String>> get incomingInvitations =>
+      _invitationController.stream;
 
   // ═════════════════════════════════════════════════════════════════
   // Initialization
@@ -202,6 +213,25 @@ class WifiDirectService {
       },
       onError: (e) => Logger.error('WifiDirectService: peers stream error', e),
     );
+
+    // ── Incoming invitations ──────────────────────────────────────
+    _invitationSubscription?.cancel();
+    _invitationSubscription =
+        _invitationEventChannel.receiveBroadcastStream().listen(
+      (event) {
+        if (event is Map) {
+          final payload = {
+            'deviceName':    (event['deviceName']    as String?) ?? 'Unknown',
+            'deviceAddress': (event['deviceAddress'] as String?) ?? '',
+          };
+          Logger.info(
+              'WifiDirectService: incoming invitation from ${payload["deviceName"]}');
+          _invitationController.add(payload);
+        }
+      },
+      onError: (e) =>
+          Logger.error('WifiDirectService: invitation stream error', e),
+    );
   }
 
   // ═════════════════════════════════════════════════════════════════
@@ -254,6 +284,34 @@ class WifiDirectService {
     } catch (e) {
       Logger.error('WifiDirectService: initiateConnection error', e);
       return {'success': false, 'error': e.toString()};
+    }
+  }
+
+  /// Accept a pending incoming Wi-Fi Direct invitation.
+  /// Call this after the user taps "Accept" in the consent dialog.
+  Future<Map<String, dynamic>> acceptInvitation() async {
+    try {
+      final result =
+          await _methodChannel.invokeMethod<Map>('acceptInvitation');
+      final map = result != null
+          ? Map<String, dynamic>.from(result)
+          : {'success': false, 'error': 'no result'};
+      Logger.info('WifiDirectService: acceptInvitation result = $map');
+      return map;
+    } catch (e) {
+      Logger.error('WifiDirectService: acceptInvitation error', e);
+      return {'success': false, 'error': e.toString()};
+    }
+  }
+
+  /// Reject a pending incoming Wi-Fi Direct invitation.
+  /// Call this after the user taps "Decline" in the consent dialog.
+  Future<void> rejectInvitation() async {
+    try {
+      await _methodChannel.invokeMethod('rejectInvitation');
+      Logger.info('WifiDirectService: rejectInvitation sent');
+    } catch (e) {
+      Logger.error('WifiDirectService: rejectInvitation error', e);
     }
   }
 
@@ -359,9 +417,11 @@ class WifiDirectService {
     _messageSubscription?.cancel();
     _connectionStateSubscription?.cancel();
     _peersSubscription?.cancel();
+    _invitationSubscription?.cancel();
     _messageController.close();
     _connectionStateController.close();
     _peersController.close();
+    _invitationController.close();
     disconnect();
   }
 }

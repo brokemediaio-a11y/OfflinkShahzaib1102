@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../core/app_colors.dart';
@@ -20,11 +21,126 @@ class HomeScreen extends ConsumerStatefulWidget {
 }
 
 class _HomeScreenState extends ConsumerState<HomeScreen> {
-  
-  // Remove the initState listener setup - it's not allowed there
-  
+
   // Tracks which device the user last tapped — used by ref.listen to navigate.
   DeviceModel? _pendingConnectionDevice;
+
+  // Prevents showing duplicate consent dialogs for the same invitation.
+  bool _invitationDialogOpen = false;
+
+  StreamSubscription<Map<String, String>>? _invitationSubscription;
+
+  @override
+  void initState() {
+    super.initState();
+    // Subscribe to incoming Wi-Fi Direct invitations.
+    // We must do this in initState (not build) to avoid multiple subscriptions.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _invitationSubscription?.cancel();
+      _invitationSubscription = ref
+          .read(connectionProvider.notifier)
+          .incomingInvitations
+          .listen(_onIncomingInvitation);
+    });
+  }
+
+  @override
+  void dispose() {
+    _invitationSubscription?.cancel();
+    super.dispose();
+  }
+
+  /// Called when another device sends us a Wi-Fi Direct connection invitation.
+  Future<void> _onIncomingInvitation(Map<String, String> payload) async {
+    if (!mounted || _invitationDialogOpen) return;
+
+    final callerName = payload['deviceName'] ?? 'Unknown Device';
+    _invitationDialogOpen = true;
+
+    final accepted = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: AppColors.primary.withOpacity(0.1),
+                shape: BoxShape.circle,
+              ),
+              child: const Icon(Icons.wifi_tethering, color: AppColors.primary),
+            ),
+            const SizedBox(width: 12),
+            const Expanded(
+              child: Text(
+                'Connection Request',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            RichText(
+              text: TextSpan(
+                style: const TextStyle(fontSize: 15, color: AppColors.textPrimary),
+                children: [
+                  TextSpan(
+                    text: callerName,
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  const TextSpan(
+                    text: ' wants to connect with you via Wi-Fi Direct.',
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 10),
+            const Text(
+              'Accept to open a chat session.',
+              style: TextStyle(fontSize: 13, color: AppColors.textSecondary),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text(
+              'Decline',
+              style: TextStyle(color: AppColors.error),
+            ),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppColors.primary,
+              foregroundColor: AppColors.textLight,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+            ),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Accept'),
+          ),
+        ],
+      ),
+    );
+
+    _invitationDialogOpen = false;
+    if (!mounted) return;
+
+    final notifier = ref.read(connectionProvider.notifier);
+    if (accepted == true) {
+      await notifier.acceptInvitation();
+      // Chat screen will open automatically when SOCKET_CONNECTED fires via
+      // the existing ref.listen in build().
+    } else {
+      await notifier.rejectInvitation();
+    }
+  }
 
   Future<void> _connectToDevice(DeviceModel device) async {
     // Remember the intended peer so ref.listen can navigate when the socket

@@ -122,6 +122,17 @@ class WifiDirectManager(private val context: Context) {
     var peerListListener: ((List<Map<String, Any>>) -> Unit)? = null
     var connectionStateListener: ((Map<String, Any>) -> Unit)? = null
     var messageListener: ((String) -> Unit)? = null
+    /** Fires on the receiving side when a remote device sends a Wi-Fi Direct invitation.
+     *  Payload: { "deviceName": String, "deviceAddress": String }
+     *  Flutter must respond within 30 s by calling acceptInvitation() or rejectInvitation().
+     */
+    var incomingInvitationListener: ((Map<String, Any>) -> Unit)? = null
+
+    // ── Pending incoming invitation ────────────────────────────────────────────
+    // Stores the peer whose WPS-PBC invitation is awaiting user consent.
+    // Cleared on accept, reject, reset, or 30-second timeout.
+    private var pendingInvitedPeer: WifiP2pDevice? = null
+    private var invitationTimeoutRunnable: Runnable? = null
 
     private var initialized = false
 
@@ -486,6 +497,94 @@ class WifiDirectManager(private val context: Context) {
 
     fun startDiscovery() { discoverPeers() }
 
+    // ─── Consent API ──────────────────────────────────────────────────────────
+
+    /**
+     * Accept the pending incoming Wi-Fi Direct invitation.
+     * Called by Flutter after the user taps "Accept" in the consent dialog.
+     */
+    fun acceptInvitation(): Map<String, Any> {
+        val peer = pendingInvitedPeer
+        if (peer == null) {
+            Log.w(tag, "acceptInvitation: no pending invitation to accept")
+            return mapOf("success" to false, "error" to "No pending invitation")
+        }
+        cancelInvitationTimeout()
+        pendingInvitedPeer = null
+        Log.d(tag, "✅ User accepted invitation from ${peer.deviceName} (${peer.deviceAddress})")
+
+        // If the P2P group already formed while the dialog was displayed
+        // (Android auto-accepted the WPS PBC handshake at the OS level),
+        // we only need to start the TCP socket — no need to call connect() again.
+        val phase = connectionPhase.get()
+        if (phase == ConnectionPhase.GROUP_FORMED) {
+            Log.d(tag, "acceptInvitation: group already formed — resuming socket setup")
+            startSocketOrFail()
+            return mapOf("success" to true)
+        }
+
+        // Group not yet formed — call connect() to trigger P2P negotiation.
+        return connectToPeer(peer.deviceAddress)
+    }
+
+    /**
+     * Reject the pending incoming Wi-Fi Direct invitation.
+     * Called by Flutter after the user taps "Decline" in the consent dialog.
+     */
+    @SuppressLint("MissingPermission")
+    fun rejectInvitation() {
+        val peer = pendingInvitedPeer
+        cancelInvitationTimeout()
+        pendingInvitedPeer = null
+        Log.d(tag, "❌ User rejected invitation from ${peer?.deviceName ?: "unknown"}")
+
+        // If the P2P group already formed while the dialog was open (Android
+        // auto-accepted at the OS level), we must dismantle it now.
+        val phase = connectionPhase.get()
+        if (phase == ConnectionPhase.GROUP_FORMED || phase == ConnectionPhase.SOCKET_CONNECTING) {
+            Log.d(tag, "rejectInvitation: removing auto-formed group")
+            wifiP2pManager?.removeGroup(p2pChannel!!, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {
+                    Log.d(tag, "Group removed after user rejection")
+                    resetState(restartPassiveDiscovery = true)
+                }
+                override fun onFailure(reason: Int) {
+                    Log.w(tag, "Failed to remove group after rejection: ${failureReason(reason)}")
+                    resetState(restartPassiveDiscovery = true)
+                }
+            })
+        } else {
+            // Group not yet formed — just restart passive discovery so we stay
+            // visible for future connection attempts.
+            resetState(restartPassiveDiscovery = true)
+        }
+    }
+
+    private fun notifyIncomingInvitation(peer: WifiP2pDevice) {
+        val payload = mapOf(
+            "deviceName"    to peer.deviceName,
+            "deviceAddress" to peer.deviceAddress
+        )
+        Log.d(tag, "🔔 Notifying Flutter of incoming invitation from ${peer.deviceName}")
+        mainHandler.post { incomingInvitationListener?.invoke(payload) }
+    }
+
+    private fun scheduleInvitationTimeout() {
+        cancelInvitationTimeout()
+        invitationTimeoutRunnable = Runnable {
+            if (pendingInvitedPeer != null) {
+                Log.d(tag, "⏰ Invitation timed out — auto-rejecting")
+                // Delegate to rejectInvitation() so group teardown logic runs.
+                rejectInvitation()
+            }
+        }.also { mainHandler.postDelayed(it, 30_000) }
+    }
+
+    private fun cancelInvitationTimeout() {
+        invitationTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        invitationTimeoutRunnable = null
+    }
+
     fun stopDiscovery() {
         val mgr = wifiP2pManager ?: return
         val ch  = p2pChannel   ?: return
@@ -531,6 +630,8 @@ class WifiDirectManager(private val context: Context) {
     fun shutdown() {
         Log.d(tag, "Shutting down WifiDirectManager")
         cancelPassiveDiscovery()
+        cancelInvitationTimeout()
+        pendingInvitedPeer = null
         disconnect()
         unregisterReceiver()
         try { executor.shutdownNow() } catch (_: Exception) {}
@@ -727,6 +828,9 @@ class WifiDirectManager(private val context: Context) {
     private fun resetState(restartPassiveDiscovery: Boolean = false) {
         connectingTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
         connectingTimeoutRunnable = null
+        // Clear any pending consent request so a stale invitation doesn't linger.
+        cancelInvitationTimeout()
+        pendingInvitedPeer = null
         connectionPhase.set(ConnectionPhase.DISCONNECTED)
         isGroupOwner.set(false)
         groupOwnerAddress = null
@@ -967,11 +1071,12 @@ class WifiDirectManager(private val context: Context) {
 
         val phase  = connectionPhase.get()
 
-        // ── Accept incoming Wi-Fi Direct invitations (passive side) ──────────
+        // ── Incoming Wi-Fi Direct invitation — request user consent ──────────
         // When another device has called connect() targeting us, Android places
         // that peer in our list with status == INVITED (1).
-        // Calling connect() back completes the WPS-PBC exchange — no user
-        // interaction needed — enabling one-side-tap connection.
+        // Instead of accepting immediately, notify Flutter so the user can
+        // Accept or Decline via a consent dialog.  acceptInvitation() /
+        // rejectInvitation() are called back from the Dart layer.
         if (phase != ConnectionPhase.SOCKET_CONNECTED &&
             phase != ConnectionPhase.CONNECTING &&
             phase != ConnectionPhase.SOCKET_CONNECTING &&
@@ -980,9 +1085,15 @@ class WifiDirectManager(private val context: Context) {
                 availablePeers.firstOrNull { it.status == WifiP2pDevice.INVITED }
             }
             if (invitedPeer != null) {
-                Log.d(tag, "🤝 Incoming Wi-Fi Direct invitation from: " +
-                      "${invitedPeer.deviceName} (${invitedPeer.deviceAddress}) — accepting")
-                connectToPeer(invitedPeer.deviceAddress)
+                if (pendingInvitedPeer?.deviceAddress == invitedPeer.deviceAddress) {
+                    // Same invitation still pending — user hasn't responded yet.
+                    Log.d(tag, "🔔 Invitation still pending from ${invitedPeer.deviceName} — waiting for user")
+                    return
+                }
+                // New invitation — ask the user for consent.
+                pendingInvitedPeer = invitedPeer
+                scheduleInvitationTimeout()
+                notifyIncomingInvitation(invitedPeer)
                 return
             }
         }
@@ -1054,7 +1165,54 @@ class WifiDirectManager(private val context: Context) {
             "groupOwnerAddress=$groupOwnerAddress"
         )
 
-        if (info.isGroupOwner) {
+        // ── Consent gate A — dialog was already shown via PEERS_CHANGED ─────────
+        // On some OEM builds PEERS_CHANGED fires with status=INVITED before the
+        // group forms.  handlePeerListUpdate() already stored pendingInvitedPeer and
+        // notified Flutter.  We must still NOT start the socket here.
+        // acceptInvitation() / rejectInvitation() resume socket setup.
+        if (pendingInvitedPeer != null) {
+            Log.d(tag, "🔒 Group formed but consent pending (gate A) — deferring socket setup")
+            return
+        }
+
+        // ── Consent gate B — silent inbound connection (INVITED missed) ──────────
+        // On other OEM builds (e.g. Samsung Galaxy A06) the INVITED state flashes
+        // by so quickly that PEERS_CHANGED only ever reports status=0 (CONNECTED).
+        // In that case we detect the inbound connection here: the group formed while
+        // this device was in DISCOVERING phase and had no outbound target
+        // (targetDeviceName == null means we never called initiateConnection()).
+        // We query the peer list to identify the caller, show the consent dialog,
+        // and defer the socket — exactly as gate A does.
+        if ((phase == ConnectionPhase.DISCOVERING || phase == ConnectionPhase.IDLE) &&
+            targetDeviceName == null) {
+            Log.d(tag, "🔔 Passive inbound connection detected (phase=$phase, no target) — querying peer for consent")
+            wifiP2pManager?.requestPeers(p2pChannel) { peerList ->
+                // After group forms the peer appears as CONNECTED (0) in the list.
+                val inboundPeer = peerList.deviceList.firstOrNull {
+                    it.status == WifiP2pDevice.CONNECTED || it.status == WifiP2pDevice.INVITED
+                }
+                if (inboundPeer != null) {
+                    Log.d(tag, "🔔 Inbound peer identified: ${inboundPeer.deviceName} (${inboundPeer.deviceAddress})")
+                    pendingInvitedPeer = inboundPeer
+                    scheduleInvitationTimeout()
+                    notifyIncomingInvitation(inboundPeer)
+                    // Socket is deferred — acceptInvitation() will start it.
+                } else {
+                    // Peer list is empty (race condition — group may have dissolved).
+                    // Fall through and start socket so we don't get stuck.
+                    Log.w(tag, "Passive inbound: peer list empty after group formed — starting socket without consent")
+                    startSocketOrFail()
+                }
+            }
+            return
+        }
+
+        startSocketOrFail()
+    }
+
+    /** Start TCP server (GO) or client (peer) based on current role. */
+    private fun startSocketOrFail() {
+        if (isGroupOwner.get()) {
             startSocketServer()
         } else {
             val goIp = groupOwnerAddress

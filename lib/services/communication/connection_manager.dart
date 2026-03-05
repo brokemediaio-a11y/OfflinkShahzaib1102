@@ -91,9 +91,16 @@ class ConnectionManager {
   final _messageController = StreamController<String>.broadcast();
   final _deviceStreamController =
       StreamController<List<DeviceModel>>.broadcast();
+  final _invitationController =
+      StreamController<Map<String, String>>.broadcast();
 
   Stream<ConnectionState> get connectionState => _connectionController.stream;
   Stream<String> get incomingMessages => _messageController.stream;
+
+  /// Fires when a remote device sends a Wi-Fi Direct connection invitation.
+  /// Map keys: "deviceName" and "deviceAddress".
+  Stream<Map<String, String>> get incomingInvitations =>
+      _invitationController.stream;
 
   // ── Device caches ─────────────────────────────────────────────────
   List<DeviceModel> _bleDevices = const [];
@@ -113,6 +120,7 @@ class ConnectionManager {
   StreamSubscription<Map<String, dynamic>>? _peripheralConnectionStateSubscription;
   StreamSubscription<WifiDirectConnectionState>? _wifiConnectionStateSubscription;
   StreamSubscription<String>? _wifiIncomingMessagesSubscription;
+  StreamSubscription<Map<String, String>>? _wifiInvitationSubscription;
 
   // ── Public getters ────────────────────────────────────────────────
   ConnectionType get currentConnectionType => _currentConnectionType;
@@ -153,6 +161,15 @@ class ConnectionManager {
       _wifiConnectionStateSubscription?.cancel();
       _wifiConnectionStateSubscription =
           _wifiDirectService.connectionState.listen(_handleWifiDirectState);
+
+      // ── Wi-Fi Direct: incoming invitations ────────────────────────
+      _wifiInvitationSubscription?.cancel();
+      _wifiInvitationSubscription =
+          _wifiDirectService.incomingInvitations.listen((payload) {
+        Logger.info(
+            'ConnectionManager: incoming invitation from ${payload["deviceName"]}');
+        _invitationController.add(payload);
+      });
 
       // ── Device-specific scan mode detection ──────────────────────
       _useNativeScanner = await _shouldUseNativeScanner();
@@ -698,6 +715,30 @@ class ConnectionManager {
   }
 
   // ═══════════════════════════════════════════════════════════════════
+  // Invitation consent
+  // ═══════════════════════════════════════════════════════════════════
+
+  /// Accept the pending incoming Wi-Fi Direct invitation.
+  Future<void> acceptInvitation() async {
+    try {
+      await _wifiDirectService.acceptInvitation();
+      Logger.info('ConnectionManager: invitation accepted');
+    } catch (e) {
+      Logger.error('ConnectionManager: acceptInvitation error', e);
+    }
+  }
+
+  /// Reject the pending incoming Wi-Fi Direct invitation.
+  Future<void> rejectInvitation() async {
+    try {
+      await _wifiDirectService.rejectInvitation();
+      Logger.info('ConnectionManager: invitation rejected');
+    } catch (e) {
+      Logger.error('ConnectionManager: rejectInvitation error', e);
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
   // Messaging  (Data Plane → TransportManager → WifiDirectService)
   // ═══════════════════════════════════════════════════════════════════
 
@@ -1127,9 +1168,11 @@ class ConnectionManager {
     _peripheralConnectionStateSubscription?.cancel();
     _wifiConnectionStateSubscription?.cancel();
     _wifiIncomingMessagesSubscription?.cancel();
+    _wifiInvitationSubscription?.cancel();
     _connectionController.close();
     _messageController.close();
     _deviceStreamController.close();
+    _invitationController.close();
     _transportManager.dispose();
   }
 

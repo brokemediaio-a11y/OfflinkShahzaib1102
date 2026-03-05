@@ -50,6 +50,12 @@ class ConnectionNotifier extends StateNotifier<ConnectionProviderState> {
   final Ref _ref; // Add this to access other providers
   StreamSubscription<ConnectionState>? _connectionSubscription;
   StreamSubscription<String>? _messageSubscription;
+  StreamSubscription<Map<String, String>>? _invitationSubscription;
+
+  /// Broadcast stream of incoming connection invitations.
+  /// Each event is a map with keys "deviceName" and "deviceAddress".
+  Stream<Map<String, String>> get incomingInvitations =>
+      _connectionManager.incomingInvitations;
 
   ConnectionNotifier(this._connectionManager, this._ref) : super(ConnectionProviderState()) {
     _setupListeners();
@@ -263,10 +269,19 @@ class ConnectionNotifier extends StateNotifier<ConnectionProviderState> {
     return _connectionManager.isConnected();
   }
 
+  /// Accept the pending incoming Wi-Fi Direct invitation.
+  Future<void> acceptInvitation() =>
+      _connectionManager.acceptInvitation();
+
+  /// Reject the pending incoming Wi-Fi Direct invitation.
+  Future<void> rejectInvitation() =>
+      _connectionManager.rejectInvitation();
+
   @override
   void dispose() {
     _connectionSubscription?.cancel();
     _messageSubscription?.cancel();
+    _invitationSubscription?.cancel();
     super.dispose();
   }
 }
