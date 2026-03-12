@@ -130,11 +130,16 @@ class WifiDirectService {
   // Initialization
   // ═════════════════════════════════════════════════════════════════
 
-  Future<bool> initialize() async {
+  /// [deviceUuid] — this device's OffLink UUID.  Passed to the native layer
+  /// so it can register a DNS-SD Bonjour service immediately on init, making
+  /// this device discoverable by UUID before any explicit connect() call.
+  Future<bool> initialize({required String deviceUuid}) async {
     if (_initialized) return true;
     try {
-      final result =
-          await _methodChannel.invokeMethod<bool>('initialize');
+      final result = await _methodChannel.invokeMethod<bool>(
+        'initialize',
+        {'deviceUuid': deviceUuid},
+      );
       _initialized = result ?? false;
 
       if (_initialized) {
@@ -257,12 +262,16 @@ class WifiDirectService {
   // Connection
   // ═════════════════════════════════════════════════════════════════
 
-  /// Initiate a Wi-Fi Direct connection to the peer identified by [targetName].
+  /// Initiate a Wi-Fi Direct connection to the peer identified by [targetUuid].
   ///
-  /// [targetName] is the peer's display name as broadcast via BLE.
-  /// The native layer will discover nearby P2P peers and connect to
-  /// the one whose deviceName matches [targetName].
+  /// [targetUuid] is the peer's OffLink UUID — the single authoritative identity.
+  /// The native layer uses Wi-Fi Direct DNS-SD service discovery to resolve the
+  /// UUID to a MAC address internally; the MAC never surfaces to Dart.
+  ///
+  /// [targetName] is the peer's display name (OffLink username), used only for
+  /// logging and as a name-based fallback if DNS-SD doesn't respond within 15 s.
   Future<Map<String, dynamic>> initiateConnection({
+    required String targetUuid,
     required String targetName,
   }) async {
     if (!_initialized) {
@@ -271,10 +280,11 @@ class WifiDirectService {
     }
     try {
       Logger.info(
-          'WifiDirectService: initiating connection to peer "$targetName"');
+          'WifiDirectService: initiating UUID-based connection to '
+          '"$targetName" (UUID=$targetUuid)');
       final result = await _methodChannel.invokeMethod<Map>(
         'initiateConnection',
-        {'targetName': targetName},
+        {'targetUuid': targetUuid, 'targetName': targetName},
       );
       final map = result != null
           ? Map<String, dynamic>.from(result)
@@ -387,9 +397,10 @@ class WifiDirectService {
   // Legacy compatibility (kept for DeviceModel-based callers)
   // ═════════════════════════════════════════════════════════════════
 
-  /// Connect to device — wraps [initiateConnection] using device name.
+  /// Connect to device — wraps [initiateConnection] using device UUID.
   Future<bool> connectToDevice(DeviceModel device) async {
-    final result = await initiateConnection(targetName: device.name);
+    final result = await initiateConnection(
+        targetUuid: device.id, targetName: device.name);
     return result['success'] == true;
   }
 

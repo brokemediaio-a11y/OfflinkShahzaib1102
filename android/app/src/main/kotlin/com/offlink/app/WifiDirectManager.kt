@@ -12,6 +12,8 @@ import android.net.wifi.p2p.WifiP2pDevice
 import android.net.wifi.p2p.WifiP2pDeviceList
 import android.net.wifi.p2p.WifiP2pInfo
 import android.net.wifi.p2p.WifiP2pManager
+import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceInfo
+import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceRequest
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -136,6 +138,30 @@ class WifiDirectManager(private val context: Context) {
 
     private var initialized = false
 
+    // Device name to apply once the p2pChannel is ready (set before initialize() completes)
+    private var pendingDeviceName: String? = null
+
+    // ── UUID-based peer identity ───────────────────────────────────────────────
+    // The OffLink UUID is the single authoritative identity for every device.
+    // Wi-Fi Direct MAC addresses are OEM-controlled strings that must NEVER leave
+    // the native layer — the Dart side works exclusively with UUIDs.
+    //
+    // Connection flow:
+    //   1. Each device advertises its UUID via Wi-Fi Direct DNS-SD (Bonjour).
+    //   2. connectByUuid() runs DNS-SD service discovery to find the peer's MAC.
+    //   3. connectToPeer(mac) is called internally — MAC never surfaces to Dart.
+    //   4. Falls back to name-based initiateConnection() after 15 s if DNS-SD
+    //      doesn't respond (handles OEM firmware bugs in DNS-SD stack).
+
+    /** This device's OffLink UUID — set via setOwnUuid() and advertised over DNS-SD. */
+    private var ownUuid: String? = null
+
+    /** UUID of the peer we are currently trying to connect to. */
+    private var targetUuid: String? = null
+
+    /** Timeout runnable that fires if DNS-SD service discovery finds nothing in 15 s. */
+    private var serviceDiscoveryTimeoutRunnable: Runnable? = null
+
     companion object {
         const val TCP_PORT = 8988
         const val GROUP_OWNER_IP = "192.168.49.1"
@@ -145,9 +171,21 @@ class WifiDirectManager(private val context: Context) {
     // Public API
     // ═══════════════════════════════════════════════════════════════
 
+    /**
+     * Initialise the Wi-Fi Direct stack.
+     *
+     * [deviceUuid] — this device's OffLink UUID.  When provided it is
+     * immediately registered as a DNS-SD Bonjour service so remote devices
+     * can discover and connect to us by UUID without relying on the OEM
+     * device-name string (which is not under app control on newer Android).
+     */
     @SuppressLint("MissingPermission")
-    fun initialize(): Boolean {
-        if (initialized) return true
+    fun initialize(deviceUuid: String? = null): Boolean {
+        if (initialized) {
+            // If a UUID was not set on the first call, allow a late registration.
+            if (deviceUuid != null && ownUuid == null) setOwnUuid(deviceUuid)
+            return true
+        }
 
         wifiP2pManager = context.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
         if (wifiP2pManager == null) {
@@ -173,6 +211,17 @@ class WifiDirectManager(private val context: Context) {
         registerReceiver()
         initialized = true
         Log.d(tag, "WifiDirectManager initialised")
+
+        // Apply any device name that was requested before the channel was ready.
+        pendingDeviceName?.let { name ->
+            pendingDeviceName = null
+            setDeviceName(name)
+        }
+
+        // Register UUID as a DNS-SD service so peers can discover us by UUID.
+        if (deviceUuid != null) {
+            setOwnUuid(deviceUuid)
+        }
 
         // ── Clean up any stale group from a previous session ─────────────────
         // If the app was killed while a Wi-Fi Direct group was active, the
@@ -363,8 +412,16 @@ class WifiDirectManager(private val context: Context) {
                     // connect() at the same time and each blocked the other's attempt.
                     // If our peer is now showing as INVITED in the peer list, accept
                     // their invitation directly instead of retrying from scratch.
+                    // ⚠️  Filter by savedTarget (= targetDeviceName before reset) so we
+                    // never accidentally accept an invitation from the wrong device when
+                    // multiple peers are visible (e.g. connecting to Techno while Infinix
+                    // is also in INVITED state from an unrelated session).
                     val invitedByPeer = synchronized(availablePeers) {
-                        availablePeers.firstOrNull { it.status == WifiP2pDevice.INVITED }
+                        val target = targetDeviceName // capture before potential null from reset
+                        availablePeers.firstOrNull { peer ->
+                            peer.status == WifiP2pDevice.INVITED &&
+                            (target == null || peer.deviceName.contains(target, ignoreCase = true))
+                        }
                     }
 
                     // Save targetDeviceName BEFORE resetState() clears it.
@@ -463,12 +520,260 @@ class WifiDirectManager(private val context: Context) {
     fun isP2pEnabled(): Boolean = isP2pEnabled.get()
     fun getConnectionPhase(): String = connectionPhase.get().name
 
+    // ─── UUID-based connection via Wi-Fi Direct DNS-SD ────────────────────────
+
     /**
-     * Convenience alias used by MainActivity to initiate connection by name.
-     * Delegates to [initiateConnection].
+     * Set this device's OffLink UUID and register it as a Wi-Fi Direct
+     * DNS-SD (Bonjour) service so that remote devices can discover us by UUID.
+     *
+     * Safe to call before or after [initialize].  If the P2P channel is not
+     * yet ready the service will be registered once [initialize] completes.
      */
-    fun connectByName(targetName: String) {
-        initiateConnection(targetName)
+    fun setOwnUuid(uuid: String) {
+        if (uuid.isBlank()) return
+        ownUuid = uuid
+        Log.d(tag, "setOwnUuid: $uuid")
+        if (initialized && p2pChannel != null) {
+            registerLocalService(uuid)
+        }
+        // If not yet initialised, initialize() will call setOwnUuid() again
+        // after the channel is ready (via the deviceUuid parameter).
+    }
+
+    /**
+     * Register this device's UUID as a Wi-Fi Direct DNS-SD Bonjour service.
+     *
+     * Remote devices can query "_offlink._tcp" services and read the "uuid"
+     * TXT record to discover our MAC address without any BLE MAC exchange.
+     */
+    @SuppressLint("MissingPermission")
+    private fun registerLocalService(uuid: String) {
+        val mgr = wifiP2pManager ?: return
+        val ch  = p2pChannel   ?: return
+
+        // First remove any stale registration to avoid duplicate-service errors
+        // on devices that cache the local service across initialise() calls.
+        mgr.clearLocalServices(ch, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() { addService(mgr, ch, uuid) }
+            override fun onFailure(r: Int) { addService(mgr, ch, uuid) } // best-effort
+        })
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun addService(mgr: WifiP2pManager, ch: WifiP2pManager.Channel, uuid: String) {
+        val record      = mapOf("uuid" to uuid)
+        val serviceInfo = WifiP2pDnsSdServiceInfo.newInstance(uuid, "_offlink._tcp", record)
+        mgr.addLocalService(ch, serviceInfo, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                Log.d(tag, "✅ DNS-SD service registered: uuid=$uuid")
+            }
+            override fun onFailure(reason: Int) {
+                Log.w(tag, "⚠️ DNS-SD service registration failed (${failureReason(reason)}) — " +
+                           "peers will fall back to name-based discovery")
+            }
+        })
+    }
+
+    /**
+     * Connect to a peer identified by its OffLink [targetUuid].
+     *
+     * Primary path: Wi-Fi Direct DNS-SD service discovery resolves the UUID
+     * to a P2P MAC address internally, then calls connectToPeer(mac).
+     * The MAC address never surfaces to the Dart layer.
+     *
+     * Fallback (after 15 s if DNS-SD yields no result): name-based peer
+     * matching against [fallbackName] — works on devices whose Wi-Fi Direct
+     * name happens to contain the username, or after setDeviceName() succeeds.
+     */
+    @SuppressLint("MissingPermission")
+    fun connectByUuid(targetUuid: String, fallbackName: String) {
+        if (!initialized) {
+            Log.w(tag, "connectByUuid: not initialised")
+            return
+        }
+        val mgr = wifiP2pManager ?: return
+        val ch  = p2pChannel   ?: return
+
+        Log.d(tag, "connectByUuid: UUID=$targetUuid, fallback='$fallbackName'")
+
+        // ── Guard: already connected / connecting ────────────────────────────
+        if (connectionPhase.get() == ConnectionPhase.SOCKET_CONNECTED) {
+            Log.d(tag, "Already socket-connected — no action needed"); return
+        }
+        val phase = connectionPhase.get()
+        if (phase == ConnectionPhase.CONNECTING || phase == ConnectionPhase.SOCKET_CONNECTING ||
+            phase == ConnectionPhase.GROUP_FORMED) {
+            Log.d(tag, "Connection already in progress ($phase) — waiting"); return
+        }
+
+        this.targetUuid       = targetUuid
+        this.targetDeviceName = fallbackName
+        discoveryRetryCount.set(0)
+        connectRetryCount.set(0)
+
+        // ── Step 1: check peer cache — already have someone advertising UUID? ─
+        // DNS-SD response listeners are persistent; if a prior discovery already
+        // populated the cache and the device is visible, skip re-discovery.
+        synchronized(availablePeers) {
+            // We only have name in the peer cache; UUID→MAC is not pre-cached.
+            // We must run DNS-SD discovery. However, if the peer's Wi-Fi Direct
+            // name already contains the UUID (i.e. setDeviceName succeeded on
+            // their side), short-circuit directly.
+            val peer = availablePeers.firstOrNull {
+                it.deviceName.contains(targetUuid, ignoreCase = true)
+            }
+            if (peer != null) {
+                Log.d(tag, "connectByUuid: UUID found in peer name immediately — connecting")
+                this.targetUuid = null
+                connectToPeer(peer.deviceAddress)
+                return
+            }
+        }
+
+        // ── Step 2: DNS-SD service discovery ────────────────────────────────
+        // Android fires TWO callbacks for every Bonjour service response:
+        //   DnsSdServiceResponseListener  → (instanceName, registrationType, srcDevice)
+        //   DnsSdTxtRecordListener        → (fullDomainName, txtRecordMap, srcDevice)
+        // We match via BOTH so either one triggers the connect.
+        // instanceName = UUID (registered via WifiP2pDnsSdServiceInfo.newInstance(uuid, ...))
+        // txtRecordMap["uuid"] = UUID (TXT record set in the service info map)
+        mgr.setDnsSdResponseListeners(
+            ch,
+            // ── Service response: instanceName is the UUID we registered ──
+            WifiP2pManager.DnsSdServiceResponseListener { instanceName, _, srcDevice ->
+                Log.d(tag, "DNS-SD service: instance=$instanceName, mac=${srcDevice.deviceAddress}")
+                if (instanceName == this.targetUuid) {
+                    Log.d(tag, "✅ UUID match via DNS-SD service name: $instanceName → ${srcDevice.deviceAddress}")
+                    cancelServiceDiscoveryTimeout()
+                    this.targetUuid = null
+                    connectToPeer(srcDevice.deviceAddress)
+                }
+            },
+            // ── TXT record: map contains { "uuid" → UUID } ─────────────────
+            WifiP2pManager.DnsSdTxtRecordListener { _, txtRecord, srcDevice ->
+                val peerUuid = txtRecord["uuid"] ?: return@DnsSdTxtRecordListener
+                Log.d(tag, "DNS-SD TXT: uuid=$peerUuid, mac=${srcDevice.deviceAddress}")
+                if (peerUuid == this.targetUuid) {
+                    Log.d(tag, "✅ UUID match via DNS-SD TXT record: $peerUuid → ${srcDevice.deviceAddress}")
+                    cancelServiceDiscoveryTimeout()
+                    this.targetUuid = null
+                    connectToPeer(srcDevice.deviceAddress)
+                }
+            }
+        )
+
+        val request = WifiP2pDnsSdServiceRequest.newInstance()
+        mgr.addServiceRequest(ch, request, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                Log.d(tag, "DNS-SD service request added — starting service discovery")
+                mgr.discoverServices(ch, object : WifiP2pManager.ActionListener {
+                    override fun onSuccess() {
+                        Log.d(tag, "DNS-SD service discovery started for UUID=$targetUuid")
+                        scheduleServiceDiscoveryTimeout(fallbackName)
+                    }
+                    override fun onFailure(reason: Int) {
+                        Log.w(tag, "discoverServices failed (${failureReason(reason)}) — falling back to name-based")
+                        fallbackToNameBased(fallbackName)
+                    }
+                })
+            }
+            override fun onFailure(reason: Int) {
+                Log.w(tag, "addServiceRequest failed (${failureReason(reason)}) — falling back to name-based")
+                fallbackToNameBased(fallbackName)
+            }
+        })
+    }
+
+    private fun scheduleServiceDiscoveryTimeout(fallbackName: String) {
+        cancelServiceDiscoveryTimeout()
+        serviceDiscoveryTimeoutRunnable = Runnable {
+            val ph = connectionPhase.get()
+            if (ph != ConnectionPhase.CONNECTING && ph != ConnectionPhase.GROUP_FORMED &&
+                ph != ConnectionPhase.SOCKET_CONNECTING && ph != ConnectionPhase.SOCKET_CONNECTED) {
+                Log.w(tag, "DNS-SD timeout — no UUID match in 15 s, falling back to name-based")
+                fallbackToNameBased(fallbackName)
+            }
+        }.also { mainHandler.postDelayed(it, 15_000) }
+    }
+
+    private fun cancelServiceDiscoveryTimeout() {
+        serviceDiscoveryTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        serviceDiscoveryTimeoutRunnable = null
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun fallbackToNameBased(targetName: String) {
+        targetUuid = null
+        // Clear DNS-SD service requests so discoverServices() stops; we switch to discoverPeers().
+        wifiP2pManager?.clearServiceRequests(p2pChannel, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                Log.d(tag, "Service requests cleared — starting name-based peer discovery for '$targetName'")
+                initiateConnection(targetName)
+            }
+            override fun onFailure(reason: Int) {
+                Log.w(tag, "clearServiceRequests failed (${failureReason(reason)}) — proceeding with name-based anyway")
+                initiateConnection(targetName)
+            }
+        })
+    }
+
+    /**
+     * Set the Wi-Fi Direct device name to [name] (typically the OffLink username).
+     *
+     * This is critical for peer-name matching: the app searches for a peer whose
+     * Wi-Fi Direct device name contains the OffLink username.  Without this call,
+     * the peer shows its Android system name (e.g. "TECNO CAMON 30S") instead of
+     * "techno", so the match fails even though the device is discoverable.
+     *
+     * Must be called AFTER [initialize] (needs an active p2pChannel).
+     * Requires android.permission.CONFIGURE_WIFI_STATE in the manifest.
+     *
+     * WifiP2pManager.setDeviceName() was deprecated in API 29 and removed from
+     * the public SDK in newer compileSdkVersions, so we invoke it via reflection
+     * to keep compatibility across all Android versions.
+     */
+    fun setDeviceName(name: String) {
+        val mgr = wifiP2pManager
+        val ch  = p2pChannel
+        if (mgr == null || ch == null) {
+            Log.w(tag, "setDeviceName: manager or channel not ready — name='$name' will be applied after init")
+            pendingDeviceName = name
+            return
+        }
+        if (name.isBlank()) {
+            Log.w(tag, "setDeviceName: blank name ignored")
+            return
+        }
+
+        val listener = object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                Log.d(tag, "✅ Wi-Fi Direct device name set to: '$name'")
+            }
+            override fun onFailure(reason: Int) {
+                // Failure is non-fatal; peer-name matching may fall back to the
+                // system device name.  Log but do not surface to Dart.
+                Log.w(tag, "⚠️ setDeviceName failed (${failureReason(reason)}) — " +
+                           "Wi-Fi Direct peers will see system name instead of '$name'")
+            }
+        }
+
+        // setDeviceName was deprecated in API 29 and removed from the public
+        // compileSdk stub in API 33+.  We use reflection so the code compiles
+        // against any targetSdk while still invoking the method at runtime on
+        // devices that still support it (Android 6 – 15 all still honour it).
+        try {
+            val method = mgr.javaClass.getMethod(
+                "setDeviceName",
+                WifiP2pManager.Channel::class.java,
+                String::class.java,
+                WifiP2pManager.ActionListener::class.java
+            )
+            method.invoke(mgr, ch, name, listener)
+        } catch (e: NoSuchMethodException) {
+            Log.w(tag, "setDeviceName not available on this device/API: ${e.message}")
+        } catch (e: Exception) {
+            Log.w(tag, "setDeviceName reflection error: ${e.message}")
+        }
     }
 
     /**
@@ -828,6 +1133,8 @@ class WifiDirectManager(private val context: Context) {
     private fun resetState(restartPassiveDiscovery: Boolean = false) {
         connectingTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
         connectingTimeoutRunnable = null
+        cancelServiceDiscoveryTimeout()
+        targetUuid = null
         // Clear any pending consent request so a stale invitation doesn't linger.
         cancelInvitationTimeout()
         pendingInvitedPeer = null
@@ -1008,7 +1315,10 @@ class WifiDirectManager(private val context: Context) {
 
                 WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION -> {
                     val device = extractThisDevice(intent)
-                    Log.d(tag, "This device info: ${device?.deviceName} (${device?.deviceAddress})")
+                    // Log the system name for diagnostics only — MAC is never exposed
+                    // to the Dart layer. UUID is the single identity used by OffLink.
+                    Log.d(tag, "This device info: name=${device?.deviceName}, " +
+                               "uuid=$ownUuid (MAC omitted by design)")
                 }
             }
         }
@@ -1111,7 +1421,13 @@ class WifiDirectManager(private val context: Context) {
 
         if (canAutoConnect) {
             val match = synchronized(availablePeers) {
-                availablePeers.firstOrNull()
+                // ── Filter by targetDeviceName so we never connect to the wrong device ──
+                // Previously this used firstOrNull() with no filter, which caused A52
+                // to connect to Infinix even when the intended target was Techno, because
+                // Infinix happened to be first in the peer list returned by the framework.
+                availablePeers.firstOrNull {
+                    it.deviceName.contains(targetDeviceName!!, ignoreCase = true)
+                }
             }
             if (match != null) {
                 Log.d(
@@ -1121,7 +1437,10 @@ class WifiDirectManager(private val context: Context) {
                 )
                 connectToPeer(match.deviceAddress)
             } else {
-                Log.w(tag, "Auto-connect skipped — peer list empty (phase=$phase)")
+                // Named peer not yet visible — schedule a rediscovery and wait.
+                Log.w(tag, "Auto-connect skipped — no peer matching '$targetDeviceName' found " +
+                      "(${availablePeers.size} other peer(s) visible). Retrying discovery in 4 s…")
+                mainHandler.postDelayed({ discoverPeers() }, 4000)
             }
         } else if (targetDeviceName != null) {
             Log.d(tag, "Auto-connect skipped — phase=$phase, target=$targetDeviceName")
@@ -1150,9 +1469,11 @@ class WifiDirectManager(private val context: Context) {
             return
         }
 
-        // Group is forming — cancel the CONNECTING timeout (no longer needed)
+        // Group is forming — cancel the CONNECTING and DNS-SD timeouts
         connectingTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
         connectingTimeoutRunnable = null
+        cancelServiceDiscoveryTimeout()
+        targetUuid = null
 
         connectionPhase.set(ConnectionPhase.GROUP_FORMED)
         isGroupOwner.set(info.isGroupOwner)

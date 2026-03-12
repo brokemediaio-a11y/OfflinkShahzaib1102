@@ -68,6 +68,11 @@ class MainActivity : FlutterActivity() {
 
                     "startAdvertising" -> {
                         val deviceName = call.argument<String>("deviceName")
+                        // Also attempt to set the Wi-Fi Direct device name (best-effort;
+                        // may silently fail on API 35+ devices that block reflection).
+                        if (!deviceName.isNullOrBlank()) {
+                            wifiDirectManager.setDeviceName(deviceName)
+                        }
                         val started = blePeripheralManager.startAdvertising(deviceName)
                         result.success(started)
                     }
@@ -332,7 +337,11 @@ class MainActivity : FlutterActivity() {
             .setMethodCallHandler { call, result ->
                 when (call.method) {
                     "initialize" -> {
-                        val initialized = wifiDirectManager.initialize()
+                        // Accept the device UUID so the native layer can register
+                        // a DNS-SD service immediately — peers can then discover
+                        // us by UUID rather than by an OEM device-name string.
+                        val deviceUuid = call.argument<String>("deviceUuid")
+                        val initialized = wifiDirectManager.initialize(deviceUuid)
                         result.success(initialized)
                     }
 
@@ -347,18 +356,18 @@ class MainActivity : FlutterActivity() {
                     }
 
                     "initiateConnection" -> {
-                        val targetName = call.argument<String>("targetName")
-                        if (targetName == null) {
-                            result.error("INVALID_ARGS", "targetName is required", null)
+                        // targetUuid is the peer's OffLink UUID — the single authoritative
+                        // identity.  The native layer resolves UUID → MAC internally via
+                        // DNS-SD; the MAC never surfaces to the Dart layer.
+                        val targetUuid = call.argument<String>("targetUuid")
+                        val targetName = call.argument<String>("targetName") ?: ""
+                        if (targetUuid == null) {
+                            result.error("INVALID_ARGS", "targetUuid is required", null)
                             return@setMethodCallHandler
                         }
-                        // Find the peer by name from the current peer list and connect
                         Thread {
                             try {
-                                // Start discovery first so peers list is populated,
-                                // then connect once the peers-changed event fires.
-                                // For now we connect directly if the peer is already known.
-                                wifiDirectManager.connectByName(targetName)
+                                wifiDirectManager.connectByUuid(targetUuid, targetName)
                                 mainHandler.post { result.success(mapOf("success" to true)) }
                             } catch (e: Exception) {
                                 mainHandler.post {

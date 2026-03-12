@@ -21,6 +21,9 @@
     <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
     <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <!-- Required by WifiP2pManager.setDeviceName() to synchronise the Wi-Fi Direct
+         device name with the OffLink username so peer-name matching works correctly. -->
+    <uses-permission android:name="android.permission.CONFIGURE_WIFI_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- Required by WifiP2pManager to bring up/down the Wi-Fi Direct network interface -->

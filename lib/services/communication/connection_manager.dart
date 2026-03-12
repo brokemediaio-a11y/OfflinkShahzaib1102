@@ -143,7 +143,12 @@ class ConnectionManager {
       final bleInitialized = await _bleDiscoveryService.initialize();
 
       // ── Data Plane: Wi-Fi Direct ──────────────────────────────────
-      final wifiInitialized = await _wifiDirectService.initialize();
+      // Pass the device UUID so the native layer can register it as a
+      // DNS-SD service immediately on start, making this device discoverable
+      // by UUID before any explicit connect() call.
+      final deviceUuid = DeviceStorage.getDeviceId();
+      final wifiInitialized =
+          await _wifiDirectService.initialize(deviceUuid: deviceUuid);
 
       // ── RoutingManager: locally delivered messages ────────────────
       _routingManager.localMessages.listen((message) {
@@ -672,8 +677,14 @@ class ConnectionManager {
       }
 
       // ── Initiate Wi-Fi Direct negotiation ────────────────────────
-      final result =
-          await _wifiDirectService.initiateConnection(targetName: device.name);
+      // UUID is the ONLY identity used here. The native layer resolves
+      // UUID → MAC internally via DNS-SD service discovery.
+      // MAC addresses NEVER appear in the Dart layer.
+      Logger.info(
+          'ConnectionManager: initiating Wi-Fi Direct to '
+          '"${device.name}" (UUID=${device.id})');
+      final result = await _wifiDirectService.initiateConnection(
+          targetUuid: device.id, targetName: device.name);
 
       if (result['success'] == true) {
         Logger.info(
