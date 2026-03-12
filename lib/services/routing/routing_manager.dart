@@ -1,183 +1,240 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
 import '../../models/message_model.dart';
 import '../../utils/logger.dart';
 import '../storage/device_storage.dart';
+import '../storage/pending_message_storage.dart';
+import '../storage/message_storage.dart';
+import '../communication/transport_manager.dart';
 
-/// Manages message routing, deduplication, and forwarding in the mesh network
-/// 
-/// This layer is responsible for:
-/// - Message deduplication (prevent infinite loops)
-/// - TTL/hop count management
-/// - Deciding whether to deliver locally or forward
-/// - (Future) Forwarding messages to neighbors
-/// 
-/// IMPORTANT: Forwarding is currently DISABLED - messages are only delivered locally
+/// Manages message routing, deduplication, forwarding, and delivery
+/// in the OffLink mesh network.
+///
+/// Routing pipeline for every incoming/outgoing message:
+///
+///   1. Deduplication     — drop already-processed messages (prevent loops)
+///   2. TTL check         — drop messages that exceeded hop limit
+///   3. Local delivery    — if finalReceiverId == myId, deliver + emit ACK
+///   4. Forward           — otherwise, increment hop and broadcast to neighbors
+///   5. Store-and-forward — if no neighbors, queue in pending_messages
 class RoutingManager {
   static final RoutingManager _instance = RoutingManager._internal();
   factory RoutingManager() => _instance;
   RoutingManager._internal();
 
-  /// Set of processed message IDs to prevent duplicate processing
-  /// Messages are identified by their messageId field
+  /// Cache of already-processed message IDs (deduplication).
   final Set<String> _processedMessageIds = <String>{};
 
-  /// Maximum size of the processed messages set (prevent unbounded growth)
   static const int _maxProcessedMessages = 1000;
 
-  /// Stream controller for locally delivered messages
-  final _localMessageController = StreamController<MessageModel>.broadcast();
+  // ── Outgoing streams ─────────────────────────────────────────────
 
-  /// Stream of messages that should be delivered to this device
+  /// Messages delivered to this device (for ChatProvider / UI).
+  final _localMessageController = StreamController<MessageModel>.broadcast();
   Stream<MessageModel> get localMessages => _localMessageController.stream;
 
-  /// Get the device ID for this device
+  /// Delivery ACKs to be sent back over the active connection.
+  ///
+  /// Format: { '__type': '__delivery_ack__', 'messageId': ..., 'originalSenderId': ... }
+  final _deliveryAckController =
+      StreamController<Map<String, dynamic>>.broadcast();
+  Stream<Map<String, dynamic>> get deliveryAcks =>
+      _deliveryAckController.stream;
+
+  // ── Identity ─────────────────────────────────────────────────────
+
   String get _myDeviceId => DeviceStorage.getDeviceId();
 
-  /// Route an incoming or outgoing message through the mesh network
-  /// 
-  /// This is the main entry point for all messages (sent or received)
-  /// 
-  /// Returns true if the message was processed successfully
-  Future<bool> routeMessage(MessageModel message) async {
-    try {
-      Logger.info('RoutingManager: Processing message ${message.messageId}');
-      Logger.debug('  From: ${message.originalSenderId} → To: ${message.finalReceiverId}');
-      Logger.debug('  Hop: ${message.hopCount}/${message.maxHops}');
+  // ═══════════════════════════════════════════════════════════════════
+  // Main entry point
+  // ═══════════════════════════════════════════════════════════════════
 
-      // Step 1: Check for duplicate messages (deduplication)
+  /// Route a message through the mesh.
+  ///
+  /// [message]       — the message to route.
+  /// [senderPeerId]  — UUID of the peer who sent this message to us
+  ///                   (used to avoid echoing it back to the sender).
+  ///
+  /// Returns `true` if the message was handled (delivered or forwarded).
+  Future<bool> routeMessage(
+    MessageModel message, {
+    String? senderPeerId,
+  }) async {
+    try {
+      Logger.info(
+          'RoutingManager: routing message ${message.messageId} '
+          '(from: ${message.originalSenderId} → to: ${message.finalReceiverId}, '
+          'hop: ${message.hopCount}/${message.maxHops})');
+
+      // Step 1: Deduplication
       if (_isDuplicate(message.messageId)) {
-        Logger.info('RoutingManager: Ignoring duplicate message ${message.messageId}');
+        Logger.debug(
+            'RoutingManager: duplicate message ${message.messageId} — dropped');
         return false;
       }
-
-      // Step 2: Mark message as processed
       _markAsProcessed(message.messageId);
 
-      // Step 3: Check if message is for this device
+      // Step 2: Check if this message is for this device
       if (_isForThisDevice(message)) {
-        Logger.info('RoutingManager: Message is for this device, delivering locally');
+        Logger.info(
+            'RoutingManager: ✅ message ${message.messageId} is for this device — delivering locally');
         _deliverLocally(message);
         return true;
       }
 
-      // Step 4: Check if message should be forwarded
-      if (_shouldForwardMessage(message)) {
-        Logger.info('RoutingManager: Message should be forwarded (hopCount: ${message.hopCount}/${message.maxHops})');
-        // IMPORTANT: Forwarding is currently DISABLED for FYP stability
-        // When ready to enable multi-hop, implement _forwardToNeighbors()
-        await _forwardToNeighbors(message);
-        return true;
+      // Step 3: TTL check — drop if hop limit exceeded
+      if (message.hopCount >= message.maxHops) {
+        Logger.warning(
+            'RoutingManager: ⛔ message ${message.messageId} exceeded hop limit '
+            '(${message.hopCount}/${message.maxHops}) — dropped');
+        return false;
       }
 
-      // Step 5: Message has exceeded hop limit or other drop condition
-      Logger.warning('RoutingManager: Dropping message ${message.messageId} (hopCount: ${message.hopCount}/${message.maxHops})');
-      return false;
-    } catch (e, stackTrace) {
-      Logger.error('RoutingManager: Error routing message', e, stackTrace);
+      // Step 4: Forward or store
+      Logger.info(
+          'RoutingManager: message ${message.messageId} needs forwarding '
+          '(hop ${message.hopCount}/${message.maxHops})');
+      await _forwardToNeighbors(message, senderPeerId: senderPeerId);
+      return true;
+    } catch (e, st) {
+      Logger.error('RoutingManager: error routing message', e, st);
       return false;
     }
   }
 
-  /// Check if a message has already been processed (deduplication)
-  bool _isDuplicate(String messageId) {
-    return _processedMessageIds.contains(messageId);
+  // ═══════════════════════════════════════════════════════════════════
+  // Local delivery
+  // ═══════════════════════════════════════════════════════════════════
+
+  void _deliverLocally(MessageModel message) {
+    // 1. Emit to ChatProvider / ConnectionNotifier
+    _localMessageController.add(message);
+
+    // 2. Emit a delivery ACK so the sender can update message status
+    final ack = {
+      '__type': '__delivery_ack__',
+      'messageId': message.messageId,
+      'originalSenderId': message.originalSenderId,
+      'finalReceiverId': message.finalReceiverId,
+      'ackSenderId': _myDeviceId,
+      'timestamp': DateTime.now().toIso8601String(),
+    };
+    _deliveryAckController.add(ack);
+
+    Logger.info(
+        'RoutingManager: 📨 delivered message ${message.messageId} locally; '
+        'ACK queued for originalSender=${message.originalSenderId}');
   }
 
-  /// Mark a message as processed
+  // ═══════════════════════════════════════════════════════════════════
+  // Forwarding / Store-and-Forward
+  // ═══════════════════════════════════════════════════════════════════
+
+  /// Forward a message to all neighbors (except the peer we received it from).
+  ///
+  /// If no usable neighbors exist, the message is saved to [PendingMessageStorage]
+  /// and will be flushed when a new connection becomes available.
+  Future<void> _forwardToNeighbors(
+    MessageModel message, {
+    String? senderPeerId,
+  }) async {
+    // Increment hop count before forwarding
+    final forwardedMessage = message.copyWith(
+      hopCount: message.hopCount + 1,
+      senderPeerId: _myDeviceId,
+    );
+
+    // Get active neighbors from TransportManager
+    final allNeighbors = TransportManager().getNeighbors();
+
+    // Exclude the peer we received this from (prevent echoing)
+    final targets = allNeighbors
+        .where((p) => p.peerId != senderPeerId && p.socketActive)
+        .toList();
+
+    if (targets.isEmpty) {
+      // No usable neighbors — queue for store-and-forward
+      Logger.info(
+          'RoutingManager: no neighbors to forward to — storing message '
+          '${message.messageId} in pending queue');
+      await PendingMessageStorage.savePendingMessage(forwardedMessage);
+      return;
+    }
+
+    // Serialize once, send to all eligible neighbors
+    final messageJson = jsonEncode(forwardedMessage.toJson());
+    final messageBytes = Uint8List.fromList(utf8.encode(messageJson));
+
+    int forwarded = 0;
+    for (final neighbor in targets) {
+      final sent =
+          await TransportManager().sendToPeer(neighbor.peerId, messageBytes);
+      if (sent) {
+        forwarded++;
+        // Update local storage status to 'relayed' if we originally sent it
+        if (forwardedMessage.originalSenderId == _myDeviceId) {
+          await MessageStorage.updateMessageStatus(
+            forwardedMessage.id,
+            MessageStatus.relayed,
+          );
+        }
+      }
+    }
+
+    if (forwarded == 0) {
+      // All sends failed — save to pending as fallback
+      Logger.warning(
+          'RoutingManager: all forward attempts failed — queuing message '
+          '${message.messageId} as pending');
+      await PendingMessageStorage.savePendingMessage(forwardedMessage);
+    } else {
+      Logger.info(
+          'RoutingManager: ↗️ forwarded message ${message.messageId} '
+          'to $forwarded/${targets.length} neighbor(s) '
+          '(hop now: ${forwardedMessage.hopCount})');
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Helper predicates
+  // ═══════════════════════════════════════════════════════════════════
+
+  bool _isDuplicate(String messageId) =>
+      _processedMessageIds.contains(messageId);
+
   void _markAsProcessed(String messageId) {
     _processedMessageIds.add(messageId);
-
-    // Prevent unbounded growth - remove oldest entries if limit exceeded
-    // In a production system, you might use a time-based expiry or LRU cache
+    // Prevent unbounded growth — remove oldest entry when limit reached
     if (_processedMessageIds.length > _maxProcessedMessages) {
-      final oldest = _processedMessageIds.first;
-      _processedMessageIds.remove(oldest);
-      Logger.debug('RoutingManager: Removed oldest processed message from cache');
+      _processedMessageIds.remove(_processedMessageIds.first);
     }
   }
 
-  /// Check if a message is destined for this device
-  bool _isForThisDevice(MessageModel message) {
-    return message.finalReceiverId == _myDeviceId;
-  }
+  bool _isForThisDevice(MessageModel message) =>
+      message.finalReceiverId == _myDeviceId;
 
-  /// Check if a message should be forwarded to neighbors
-  /// 
-  /// Returns true if:
-  /// - Message is not for this device
-  /// - Hop count is below max hops (TTL not exceeded)
-  bool _shouldForwardMessage(MessageModel message) {
-    // Don't forward if message is for us
-    if (_isForThisDevice(message)) {
-      return false;
-    }
+  // ═══════════════════════════════════════════════════════════════════
+  // Utilities
+  // ═══════════════════════════════════════════════════════════════════
 
-    // Don't forward if hop count exceeded
-    if (message.hopCount >= message.maxHops) {
-      Logger.warning('RoutingManager: Message ${message.messageId} exceeded hop limit');
-      return false;
-    }
-
-    // Message can be forwarded
-    return true;
-  }
-
-  /// Deliver a message to the local application (ChatProvider, etc.)
-  void _deliverLocally(MessageModel message) {
-    Logger.info('RoutingManager: Delivering message ${message.messageId} to local application');
-    _localMessageController.add(message);
-  }
-
-  /// Forward a message to all neighbors (except the sender)
-  /// 
-  /// STUB IMPLEMENTATION - Forwarding is currently DISABLED
-  /// 
-  /// When ready to enable multi-hop:
-  /// 1. Get list of neighbors from TransportManager
-  /// 2. Increment hopCount
-  /// 3. Serialize message to bytes
-  /// 4. Send to all neighbors except the one we received from
-  /// 5. Use controlled flooding (broadcast to all neighbors)
-  Future<void> _forwardToNeighbors(MessageModel message) async {
-    // STUB: Forwarding disabled for FYP stability
-    Logger.debug('RoutingManager: Forwarding is currently disabled (stub method)');
-    
-    // Future implementation:
-    // 1. Increment hop count
-    // final forwardedMessage = message.copyWith(hopCount: message.hopCount + 1);
-    // 
-    // 2. Get neighbors from TransportManager
-    // final neighbors = _transportManager.getNeighbors();
-    // 
-    // 3. Serialize message
-    // final messageBytes = _serializeMessage(forwardedMessage);
-    // 
-    // 4. Broadcast to all neighbors
-    // await _transportManager.broadcastToAllPeers(messageBytes);
-    //
-    // 5. Log forwarding action
-    // Logger.info('RoutingManager: Forwarded message ${message.messageId} to ${neighbors.length} neighbors');
-  }
-
-  /// Clear the processed message cache
-  /// Useful for testing or resetting state
   void clearProcessedMessages() {
     _processedMessageIds.clear();
-    Logger.info('RoutingManager: Cleared processed message cache');
+    Logger.info('RoutingManager: cleared processed message cache');
   }
 
-  /// Get statistics about the routing manager
   Map<String, dynamic> getStatistics() {
     return {
       'processedMessages': _processedMessageIds.length,
       'maxProcessedMessages': _maxProcessedMessages,
       'myDeviceId': _myDeviceId,
+      'pendingMessages': PendingMessageStorage.getPendingCount(),
     };
   }
 
-  /// Dispose resources
   void dispose() {
     _localMessageController.close();
+    _deliveryAckController.close();
     _processedMessageIds.clear();
   }
 }

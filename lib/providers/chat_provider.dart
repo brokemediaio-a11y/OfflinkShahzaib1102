@@ -6,8 +6,8 @@ import '../models/message_model.dart';
 import '../models/device_model.dart';
 import '../services/storage/message_storage.dart';
 import '../services/storage/device_storage.dart';
+import '../services/storage/pending_message_storage.dart';
 import '../providers/connection_provider.dart';
-import '../providers/device_provider.dart';
 import 'conversations_provider.dart';
 import '../utils/logger.dart';
 
@@ -41,236 +41,122 @@ class ChatState {
 
 class ChatNotifier extends StateNotifier<ChatState> {
   final ConnectionNotifier _connectionNotifier;
-  final Ref _ref; // Add ref to access other providers
-  final String _myDeviceId; // Our own device ID (for sending messages)
-  final String _otherDeviceId; // The device we're chatting with
-  DeviceModel? _otherDevice; // Store device info for auto-connection
+  final Ref _ref;
+  final String _myDeviceId;
+  final String _otherDeviceId;
+  DeviceModel? _otherDevice;
   StreamSubscription<String>? _messageSubscription;
 
-  ChatNotifier(ConnectionNotifier connectionNotifier, Ref ref, String myDeviceId, String otherDeviceId)
+  ChatNotifier(ConnectionNotifier connectionNotifier, Ref ref,
+      String myDeviceId, String otherDeviceId)
       : _connectionNotifier = connectionNotifier,
         _ref = ref,
         _myDeviceId = myDeviceId,
         _otherDeviceId = otherDeviceId,
         super(ChatState(currentDeviceId: otherDeviceId)) {
     _loadMessages();
-    _setupMessageListener();
-    Logger.info('ChatNotifier initialized: myDeviceId=$myDeviceId, otherDeviceId=$otherDeviceId');
+    Logger.info(
+        'ChatNotifier initialized: myDeviceId=$myDeviceId, otherDeviceId=$otherDeviceId');
   }
 
-  // Set device info (called from chat screen)
   void setDeviceInfo(DeviceModel device) {
     _otherDevice = device;
-    // IMPORTANT: Update _otherDeviceId to match the device's ID
-    // This ensures we use the correct device ID (UUID from conversation) when sending messages
-    // Note: _otherDeviceId is final, so we can't change it directly
-    // But the chat provider is created with the correct otherDeviceId from the conversation
-    Logger.info('Device info set: id=${device.id}, address=${device.address}, _otherDeviceId=$_otherDeviceId');
-  }
-
-  void _setupMessageListener() {
-    // Listen to incoming messages from connection manager
-    // Note: This would need to be set up through the connection manager
-    // For now, we'll handle messages when they arrive
+    Logger.info(
+        'Device info set: id=${device.id}, address=${device.address}, '
+        '_otherDeviceId=$_otherDeviceId');
   }
 
   Future<void> _loadMessages() async {
     try {
-      // Load messages for the conversation with the other device
       final messages = MessageStorage.getMessagesForConversation(_otherDeviceId);
-      // Sort messages by timestamp
       messages.sort((a, b) => a.timestamp.compareTo(b.timestamp));
       state = state.copyWith(messages: messages);
-      Logger.info('Loaded ${messages.length} messages for conversation with: $_otherDeviceId');
+      Logger.info(
+          'Loaded ${messages.length} messages for conversation with: $_otherDeviceId');
     } catch (e) {
       Logger.error('Error loading messages', e);
       state = state.copyWith(error: 'Failed to load messages');
     }
   }
 
-  Future<void> sendMessage(String content, String receiverId, {DeviceModel? device}) async {
+  // ─────────────────────────────────────────────────────────────────
+  // Send — works online OR offline (store-and-forward)
+  // ─────────────────────────────────────────────────────────────────
+
+  Future<void> sendMessage(String content, String receiverId,
+      {DeviceModel? device}) async {
     if (content.trim().isEmpty) return;
 
     try {
-      // The conversation key (_otherDeviceId) is always the peer's UUID.
-      // Use it directly as the message receiver — never fall back to a MAC or
-      // any other identifier.
       final String finalReceiverId = _otherDeviceId;
 
-      Logger.info('ChatNotifier.sendMessage: receiverId=$finalReceiverId (_otherDeviceId=$_otherDeviceId)');
-      
-      // Check if we're connected to any device
-      // IMPORTANT: If we're already connected (as central OR peripheral), use that connection
-      // This allows replies to work even when we're in peripheral mode (central connected to us)
-      final connectionState = _ref.read(connectionProvider);
-      final isConnected = connectionState.state == ConnectionStateType.connected;
-      
-      Logger.info('Connection check: isConnected=$isConnected');
-      if (isConnected && connectionState.connectedDevice != null) {
-        Logger.info('  connectedDevice: id=${connectionState.connectedDevice!.id}, address=${connectionState.connectedDevice!.address}, name=${connectionState.connectedDevice!.name}');
-        Logger.info('  finalReceiverId: $finalReceiverId, receiverId: $receiverId');
-      }
+      Logger.info(
+          'ChatNotifier.sendMessage: receiverId=$finalReceiverId');
 
-      // If already connected, skip scanning and just send the message
-      // This works for both central and peripheral connections
-      if (isConnected) {
-        Logger.info('Already connected (central or peripheral). Will send message to: $finalReceiverId');
-        // Continue to message sending logic below
-      } else {
-        // Not connected - try to auto-connect by scanning
-        Logger.info('Not connected to device. Scanning and attempting auto-connection...');
-        state = state.copyWith(
-          isSending: true,
-          error: 'Connecting to device...',
-        );
-
-        final deviceNotifier = _ref.read(deviceProvider.notifier);
-        
-        // Always scan to find the device (device info might have UUID instead of MAC)
-        Logger.info('Starting scan to find device...');
-        await deviceNotifier.startScan();
-        
-        // Wait for devices to be discovered (increase wait time)
-        await Future.delayed(const Duration(seconds: 5));
-        
-        // Get discovered devices
-        final discoveredDevices = _ref.read(deviceProvider).discoveredDevices;
-        Logger.info('Found ${discoveredDevices.length} devices during scan');
-        
-        // Find the target device by UUID only
-        // receiverId should always be a UUID now
-        DeviceModel? foundDevice;
-        for (final d in discoveredDevices) {
-          Logger.debug('Checking device: id=${d.id} (UUID), address=${d.address} (MAC), name=${d.name}');
-          
-          // Match by UUID (receiverId should be UUID)
-          if (d.id == receiverId) {
-            foundDevice = d;
-            Logger.info('Matched device by UUID: ${d.name}');
-            break;
-          }
-          
-          // If we have device info, try matching by UUID
-          final targetDevice = device ?? _otherDevice;
-          if (targetDevice != null && d.id == targetDevice.id) {
-            foundDevice = d;
-            Logger.info('Matched device by target device UUID: ${d.name}');
-            break;
-          }
-        }
-        
-        // Stop scan
-        await deviceNotifier.stopScan();
-        
-        if (foundDevice != null) {
-          Logger.info('Found device: ${foundDevice.name} (${foundDevice.address}). Connecting...');
-          final connected = await _connectionNotifier.connectToDevice(foundDevice);
-          if (!connected) {
-            state = state.copyWith(
-              isSending: false,
-              error: 'Failed to connect to device. Please ensure device is nearby and try again.',
-            );
-            Logger.error('Failed to auto-connect to device: ${foundDevice.name}');
-            return;
-          }
-          // Update stored device info with actual discovered device
-          _otherDevice = foundDevice;
-          // IMPORTANT: Keep using _otherDeviceId (the UUID from the received message)
-          // Don't change finalReceiverId to foundDevice.id - we want to reply to the same UUID we received from
-          // This ensures Device 2 replies to Device 1's UUID, not Device 1's MAC address
-          Logger.info('Successfully connected to device: ${foundDevice.name}. Will reply to: $finalReceiverId');
-        } else {
-          state = state.copyWith(
-            isSending: false,
-            error: 'Device not found. Please ensure device is nearby and advertising, then try again.',
-          );
-          Logger.error('Target device not found during scan. ReceiverId: $finalReceiverId');
-          return;
-        }
-      }
-
-      // NEW: Create message with routing fields for mesh networking
+      // ── Build the message ─────────────────────────────────────────
       final messageId = const Uuid().v4();
       final message = MessageModel(
-        id: messageId, // Legacy field for backward compatibility
+        id: messageId,
         content: content.trim(),
-        senderId: _myDeviceId, // Legacy field for backward compatibility
-        receiverId: finalReceiverId, // Legacy field for backward compatibility
+        senderId: _myDeviceId,
+        receiverId: finalReceiverId,
         timestamp: DateTime.now(),
         status: MessageStatus.sending,
         isSent: true,
-        // NEW: Routing fields for mesh networking
-        messageId: messageId, // Unique message identifier for deduplication
-        originalSenderId: _myDeviceId, // Device that created the message
-        finalReceiverId: finalReceiverId, // Intended destination device
-        hopCount: 0, // Starting hop count
-        maxHops: 3, // Maximum hops allowed (TTL)
+        messageId: messageId,
+        originalSenderId: _myDeviceId,
+        finalReceiverId: finalReceiverId,
+        senderPeerId: _myDeviceId,
+        hopCount: 0,
+        maxHops: 5,
       );
 
-      // Add message to state immediately
+      // ── Optimistic UI update ──────────────────────────────────────
       state = state.copyWith(
         messages: [...state.messages, message],
         isSending: true,
         error: null,
       );
 
-      // Save to local storage
+      // ── Persist message ───────────────────────────────────────────
       await MessageStorage.saveMessage(message);
 
-      // Update conversations list
+      // ── Update conversations list ─────────────────────────────────
       try {
-        // Get stored name for the receiver, or use device name
         final storedName = DeviceStorage.getDeviceDisplayName(finalReceiverId);
         final deviceName = storedName ?? finalReceiverId;
-        _ref.read(conversationsProvider.notifier).updateConversation(message, deviceName);
+        _ref
+            .read(conversationsProvider.notifier)
+            .updateConversation(message, deviceName);
       } catch (e) {
         Logger.error('Error updating conversations', e);
       }
 
-      // Send via connection manager
-      // Convert message to JSON string properly using jsonEncode
-      final messageJson = jsonEncode(message.toJson());
-      final sent = await _connectionNotifier.sendMessage(messageJson);
+      // ── Check connection ──────────────────────────────────────────
+      final connectionState = _ref.read(connectionProvider);
+      final isConnected =
+          connectionState.state == ConnectionStateType.connected;
 
-      if (sent) {
-        // Update message status to sent
-        await MessageStorage.updateMessageStatus(
-          message.id,
-          MessageStatus.sent,
-        );
-        
-        final updatedMessages = state.messages.map((m) {
-          if (m.id == message.id) {
-            return m.copyWith(status: MessageStatus.sent);
-          }
-          return m;
-        }).toList();
+      if (isConnected) {
+        // ── ONLINE: send directly ─────────────────────────────────
+        final messageJson = jsonEncode(message.toJson());
+        final sent = await _connectionNotifier.sendMessage(messageJson);
 
-        state = state.copyWith(
-          messages: updatedMessages,
-          isSending: false,
-        );
-        Logger.info('Message sent successfully');
+        if (sent) {
+          await MessageStorage.updateMessageStatus(
+              message.id, MessageStatus.sent);
+          _updateMessageInState(message.id, MessageStatus.sent);
+          Logger.info('ChatNotifier: ✅ message sent successfully');
+        } else {
+          // Send failed even though connected — queue as pending
+          await _queueAsPending(message);
+        }
       } else {
-        // Update message status to failed
-        await MessageStorage.updateMessageStatus(
-          message.id,
-          MessageStatus.failed,
-        );
-        
-        final updatedMessages = state.messages.map((m) {
-          if (m.id == message.id) {
-            return m.copyWith(status: MessageStatus.failed);
-          }
-          return m;
-        }).toList();
-
-        state = state.copyWith(
-          messages: updatedMessages,
-          isSending: false,
-          error: 'Failed to send message',
-        );
-        Logger.error('Failed to send message');
+        // ── OFFLINE: queue for store-and-forward ─────────────────
+        Logger.info(
+            'ChatNotifier: peer offline — queuing message ${message.messageId} '
+            'for store-and-forward delivery');
+        await _queueAsPending(message);
       }
     } catch (e) {
       Logger.error('Error sending message', e);
@@ -281,68 +167,86 @@ class ChatNotifier extends StateNotifier<ChatState> {
     }
   }
 
+  /// Save message to the pending queue and update status to [MessageStatus.pending].
+  Future<void> _queueAsPending(MessageModel message) async {
+    final pendingMessage = message.copyWith(status: MessageStatus.pending);
+    await PendingMessageStorage.savePendingMessage(pendingMessage);
+    await MessageStorage.updateMessageStatus(message.id, MessageStatus.pending);
+    _updateMessageInState(message.id, MessageStatus.pending);
+    state = state.copyWith(isSending: false);
+    Logger.info(
+        'ChatNotifier: 📥 message ${message.messageId} queued as pending');
+  }
+
+  /// Update a single message's status in the current UI state.
+  void _updateMessageInState(String messageId, MessageStatus status) {
+    final updated = state.messages.map((m) {
+      if (m.id == messageId) return m.copyWith(status: status);
+      return m;
+    }).toList();
+    state = state.copyWith(messages: updated, isSending: false);
+  }
+
+  // ─────────────────────────────────────────────────────────────────
+  // Called by ConnectionProvider when a delivery ACK arrives
+  // ─────────────────────────────────────────────────────────────────
+
+  void updateMessageDeliveryStatus(String messageId, MessageStatus status) {
+    _updateMessageInState(messageId, status);
+    Logger.info(
+        'ChatNotifier: 📬 message $messageId status → ${status.name}');
+  }
+
+  // ─────────────────────────────────────────────────────────────────
+  // Receive
+  // ─────────────────────────────────────────────────────────────────
+
   void receiveMessage(String messageJson) {
     try {
       Logger.info('Received message JSON: $messageJson');
-      
-      // Parse the JSON string to extract the message data
+
       final jsonMap = _parseJsonString(messageJson);
-      
+
       MessageModel message;
-      
+
       if (jsonMap != null) {
-        // Parse from JSON
         message = MessageModel.fromJson(jsonMap);
-        
-        // Mark as received (not sent by this device)
-        // Keep the original receiverId (it's our MAC address when we receive)
         message = message.copyWith(
           isSent: false,
           status: MessageStatus.delivered,
         );
-        Logger.info('Parsed message from JSON: ${message.content} from ${message.senderId} to ${message.receiverId}');
+        Logger.info(
+            'Parsed message from JSON: ${message.content} '
+            'from ${message.senderId} to ${message.receiverId}');
       } else {
-        // Fallback: treat as plain text message
-        Logger.warning('Could not parse message JSON, treating as plain text: $messageJson');
+        Logger.warning(
+            'Could not parse message JSON, treating as plain text: $messageJson');
         message = MessageModel(
           id: const Uuid().v4(),
           content: messageJson,
-          senderId: _otherDeviceId, // Assume it's from the device we're chatting with
-          receiverId: _myDeviceId, // We're receiving it
+          senderId: _otherDeviceId,
+          receiverId: _myDeviceId,
           timestamp: DateTime.now(),
           status: MessageStatus.delivered,
           isSent: false,
         );
       }
 
-      // Check if message already exists (avoid duplicates)
+      // Deduplication
       final exists = state.messages.any((m) => m.id == message.id);
       if (exists) {
         Logger.debug('Message already exists, skipping: ${message.id}');
         return;
       }
 
-      // ── UUID-only conversation matching ────────────────────────────
-      //
-      // Identity rule: every device has exactly ONE identifier — its UUID.
-      // There are no MAC addresses, no role-based IDs.
-      //
-      // This provider is keyed on _otherDeviceId (UUID from BLE discovery or
-      // UUID resolved by the handshake in ConnectionManager).
-      //
-      // A message belongs to this conversation when:
-      //   • sender is the other device  (they sent it to us), OR
-      //   • receiver is the other device (we sent it to them)
-      //
-      // Because RoutingManager already filters on finalReceiverId == myUuid
-      // before emitting to ConnectionNotifier, and ConnectionNotifier routes
-      // to chatProvider(senderId), every message arriving here is already
-      // for this conversation.  The check below is a safety net.
-      final senderMatchesOtherDevice  = message.senderId  == _otherDeviceId ||
-                                         message.originalSenderId == _otherDeviceId;
-      final receiverMatchesOtherDevice = message.receiverId == _otherDeviceId ||
-                                         message.finalReceiverId == _otherDeviceId;
-      final isForThisConversation = senderMatchesOtherDevice || receiverMatchesOtherDevice;
+      // Conversation filter
+      final senderMatchesOtherDevice = message.senderId == _otherDeviceId ||
+          message.originalSenderId == _otherDeviceId;
+      final receiverMatchesOtherDevice =
+          message.receiverId == _otherDeviceId ||
+              message.finalReceiverId == _otherDeviceId;
+      final isForThisConversation =
+          senderMatchesOtherDevice || receiverMatchesOtherDevice;
 
       Logger.info(
           'ChatNotifier.receiveMessage: '
@@ -356,43 +260,34 @@ class ChatNotifier extends StateNotifier<ChatState> {
             'ChatNotifier: message not for this conversation — '
             'sender=${message.senderId}, receiver=${message.receiverId}, '
             'chatWith=$_otherDeviceId');
-        // Save to storage so it can be loaded by the correct chat later.
         MessageStorage.saveMessage(message);
         return;
       }
 
-      Logger.info('ChatNotifier: message accepted. Content: ${message.content}');
+      Logger.info(
+          'ChatNotifier: message accepted. Content: ${message.content}');
 
-      // Add to state
       final updatedMessages = [...state.messages, message];
-      // Sort by timestamp
       updatedMessages.sort((a, b) => a.timestamp.compareTo(b.timestamp));
-      
-      state = state.copyWith(
-        messages: updatedMessages,
-      );
 
-      // Save to local storage
+      state = state.copyWith(messages: updatedMessages);
       MessageStorage.saveMessage(message);
       Logger.info('Message received and saved: ${message.content}');
     } catch (e, stackTrace) {
       Logger.error('Error receiving message', e, stackTrace);
-      // Try to save as plain text message as fallback
       try {
         final fallbackMessage = MessageModel(
           id: const Uuid().v4(),
           content: messageJson,
-          senderId: _otherDeviceId, // Assume from device we're chatting with
-          receiverId: _myDeviceId, // We're receiving it
+          senderId: _otherDeviceId,
+          receiverId: _myDeviceId,
           timestamp: DateTime.now(),
           status: MessageStatus.delivered,
           isSent: false,
         );
         final updatedMessages = [...state.messages, fallbackMessage];
         updatedMessages.sort((a, b) => a.timestamp.compareTo(b.timestamp));
-        state = state.copyWith(
-          messages: updatedMessages,
-        );
+        state = state.copyWith(messages: updatedMessages);
         MessageStorage.saveMessage(fallbackMessage);
       } catch (e2) {
         Logger.error('Error saving fallback message', e2);
@@ -402,21 +297,14 @@ class ChatNotifier extends StateNotifier<ChatState> {
 
   Map<String, dynamic>? _parseJsonString(String jsonString) {
     try {
-      // Remove any leading/trailing whitespace
       final cleaned = jsonString.trim();
-      
-      // Handle case where JSON might be wrapped in quotes or have extra characters
       String jsonToParse = cleaned;
       if (cleaned.startsWith('"') && cleaned.endsWith('"')) {
-        // Remove surrounding quotes
         jsonToParse = cleaned.substring(1, cleaned.length - 1);
-        // Unescape JSON string
-        jsonToParse = jsonToParse.replaceAll('\\"', '"').replaceAll('\\n', '\n');
+        jsonToParse =
+            jsonToParse.replaceAll('\\"', '"').replaceAll('\\n', '\n');
       }
-      
-      // Parse JSON string to Map
-      final decoded = jsonDecode(jsonToParse) as Map<String, dynamic>;
-      return decoded;
+      return jsonDecode(jsonToParse) as Map<String, dynamic>;
     } catch (e) {
       Logger.error('Error parsing JSON string: $jsonString', e);
       return null;
@@ -425,13 +313,12 @@ class ChatNotifier extends StateNotifier<ChatState> {
 
   Future<void> loadMessagesForConversation(String otherDeviceId) async {
     try {
-      // Get messages where the other device is involved
-      // This includes messages we sent to them AND messages they sent to us
-      final messages = MessageStorage.getMessagesForConversation(_otherDeviceId);
-      // Sort messages by timestamp
+      final messages =
+          MessageStorage.getMessagesForConversation(_otherDeviceId);
       messages.sort((a, b) => a.timestamp.compareTo(b.timestamp));
       state = state.copyWith(messages: messages);
-      Logger.info('Loaded ${messages.length} messages for conversation with: $_otherDeviceId');
+      Logger.info(
+          'Loaded ${messages.length} messages for conversation with: $_otherDeviceId');
     } catch (e) {
       Logger.error('Error loading conversation messages', e);
       state = state.copyWith(error: 'Failed to load messages');
@@ -456,9 +343,10 @@ final currentDeviceIdProvider = Provider<String>((ref) {
 
 // Provider for ChatNotifier
 // The parameter is the device we're chatting with (otherDeviceId)
-final chatProvider = StateNotifierProvider.family<ChatNotifier, ChatState, String>((ref, otherDeviceId) {
+final chatProvider =
+    StateNotifierProvider.family<ChatNotifier, ChatState, String>(
+        (ref, otherDeviceId) {
   final connectionNotifier = ref.watch(connectionProvider.notifier);
   final myDeviceId = ref.watch(currentDeviceIdProvider);
   return ChatNotifier(connectionNotifier, ref, myDeviceId, otherDeviceId);
 });
-

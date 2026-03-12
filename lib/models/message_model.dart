@@ -25,7 +25,8 @@ class MessageModel extends HiveObject {
   @HiveField(6)
   final bool isSent;
 
-  // New routing fields for mesh networking
+  // ── Routing fields for mesh networking ────────────────────────────
+
   @HiveField(7)
   final String messageId; // Unique message identifier for deduplication
 
@@ -36,10 +37,14 @@ class MessageModel extends HiveObject {
   final String finalReceiverId; // Intended destination device
 
   @HiveField(10)
-  final int hopCount; // Number of hops taken
+  final int hopCount; // Number of hops taken (incremented at each relay)
 
   @HiveField(11)
-  final int maxHops; // Maximum hops allowed (TTL)
+  final int maxHops; // Maximum hops allowed (TTL — default: 5)
+
+  @HiveField(12)
+  final String? senderPeerId; // The immediate peer that sent/forwarded this message to us
+                               // Used to avoid echoing messages back to the sender
 
   MessageModel({
     required this.id,
@@ -49,12 +54,13 @@ class MessageModel extends HiveObject {
     required this.timestamp,
     this.status = MessageStatus.sending,
     required this.isSent,
-    // New routing fields with defaults
+    // Routing fields with defaults
     String? messageId,
     String? originalSenderId,
     String? finalReceiverId,
     this.hopCount = 0,
-    this.maxHops = 3,
+    this.maxHops = 5,
+    this.senderPeerId,
   })  : messageId = messageId ?? id,
         originalSenderId = originalSenderId ?? senderId,
         finalReceiverId = finalReceiverId ?? receiverId;
@@ -72,6 +78,7 @@ class MessageModel extends HiveObject {
     String? finalReceiverId,
     int? hopCount,
     int? maxHops,
+    String? senderPeerId,
   }) {
     return MessageModel(
       id: id ?? this.id,
@@ -86,6 +93,7 @@ class MessageModel extends HiveObject {
       finalReceiverId: finalReceiverId ?? this.finalReceiverId,
       hopCount: hopCount ?? this.hopCount,
       maxHops: maxHops ?? this.maxHops,
+      senderPeerId: senderPeerId ?? this.senderPeerId,
     );
   }
 
@@ -104,6 +112,7 @@ class MessageModel extends HiveObject {
       'finalReceiverId': finalReceiverId,
       'hopCount': hopCount,
       'maxHops': maxHops,
+      'senderPeerId': senderPeerId,
     };
   }
 
@@ -121,31 +130,42 @@ class MessageModel extends HiveObject {
       isSent: json['isSent'] as bool? ?? true,
       // Parse routing fields with fallbacks to legacy fields
       messageId: json['messageId'] as String? ?? json['id'] as String,
-      originalSenderId: json['originalSenderId'] as String? ?? json['senderId'] as String,
-      finalReceiverId: json['finalReceiverId'] as String? ?? json['receiverId'] as String,
+      originalSenderId:
+          json['originalSenderId'] as String? ?? json['senderId'] as String,
+      finalReceiverId:
+          json['finalReceiverId'] as String? ?? json['receiverId'] as String,
       hopCount: json['hopCount'] as int? ?? 0,
-      maxHops: json['maxHops'] as int? ?? 3,
+      maxHops: json['maxHops'] as int? ?? 5,
+      senderPeerId: json['senderPeerId'] as String?,
     );
   }
 
   @override
   String toString() {
-    return 'MessageModel(id: $id, messageId: $messageId, content: $content, senderId: $senderId, originalSenderId: $originalSenderId, receiverId: $receiverId, finalReceiverId: $finalReceiverId, timestamp: $timestamp, status: $status, isSent: $isSent, hopCount: $hopCount, maxHops: $maxHops)';
+    return 'MessageModel(messageId: $messageId, content: $content, '
+        'from: $originalSenderId → to: $finalReceiverId, '
+        'hop: $hopCount/$maxHops, status: ${status.name}, '
+        'isSent: $isSent)';
   }
 }
 
 @HiveType(typeId: 1)
 enum MessageStatus {
   @HiveField(0)
-  sending,
+  sending, // Being sent right now
+
   @HiveField(1)
-  sent,
+  sent, // Delivered to immediate connected peer
+
   @HiveField(2)
-  delivered,
+  delivered, // Confirmed received by the final destination (via ACK)
+
   @HiveField(3)
-  failed,
+  failed, // Send attempt failed
+
+  @HiveField(4)
+  pending, // Queued locally — peer offline, waiting for a relay connection
+
+  @HiveField(5)
+  relayed, // Forwarded to a relay node — en route to final destination
 }
-
-
-
-

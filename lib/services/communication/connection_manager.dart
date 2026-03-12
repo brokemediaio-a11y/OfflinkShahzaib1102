@@ -11,6 +11,8 @@ import '../../utils/logger.dart';
 import '../../utils/permissions_helper.dart';
 import '../storage/scan_log_storage.dart';
 import '../storage/device_storage.dart';
+import '../storage/pending_message_storage.dart';
+import '../storage/known_contacts_storage.dart';
 import '../routing/routing_manager.dart';
 import 'transport_manager.dart';
 import 'ble_discovery_service.dart';      // ← Control Plane (discovery only)
@@ -121,6 +123,7 @@ class ConnectionManager {
   StreamSubscription<WifiDirectConnectionState>? _wifiConnectionStateSubscription;
   StreamSubscription<String>? _wifiIncomingMessagesSubscription;
   StreamSubscription<Map<String, String>>? _wifiInvitationSubscription;
+  StreamSubscription<Map<String, dynamic>>? _deliveryAckSubscription;
 
   // ── Public getters ────────────────────────────────────────────────
   ConnectionType get currentConnectionType => _currentConnectionType;
@@ -142,11 +145,22 @@ class ConnectionManager {
       // ── Data Plane: Wi-Fi Direct ──────────────────────────────────
       final wifiInitialized = await _wifiDirectService.initialize();
 
-      // ── RoutingManager → message controller ──────────────────────
+      // ── RoutingManager: locally delivered messages ────────────────
       _routingManager.localMessages.listen((message) {
         Logger.info(
             'RoutingManager: locally delivered message for ${message.finalReceiverId}');
         _messageController.add(jsonEncode(message.toJson()));
+      });
+
+      // ── RoutingManager: delivery ACKs → send back to peer ─────────
+      _deliveryAckSubscription?.cancel();
+      _deliveryAckSubscription =
+          _routingManager.deliveryAcks.listen((ack) {
+        Logger.info(
+            'ConnectionManager: forwarding delivery ACK for '
+            'messageId=${ack['messageId']} back to peer');
+        final ackJson = jsonEncode(ack);
+        unawaited(_wifiDirectService.sendMessage(ackJson));
       });
 
       // ── Wi-Fi Direct: incoming messages ──────────────────────────
@@ -396,11 +410,23 @@ class ConnectionManager {
         Logger.info(
             'ConnectionManager: ✅ peer UUID resolved from handshake — '
             'peerId=$senderUuid, name=$peerName');
+
+        // Save as a known contact so they appear in the contacts list
+        unawaited(KnownContactsStorage.saveContact(
+          peerId: senderUuid,
+          displayName: peerName,
+        ));
+
+        // Flush any pending messages for this peer
+        unawaited(_syncPendingMessages(senderUuid));
       } else {
         // ── INITIATOR side: handshake reply confirms peer is ready ──
         Logger.info(
             'ConnectionManager: peer confirmed UUID handshake '
             '(our _connectedPeerId=${_connectedPeerId!})');
+
+        // Flush pending messages now that the socket is confirmed open
+        unawaited(_syncPendingMessages(_connectedPeerId!));
       }
     } catch (e) {
       Logger.error('ConnectionManager: error handling UUID handshake', e);
@@ -811,8 +837,17 @@ class ConnectionManager {
         return; // Do NOT route to RoutingManager or ChatNotifier
       }
 
+      // ── Delivery ACK — intercept before routing ────────────────────
+      if (jsonMap['__type'] == '__delivery_ack__') {
+        _handleDeliveryAck(jsonMap);
+        return;
+      }
+
       final messageModel = MessageModel.fromJson(jsonMap);
-      unawaited(_routingManager.routeMessage(messageModel));
+      unawaited(_routingManager.routeMessage(
+        messageModel,
+        senderPeerId: _connectedPeerId,
+      ));
     } catch (e, st) {
       Logger.error(
           'ConnectionManager: error handling incoming message', e, st);
@@ -1170,11 +1205,82 @@ class ConnectionManager {
     _wifiConnectionStateSubscription?.cancel();
     _wifiIncomingMessagesSubscription?.cancel();
     _wifiInvitationSubscription?.cancel();
+    _deliveryAckSubscription?.cancel();
     _connectionController.close();
     _messageController.close();
     _deviceStreamController.close();
     _invitationController.close();
     _transportManager.dispose();
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Delivery ACK handler
+  // ═══════════════════════════════════════════════════════════════════
+
+  /// Called when a `__delivery_ack__` packet arrives from the peer.
+  ///
+  /// Removes the confirmed message from the pending queue and emits
+  /// the ACK on [incomingMessages] so [ConnectionNotifier] can update
+  /// the message status in storage and the chat UI.
+  void _handleDeliveryAck(Map<String, dynamic> ack) {
+    try {
+      final messageId = ack['messageId'] as String?;
+      if (messageId == null) return;
+
+      Logger.info(
+          'ConnectionManager: 📬 received delivery ACK for messageId=$messageId');
+
+      // Remove from pending queue — delivery confirmed
+      unawaited(PendingMessageStorage.removePendingMessage(messageId));
+
+      // Emit as a special JSON string so ConnectionNotifier can update UI
+      _messageController.add(jsonEncode(ack));
+    } catch (e) {
+      Logger.error('ConnectionManager: error handling delivery ACK', e);
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Store-and-Forward: sync pending messages when a peer connects
+  // ═══════════════════════════════════════════════════════════════════
+
+  /// Flush pending messages to a newly connected peer.
+  ///
+  /// Sends all pending messages via Wi-Fi Direct.  RoutingManager on the
+  /// remote side will either deliver locally (if that device is the
+  /// final receiver) or relay further.
+  Future<void> _syncPendingMessages(String connectedPeerId) async {
+    final pending = PendingMessageStorage.getAllPendingMessages();
+    if (pending.isEmpty) {
+      Logger.info(
+          'ConnectionManager: no pending messages to sync for $connectedPeerId');
+      return;
+    }
+
+    Logger.info(
+        'ConnectionManager: syncing ${pending.length} pending message(s) '
+        'to newly connected peer $connectedPeerId');
+
+    int synced = 0;
+    for (final message in pending) {
+      try {
+        final messageJson = jsonEncode(message.toJson());
+        final sent = await _wifiDirectService.sendMessage(messageJson);
+        if (sent) {
+          synced++;
+          Logger.debug(
+              'ConnectionManager: synced pending message '
+              '${message.messageId} → $connectedPeerId');
+        }
+      } catch (e) {
+        Logger.error(
+            'ConnectionManager: error syncing message ${message.messageId}', e);
+      }
+    }
+
+    Logger.info(
+        'ConnectionManager: sync complete — $synced/${pending.length} '
+        'message(s) forwarded to $connectedPeerId');
   }
 
   // ── Storage helper (inline, avoids extra import) ───────────────────

@@ -25,96 +25,56 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   final ScrollController _scrollController = ScrollController();
   String? _currentDeviceId;
 
-  @override
-  void initState() {
-    super.initState();
-    // Messages are handled globally via ConnectionNotifier
-    // Messages will be loaded from storage when screen opens
-  }
+  // ── Connect ────────────────────────────────────────────────────────
 
   Future<void> _connectToDevice() async {
     final connectionNotifier = ref.read(connectionProvider.notifier);
     final deviceNotifier = ref.read(deviceProvider.notifier);
-    
-    // Show connecting indicator
-    if (mounted) {
-      setState(() {});
-    }
-    
-    // Start scanning for devices
+
+    if (mounted) setState(() {});
+
     await deviceNotifier.startScan();
     await Future.delayed(const Duration(seconds: 5));
-    
-    // Get discovered devices
+
     final discoveredDevices = ref.read(deviceProvider).discoveredDevices;
     Logger.info('Found ${discoveredDevices.length} devices during scan');
-    for (final d in discoveredDevices) {
-      Logger.info('Discovered device: id=${d.id}, address=${d.address}, name=${d.name}');
-    }
-    Logger.info('Looking for device: widget.device.id=${widget.device.id}, widget.device.address=${widget.device.address}, widget.device.name=${widget.device.name}');
-    
-    // Find the target device - improved matching logic
+
     DeviceModel? foundDevice;
-    
-    // First, try exact matches by UUID (primary identifier)
+
+    // Exact UUID match
     for (final d in discoveredDevices) {
       if (d.id == widget.device.id) {
         foundDevice = d;
-        Logger.info('Matched device by UUID: ${d.name} (UUID: ${d.id})');
         break;
       }
     }
-    
-    // Fallback: try matching by name if UUID match failed
+
+    // Fallback: name match
     if (foundDevice == null) {
       for (final d in discoveredDevices) {
         if (d.name == widget.device.name) {
           foundDevice = d;
-          Logger.info('Matched device by name: ${d.name} (UUID: ${d.id})');
           break;
         }
       }
     }
-    
-    // If no exact match, try matching by name (especially for "Offlink" devices)
-    // This is a fallback - UUID matching should be primary
+
+    // Fallback: single "Offlink" device
     if (foundDevice == null) {
-      for (final d in discoveredDevices) {
-        if (d.name.toLowerCase().contains('offlink') || 
-            widget.device.name.toLowerCase().contains('offlink')) {
-          // If both are Offlink devices, match by name
-          if (d.name == widget.device.name || 
-              widget.device.name.contains(d.name) ||
-              d.name.contains(widget.device.name)) {
-            foundDevice = d;
-            Logger.info('Matched device by name (Offlink): ${d.name} (UUID: ${d.id})');
-            break;
-          }
-        }
-      }
+      final offlink = discoveredDevices
+          .where((d) => d.name.toLowerCase().contains('offlink'))
+          .toList();
+      if (offlink.length == 1) foundDevice = offlink.first;
     }
-    
-    // If still no match and we have only one Offlink device, use it
-    if (foundDevice == null) {
-      final offlinkDevices = discoveredDevices.where((d) => 
-        d.name.toLowerCase().contains('offlink')
-      ).toList();
-      
-      if (offlinkDevices.length == 1) {
-        foundDevice = offlinkDevices.first;
-        Logger.info('Matched single Offlink device: ${foundDevice.name} (UUID: ${foundDevice.id})');
-      }
-    }
-    
+
     await deviceNotifier.stopScan();
-    
+
     if (foundDevice != null) {
       final connected = await connectionNotifier.connectToDevice(foundDevice);
       if (connected && mounted) {
-        // Update device info in chat provider
-        final chatNotifier = ref.read(chatProvider(widget.device.id).notifier);
+        final chatNotifier =
+            ref.read(chatProvider(widget.device.id).notifier);
         chatNotifier.setDeviceInfo(foundDevice);
-        
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text('Connected to ${foundDevice.name}'),
@@ -129,50 +89,42 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           ),
         );
       }
-    } else {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Device not found. Please ensure device is nearby and advertising.'),
-            backgroundColor: AppColors.error,
-          ),
-        );
-      }
+    } else if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+              'Device not found. Message will be queued for delivery.'),
+          backgroundColor: AppColors.primary,
+        ),
+      );
     }
   }
 
+  // ── Send ───────────────────────────────────────────────────────────
+
   Future<void> _sendMessage() async {
     if (_messageController.text.trim().isEmpty) return;
-    
-    // Check if connected
-    final connectionState = ref.read(connectionProvider);
-    if (connectionState.state != ConnectionStateType.connected) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Please connect to device first'),
-          backgroundColor: AppColors.error,
-        ),
-      );
-      return;
-    }
 
     final message = _messageController.text.trim();
     _messageController.clear();
 
     final chatNotifier = ref.read(chatProvider(widget.device.id).notifier);
-    // Set device info
     chatNotifier.setDeviceInfo(widget.device);
-    // Send message
-    await chatNotifier.sendMessage(message, widget.device.id, device: widget.device);
+
+    // Send (will queue as pending if offline)
+    await chatNotifier.sendMessage(message, widget.device.id,
+        device: widget.device);
 
     // Scroll to bottom
-    if (_scrollController.hasClients) {
-      _scrollController.animateTo(
-        _scrollController.position.maxScrollExtent,
-        duration: const Duration(milliseconds: 300),
-        curve: Curves.easeOut,
-      );
-    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scrollController.hasClients) {
+        _scrollController.animateTo(
+          _scrollController.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOut,
+        );
+      }
+    });
   }
 
   @override
@@ -187,20 +139,43 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     final chatState = ref.watch(chatProvider(widget.device.id));
     final connectionState = ref.watch(connectionProvider);
 
-    // Load messages for this conversation on first build
+    final isConnected =
+        connectionState.state == ConnectionStateType.connected;
+    final isConnecting =
+        connectionState.state == ConnectionStateType.connecting;
+
+    // Load messages on first open
     if (_currentDeviceId != widget.device.id) {
       _currentDeviceId = widget.device.id;
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        final chatNotifier = ref.read(chatProvider(widget.device.id).notifier);
-        // Set device info for auto-connection
+        final chatNotifier =
+            ref.read(chatProvider(widget.device.id).notifier);
         chatNotifier.setDeviceInfo(widget.device);
         chatNotifier.loadMessagesForConversation(widget.device.id);
       });
     }
 
-    // Get stored device name or use device name from widget
-    final storedName = DeviceStorage.getDeviceDisplayName(widget.device.id);
-    final displayName = storedName ?? (widget.device.name != 'Unknown Device' && widget.device.name != widget.device.id ? widget.device.name : widget.device.id);
+    final storedName =
+        DeviceStorage.getDeviceDisplayName(widget.device.id);
+    final displayName = storedName ??
+        (widget.device.name != 'Unknown Device' &&
+                widget.device.name != widget.device.id
+            ? widget.device.name
+            : widget.device.id);
+
+    // Connection status label
+    String statusLabel;
+    Color statusColor;
+    if (isConnected) {
+      statusLabel = AppStrings.connected;
+      statusColor = Colors.green;
+    } else if (isConnecting) {
+      statusLabel = 'Connecting…';
+      statusColor = Colors.orange;
+    } else {
+      statusLabel = 'Offline — messages queued';
+      statusColor = AppColors.textSecondary;
+    }
 
     return Scaffold(
       appBar: AppBar(
@@ -208,181 +183,177 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(displayName),
-            Text(
-              connectionState.state == ConnectionStateType.connected
-                  ? AppStrings.connected
-                  : AppStrings.disconnected,
-              style: const TextStyle(fontSize: 12),
+            Row(
+              children: [
+                Container(
+                  width: 7,
+                  height: 7,
+                  margin: const EdgeInsets.only(right: 4),
+                  decoration: BoxDecoration(
+                    color: statusColor,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+                Text(statusLabel, style: const TextStyle(fontSize: 12)),
+              ],
             ),
           ],
         ),
         backgroundColor: AppColors.primary,
         foregroundColor: AppColors.textLight,
+        actions: [
+          if (!isConnected && !isConnecting)
+            IconButton(
+              icon: const Icon(Icons.bluetooth_searching),
+              tooltip: 'Connect',
+              onPressed: _connectToDevice,
+            ),
+        ],
       ),
       body: Column(
         children: [
-          // Messages List
+          // ── Offline banner ────────────────────────────────────────
+          if (!isConnected && !isConnecting)
+            Container(
+              width: double.infinity,
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              color: Colors.amber.shade100,
+              child: Row(
+                children: [
+                  Icon(Icons.info_outline,
+                      size: 16, color: Colors.amber.shade800),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'Offline — messages will be queued and sent when in range.',
+                      style: TextStyle(
+                          fontSize: 12, color: Colors.amber.shade900),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+
+          // ── Message list ──────────────────────────────────────────
           Expanded(
-            child: chatState.messages.isEmpty && connectionState.state != ConnectionStateType.connected
+            child: chatState.messages.isEmpty
                 ? Center(
                     child: Column(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
                         Icon(
-                          Icons.bluetooth_disabled,
+                          Icons.chat_bubble_outline,
                           size: 64,
                           color: AppColors.textSecondary.withOpacity(0.5),
                         ),
                         const SizedBox(height: 16),
                         Text(
-                          'Not Connected',
+                          AppStrings.noMessages,
                           style: TextStyle(
-                            fontSize: 18,
-                            fontWeight: FontWeight.bold,
-                            color: AppColors.textPrimary,
-                          ),
-                        ),
-                        const SizedBox(height: 8),
-                        Text(
-                          'Connect to ${widget.device.name} to send messages',
-                          style: TextStyle(
-                            fontSize: 14,
+                            fontSize: 16,
                             color: AppColors.textSecondary,
                           ),
-                          textAlign: TextAlign.center,
                         ),
-                        const SizedBox(height: 24),
-                        ElevatedButton.icon(
-                          onPressed: connectionState.state == ConnectionStateType.connecting
-                              ? null
-                              : _connectToDevice,
-                          icon: connectionState.state == ConnectionStateType.connecting
-                              ? const SizedBox(
-                                  width: 16,
-                                  height: 16,
-                                  child: CircularProgressIndicator(strokeWidth: 2),
-                                )
-                              : const Icon(Icons.bluetooth),
-                          label: Text(
-                            connectionState.state == ConnectionStateType.connecting
-                                ? 'Connecting...'
-                                : 'Connect to Device',
-                          ),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: AppColors.primary,
-                            foregroundColor: AppColors.textLight,
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 24,
-                              vertical: 12,
+                        if (!isConnected) ...[
+                          const SizedBox(height: 8),
+                          Text(
+                            'Send a message — it will be delivered when\nthe peer comes into range.',
+                            style: TextStyle(
+                              fontSize: 13,
+                              color: AppColors.textSecondary.withOpacity(0.7),
                             ),
+                            textAlign: TextAlign.center,
                           ),
-                        ),
+                        ],
                       ],
                     ),
                   )
-                : chatState.messages.isEmpty
-                    ? Center(
-                        child: Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            Icon(
-                              Icons.chat_bubble_outline,
-                              size: 64,
-                              color: AppColors.textSecondary.withOpacity(0.5),
-                            ),
-                            const SizedBox(height: 16),
-                            Text(
-                              AppStrings.noMessages,
-                              style: TextStyle(
-                                fontSize: 16,
-                                color: AppColors.textSecondary,
-                              ),
-                            ),
-                          ],
-                        ),
-                      )
-                    : ListView.builder(
-                        controller: _scrollController,
-                        padding: const EdgeInsets.all(AppConstants.defaultPadding),
-                        itemCount: chatState.messages.length,
-                        itemBuilder: (context, index) {
-                          final message = chatState.messages[index];
-                          return _MessageBubble(message: message);
-                        },
-                      ),
+                : ListView.builder(
+                    controller: _scrollController,
+                    padding: const EdgeInsets.all(AppConstants.defaultPadding),
+                    itemCount: chatState.messages.length,
+                    itemBuilder: (context, index) {
+                      final message = chatState.messages[index];
+                      return _MessageBubble(message: message);
+                    },
+                  ),
           ),
-          // Message Input - Only show if connected
-          if (connectionState.state == ConnectionStateType.connected)
-            Container(
-              padding: const EdgeInsets.all(AppConstants.defaultPadding),
-              decoration: BoxDecoration(
-                color: AppColors.surface,
-                boxShadow: [
-                  BoxShadow(
-                    color: AppColors.textSecondary.withOpacity(0.1),
-                    blurRadius: 4,
-                    offset: const Offset(0, -2),
+
+          // ── Message input (always visible) ────────────────────────
+          Container(
+            padding: const EdgeInsets.all(AppConstants.defaultPadding),
+            decoration: BoxDecoration(
+              color: AppColors.surface,
+              boxShadow: [
+                BoxShadow(
+                  color: AppColors.textSecondary.withOpacity(0.1),
+                  blurRadius: 4,
+                  offset: const Offset(0, -2),
+                ),
+              ],
+            ),
+            child: SafeArea(
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _messageController,
+                      decoration: InputDecoration(
+                        hintText: isConnected
+                            ? AppStrings.typeMessage
+                            : 'Type a message (will queue if offline)…',
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(
+                              AppConstants.defaultBorderRadius),
+                          borderSide: BorderSide.none,
+                        ),
+                        filled: true,
+                        fillColor: AppColors.background,
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 12,
+                        ),
+                      ),
+                      maxLines: null,
+                      textCapitalization: TextCapitalization.sentences,
+                      onSubmitted: (_) => _sendMessage(),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Container(
+                    decoration: BoxDecoration(
+                      color: AppColors.primary,
+                      shape: BoxShape.circle,
+                    ),
+                    child: IconButton(
+                      onPressed: chatState.isSending ? null : _sendMessage,
+                      icon: chatState.isSending
+                          ? const SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                valueColor: AlwaysStoppedAnimation<Color>(
+                                    AppColors.textLight),
+                              ),
+                            )
+                          : const Icon(Icons.send, color: AppColors.textLight),
+                    ),
                   ),
                 ],
               ),
-              child: SafeArea(
-                child: Row(
-                        children: [
-                          Expanded(
-                            child: TextField(
-                              controller: _messageController,
-                              decoration: InputDecoration(
-                                hintText: AppStrings.typeMessage,
-                                border: OutlineInputBorder(
-                                  borderRadius:
-                                      BorderRadius.circular(AppConstants.defaultBorderRadius),
-                                  borderSide: BorderSide.none,
-                                ),
-                                filled: true,
-                                fillColor: AppColors.background,
-                                contentPadding: const EdgeInsets.symmetric(
-                                  horizontal: 16,
-                                  vertical: 12,
-                                ),
-                              ),
-                              maxLines: null,
-                              textCapitalization: TextCapitalization.sentences,
-                              onSubmitted: (_) => _sendMessage(),
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          Container(
-                            decoration: BoxDecoration(
-                              color: AppColors.primary,
-                              shape: BoxShape.circle,
-                            ),
-                            child: IconButton(
-                              onPressed: chatState.isSending ? null : _sendMessage,
-                              icon: chatState.isSending
-                                  ? const SizedBox(
-                                      width: 20,
-                                      height: 20,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2,
-                                        valueColor:
-                                            AlwaysStoppedAnimation<Color>(AppColors.textLight),
-                                      ),
-                                    )
-                                  : const Icon(
-                                      Icons.send,
-                                      color: AppColors.textLight,
-                                    ),
-                            ),
-                          ),
-                        ],
-                      ),
-              ),
             ),
+          ),
         ],
       ),
     );
   }
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// Message Bubble
+// ══════════════════════════════════════════════════════════════════════
 
 class _MessageBubble extends StatelessWidget {
   final MessageModel message;
@@ -397,13 +368,14 @@ class _MessageBubble extends StatelessWidget {
       alignment: isSent ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
         margin: const EdgeInsets.only(bottom: 8),
-        constraints: BoxConstraints(
-          maxWidth: MediaQuery.of(context).size.width * 0.75,
-        ),
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        constraints:
+            BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.75),
+        padding:
+            const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
         decoration: BoxDecoration(
           color: isSent ? AppColors.messageSent : AppColors.messageReceived,
-          borderRadius: BorderRadius.circular(AppConstants.defaultBorderRadius),
+          borderRadius:
+              BorderRadius.circular(AppConstants.defaultBorderRadius),
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -430,8 +402,10 @@ class _MessageBubble extends StatelessWidget {
                         : AppColors.messageTextReceived.withOpacity(0.7),
                   ),
                 ),
-                const SizedBox(width: 4),
-                if (isSent) _MessageStatusIcon(message.status),
+                if (isSent) ...[
+                  const SizedBox(width: 4),
+                  _MessageStatusIcon(message.status),
+                ],
               ],
             ),
           ],
@@ -441,38 +415,57 @@ class _MessageBubble extends StatelessWidget {
   }
 
   String _formatTime(DateTime timestamp) {
-    final hour = timestamp.hour.toString().padLeft(2, '0');
-    final minute = timestamp.minute.toString().padLeft(2, '0');
-    return '$hour:$minute';
+    final h = timestamp.hour.toString().padLeft(2, '0');
+    final m = timestamp.minute.toString().padLeft(2, '0');
+    return '$h:$m';
   }
 
   Widget _MessageStatusIcon(MessageStatus status) {
     IconData icon;
     Color color;
+    String? tooltip;
 
     switch (status) {
       case MessageStatus.sending:
         icon = Icons.access_time;
         color = AppColors.messageTextSent.withOpacity(0.7);
+        tooltip = 'Sending…';
         break;
+
+      case MessageStatus.pending:
+        icon = Icons.schedule_send;
+        color = Colors.orange.shade300;
+        tooltip = 'Pending — will send when in range';
+        break;
+
       case MessageStatus.sent:
         icon = Icons.check;
         color = AppColors.messageTextSent.withOpacity(0.7);
+        tooltip = 'Sent';
         break;
+
+      case MessageStatus.relayed:
+        icon = Icons.sync_alt;
+        color = Colors.blue.shade300;
+        tooltip = 'Relayed via mesh';
+        break;
+
       case MessageStatus.delivered:
         icon = Icons.done_all;
-        color = AppColors.messageTextSent.withOpacity(0.7);
+        color = Colors.blue.shade400;
+        tooltip = 'Delivered';
         break;
+
       case MessageStatus.failed:
         icon = Icons.error_outline;
         color = AppColors.error;
+        tooltip = 'Failed';
         break;
     }
 
-    return Icon(icon, size: 12, color: color);
+    return Tooltip(
+      message: tooltip ?? '',
+      child: Icon(icon, size: 12, color: color),
+    );
   }
 }
-
-
-
-

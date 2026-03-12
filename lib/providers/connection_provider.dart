@@ -8,6 +8,7 @@ import 'chat_provider.dart';
 import '../models/message_model.dart';
 import '../services/storage/message_storage.dart';
 import '../services/storage/device_storage.dart';
+import '../services/storage/pending_message_storage.dart';
 import 'dart:convert';
 
 class ConnectionProviderState {
@@ -115,6 +116,12 @@ class ConnectionNotifier extends StateNotifier<ConnectionProviderState> {
         return;
       }
 
+      // ── Delivery ACK — intercept before parsing as MessageModel ────
+      if (jsonMap['__type'] == '__delivery_ack__') {
+        _handleDeliveryAck(jsonMap);
+        return;
+      }
+
       var message = MessageModel.fromJson(jsonMap);
       message = message.copyWith(
         isSent: false,
@@ -176,6 +183,53 @@ class ConnectionNotifier extends StateNotifier<ConnectionProviderState> {
           'content="${message.content}"');
     } catch (e, stackTrace) {
       Logger.error('ConnectionProvider: error in global message handler', e, stackTrace);
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Delivery ACK handler
+  // ═══════════════════════════════════════════════════════════════════
+
+  /// Called when a `__delivery_ack__` arrives from the peer.
+  ///
+  /// - Removes the message from the pending queue
+  /// - Updates message status in [MessageStorage] to `delivered`
+  /// - Notifies the open [chatProvider] (if any) to update the bubble icon
+  void _handleDeliveryAck(Map<String, dynamic> ack) {
+    try {
+      final messageId = ack['messageId'] as String?;
+      // `ackSenderId` is the UUID of the peer that confirmed receipt
+      final ackSenderId = ack['ackSenderId'] as String?;
+
+      if (messageId == null) {
+        Logger.warning('ConnectionProvider: delivery ACK missing messageId');
+        return;
+      }
+
+      Logger.info(
+          'ConnectionProvider: 📬 delivery ACK — messageId=$messageId, '
+          'ackSenderId=$ackSenderId');
+
+      // Remove from pending queue
+      unawaited(PendingMessageStorage.removePendingMessage(messageId));
+
+      // Update status in persistent storage
+      unawaited(
+          MessageStorage.updateMessageStatus(messageId, MessageStatus.delivered));
+
+      // Update UI in the open chat screen (keyed by the recipient's UUID)
+      if (ackSenderId != null) {
+        try {
+          final chatNotifier = _ref.read(chatProvider(ackSenderId).notifier);
+          chatNotifier.updateMessageDeliveryStatus(
+              messageId, MessageStatus.delivered);
+        } catch (_) {
+          // Chat screen for this peer is not open — status already
+          // persisted in storage and will load correctly when opened.
+        }
+      }
+    } catch (e, st) {
+      Logger.error('ConnectionProvider: error handling delivery ACK', e, st);
     }
   }
 

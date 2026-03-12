@@ -27,15 +27,16 @@ class MessageModelAdapter extends TypeAdapter<MessageModel> {
       messageId: fields[7] as String?,
       originalSenderId: fields[8] as String?,
       finalReceiverId: fields[9] as String?,
-      hopCount: fields[10] as int,
-      maxHops: fields[11] as int,
+      hopCount: fields[10] as int? ?? 0,
+      maxHops: fields[11] as int? ?? 5,
+      senderPeerId: fields[12] as String?,
     );
   }
 
   @override
   void write(BinaryWriter writer, MessageModel obj) {
     writer
-      ..writeByte(12)
+      ..writeByte(13)
       ..writeByte(0)
       ..write(obj.id)
       ..writeByte(1)
@@ -59,7 +60,9 @@ class MessageModelAdapter extends TypeAdapter<MessageModel> {
       ..writeByte(10)
       ..write(obj.hopCount)
       ..writeByte(11)
-      ..write(obj.maxHops);
+      ..write(obj.maxHops)
+      ..writeByte(12)
+      ..write(obj.senderPeerId);
   }
 
   @override
@@ -88,6 +91,10 @@ class MessageStatusAdapter extends TypeAdapter<MessageStatus> {
         return MessageStatus.delivered;
       case 3:
         return MessageStatus.failed;
+      case 4:
+        return MessageStatus.pending;
+      case 5:
+        return MessageStatus.relayed;
       default:
         return MessageStatus.sending;
     }
@@ -107,6 +114,12 @@ class MessageStatusAdapter extends TypeAdapter<MessageStatus> {
         break;
       case MessageStatus.failed:
         writer.writeByte(3);
+        break;
+      case MessageStatus.pending:
+        writer.writeByte(4);
+        break;
+      case MessageStatus.relayed:
+        writer.writeByte(5);
         break;
     }
   }

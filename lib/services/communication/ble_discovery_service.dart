@@ -5,6 +5,7 @@ import '../../core/constants.dart';
 import '../../utils/logger.dart';
 import '../storage/scan_log_storage.dart';
 import '../storage/device_storage.dart';
+import '../storage/known_contacts_storage.dart';
 
 /// BleDiscoveryService — Control Plane (Discovery Only)
 ///
@@ -340,6 +341,15 @@ class BleDiscoveryService {
 
       _discoveredDevices[deviceUuid] = device;
       _deviceController.add(_discoveredDevices.values.toList());
+
+      // ── Persist to Known Contacts database ───────────────────────
+      // Every discovered peer is saved so users can send messages
+      // even when the peer goes out of range (store-and-forward).
+      unawaited(KnownContactsStorage.saveContact(
+        peerId: deviceUuid,
+        displayName: displayName,
+        deviceAddress: macAddress,
+      ));
 
       Logger.info(
           'BleDiscoveryService: discovered peer "$displayName" '
