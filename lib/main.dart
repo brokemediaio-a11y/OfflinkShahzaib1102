@@ -42,30 +42,37 @@ void main() async {
   await KnownContactsStorage.init();
   await PendingMessageStorage.init();
 
-  // ── MIGRATION: clear old messages incompatible with new schema ────
+  // ── MIGRATION: one-time clear of pre-routing messages ────────────
   // The MessageModel gained routing fields (messageId, hopCount, etc.)
-  // Old Hive boxes may contain objects with missing fields → clear once.
-  try {
-    final messageBox = await Hive.openBox<MessageModel>('messages');
-    if (messageBox.isNotEmpty) {
-      Logger.info(
-          'MIGRATION: Clearing ${messageBox.length} old messages '
-          'for multi-hop architecture update');
-      await messageBox.clear();
-      Logger.info('MIGRATION: Message storage cleared successfully');
-    }
+  // Old Hive boxes may contain objects with missing fields.
+  // Guard with a flag so this only runs once per install.
+  const _migrationKey = 'routing_v1';
+  if (!DeviceStorage.getMigrationFlag(_migrationKey)) {
+    try {
+      final messageBox = await Hive.openBox<MessageModel>('messages');
+      if (messageBox.isNotEmpty) {
+        Logger.info(
+            'MIGRATION: Clearing ${messageBox.length} old messages '
+            'for multi-hop architecture update');
+        await messageBox.clear();
+        Logger.info('MIGRATION: Message storage cleared successfully');
+      }
 
-    final conversationBox =
-        await Hive.openBox<ConversationModel>('conversations');
-    if (conversationBox.isNotEmpty) {
-      Logger.info(
-          'MIGRATION: Clearing ${conversationBox.length} old conversations');
-      await conversationBox.clear();
-      Logger.info('MIGRATION: Conversations cleared successfully');
+      final conversationBox =
+          await Hive.openBox<ConversationModel>('conversations');
+      if (conversationBox.isNotEmpty) {
+        Logger.info(
+            'MIGRATION: Clearing ${conversationBox.length} old conversations');
+        await conversationBox.clear();
+        Logger.info('MIGRATION: Conversations cleared successfully');
+      }
+
+      await DeviceStorage.setMigrationFlag(_migrationKey);
+      Logger.info('MIGRATION: Flag set — will not run again');
+    } catch (e) {
+      Logger.error('MIGRATION: Error clearing storage', e);
+      // Continue anyway — app will work with empty storage
     }
-  } catch (e) {
-    Logger.error('MIGRATION: Error clearing storage', e);
-    // Continue anyway — app will work with empty storage
   }
 
   runApp(

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /c/NewOffLink/.claude/worktrees/festive-colden/ios -type f -name *.swift -o -name *.m -o -name *.h)",
+      "Bash(find /c/NewOffLink/.claude/worktrees/festive-colden/android -type f -name *.kt -o -name *.java)",
+      "Bash(grep -r \"8080\\\\|5000\\\\|8000\\\\|9000\\\\|localhost\\\\|0.0.0.0\" /c/NewOffLink/.claude/worktrees/festive-colden/android --include=*.kt --include=*.java --include=*.gradle)"
+    ]
+  }
+}

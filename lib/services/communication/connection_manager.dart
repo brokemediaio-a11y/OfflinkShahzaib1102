@@ -50,6 +50,11 @@ enum ConnectionState {
   connecting,
   connected,
   error,
+  /// The connection was lost unexpectedly (e.g. moved out of range).
+  /// The manager is automatically retrying until the peer comes back in range.
+  /// Cleared automatically when the socket re-opens, or if the user taps
+  /// a different device (which cancels the backoff loop).
+  reconnecting,
 }
 
 class ConnectionManager {
@@ -87,6 +92,27 @@ class ConnectionManager {
   /// DeviceModel cached after a successful Wi-Fi Direct negotiation.
   DeviceModel? _connectedDevice;
 
+  // ── Auto-reconnect state ──────────────────────────────────────────
+  /// Last device we had a full SOCKET_CONNECTED session with.
+  /// Preserved across unexpected disconnects; cleared only on user-initiated
+  /// [disconnect] or when [connectToDevice] is called for a different peer.
+  DeviceModel? _lastConnectedDevice;
+
+  /// Set to [true] just before a user-initiated [disconnect].
+  /// Tells [_handleWifiDirectState] NOT to trigger auto-reconnect.
+  bool _userInitiatedDisconnect = false;
+
+  /// Exponential-backoff timer driving auto-reconnect attempts.
+  Timer? _reconnectTimer;
+
+  /// Number of consecutive auto-reconnect attempts (reset to 0 on success).
+  int _reconnectAttempt = 0;
+
+  /// [true] while the manager is trying to restore a lost connection.
+  bool get isReconnecting =>
+      _reconnectTimer != null ||
+      (_lastConnectedDevice != null && _reconnectAttempt > 0);
+
   // ── Streams (exposed to UI / providers) ──────────────────────────
   final _connectionController =
       StreamController<ConnectionState>.broadcast();
@@ -107,6 +133,9 @@ class ConnectionManager {
   // ── Device caches ─────────────────────────────────────────────────
   List<DeviceModel> _bleDevices = const [];
   final Map<String, DeviceModel> _nativeScanDevices = {};
+  /// Peers discovered by Wi-Fi Direct background DNS-SD service browser.
+  /// Keyed by UUID; populated independently of BLE, extending range to ~200 m.
+  final Map<String, DeviceModel> _wifiDirectDiscoveredDevices = {};
 
   // ── Flags ─────────────────────────────────────────────────────────
   bool _peripheralInitialized = false;
@@ -124,6 +153,7 @@ class ConnectionManager {
   StreamSubscription<String>? _wifiIncomingMessagesSubscription;
   StreamSubscription<Map<String, String>>? _wifiInvitationSubscription;
   StreamSubscription<Map<String, dynamic>>? _deliveryAckSubscription;
+  StreamSubscription<List<Map<String, dynamic>>>? _wifiDirectServicesSubscription;
 
   // ── Public getters ────────────────────────────────────────────────
   ConnectionType get currentConnectionType => _currentConnectionType;
@@ -188,6 +218,46 @@ class ConnectionManager {
         Logger.info(
             'ConnectionManager: incoming invitation from ${payload["deviceName"]}');
         _invitationController.add(payload);
+      });
+
+      // ── Wi-Fi Direct: background DNS-SD discovered services ───────
+      // Peers found at Wi-Fi Direct range (~200 m), independent of BLE.
+      // We surface any entry that has a known display name (from DeviceStorage
+      // or from the DNS-SD TXT record) so the UI shows them alongside BLE peers.
+      _wifiDirectServicesSubscription?.cancel();
+      _wifiDirectServicesSubscription =
+          _wifiDirectService.discoveredServices.listen((services) {
+        bool changed = false;
+        for (final svc in services) {
+          final uuid = svc['uuid'] as String?;
+          if (uuid == null || uuid.isEmpty) continue;
+          // Skip ourselves
+          if (uuid == DeviceStorage.getDeviceId()) continue;
+
+          // Resolve display name: TXT record name → stored name → skip
+          final txtName = svc['name'] as String?;
+          final storedName = DeviceStorage.getDeviceDisplayName(uuid);
+          final displayName = (storedName?.isNotEmpty == true)
+              ? storedName!
+              : (txtName?.isNotEmpty == true ? txtName! : null);
+
+          if (displayName == null) continue; // no usable name yet
+
+          // Store the name for future sessions if we got it from DNS-SD
+          if (storedName == null && txtName != null && txtName.isNotEmpty) {
+            unawaited(DeviceStorage.setDeviceDisplayName(uuid, txtName));
+          }
+
+          final device = DeviceModel(
+            id: uuid,
+            name: displayName,
+            type: DeviceType.wifiDirect,
+            isConnected: false,
+          );
+          _wifiDirectDiscoveredDevices[uuid] = device;
+          changed = true;
+        }
+        if (changed) _emitDiscoveredDevices();
       });
 
       // ── Device-specific scan mode detection ──────────────────────
@@ -258,6 +328,9 @@ class ConnectionManager {
 
           _connectedDevice = device;
           _currentConnectionType = ConnectionType.wifiDirect;
+          // Successful session — save for auto-reconnect and reset counter.
+          _lastConnectedDevice = device;
+          _cancelReconnect();
           _connectionController.add(ConnectionState.connected);
 
           Logger.info(
@@ -325,15 +398,26 @@ class ConnectionManager {
           _connectedDevice = null;
           _connectedPeerId = null;
 
-          // Emit error vs. clean disconnect so the UI can show the right message
-          if (state.error != null) {
-            _connectionController.add(ConnectionState.error);
-          } else {
+          if (_userInitiatedDisconnect) {
+            // ── User tapped Disconnect — no auto-reconnect ──────────────
+            _userInitiatedDisconnect = false;
             _connectionController.add(ConnectionState.disconnected);
+          } else if (_lastConnectedDevice != null) {
+            // ── Unexpected drop (range / signal) — auto-reconnect ────────
+            Logger.info(
+                'ConnectionManager: unexpected disconnect from '
+                '"${_lastConnectedDevice!.name}" — '
+                'entering auto-reconnect (attempt ${_reconnectAttempt + 1})…');
+            _connectionController.add(ConnectionState.reconnecting);
+            _scheduleReconnect();
+          } else {
+            // ── Never had a full session (initial connect failed) ─────────
+            if (state.error != null) {
+              _connectionController.add(ConnectionState.error);
+            } else {
+              _connectionController.add(ConnectionState.disconnected);
+            }
           }
-
-          // BLE continues scanning in background — no action needed here.
-          // User can reconnect by tapping the device again in the UI.
         }
       }
     } catch (e, st) {
@@ -345,18 +429,20 @@ class ConnectionManager {
   // UUID Handshake — mutual UUID exchange over the socket
   // ═══════════════════════════════════════════════════════════════════
 
-  /// Sends our UUID to the peer immediately after the socket opens.
-  /// Both sides do this so neither needs to know the other's UUID in advance.
+  /// Sends our UUID and display name to the peer immediately after the socket opens.
+  /// Both sides do this so neither needs to know the other's UUID or name in advance.
   void _sendUuidHandshake() {
     try {
       final myUuid = DeviceStorage.getDeviceId();
+      final myName = DeviceStorage.getDisplayName() ?? '';
       final handshake = jsonEncode({
         '__type': '__uuid_handshake__',
         'senderUuid': myUuid,
+        'senderName': myName,
       });
       // Use the service directly — transport map may still be placeholder.
       _wifiDirectService.sendMessage(handshake);
-      Logger.info('ConnectionManager: 🤝 sent UUID handshake (myUuid=$myUuid)');
+      Logger.info('ConnectionManager: 🤝 sent UUID handshake (myUuid=$myUuid, myName=$myName)');
     } catch (e) {
       Logger.error('ConnectionManager: failed to send UUID handshake', e);
     }
@@ -383,9 +469,18 @@ class ConnectionManager {
         // Remove placeholder neighbor
         _transportManager.removeNeighbor(oldId);
 
-        // Look up a stored name for this peer (if they were seen via BLE before)
-        final peerName =
-            DeviceStorage.getDeviceDisplayName(senderUuid) ?? 'Offlink Peer';
+        // Prefer the name sent in the handshake; fall back to stored BLE name.
+        final handshakeName = (handshake['senderName'] as String?)?.trim();
+        final peerName = (handshakeName != null && handshakeName.isNotEmpty)
+            ? handshakeName
+            : (DeviceStorage.getDeviceDisplayName(senderUuid) ?? 'Offlink Peer');
+
+        // Persist so future lookups (after reconnect) also use the correct name,
+        // and refresh the in-memory discovery cache so the home screen updates.
+        if (handshakeName != null && handshakeName.isNotEmpty) {
+          unawaited(DeviceStorage.setDeviceDisplayName(senderUuid, handshakeName));
+          _refreshDeviceNameInCache(senderUuid, handshakeName);
+        }
 
         final lastState = _wifiDirectService.lastKnownState;
         final role = lastState.isGroupOwner
@@ -410,6 +505,9 @@ class ConnectionManager {
 
         _connectedDevice = device;
         _currentConnectionType = ConnectionType.wifiDirect;
+        // Successful session (receiver side) — save for auto-reconnect.
+        _lastConnectedDevice = device;
+        _cancelReconnect();
         _connectionController.add(ConnectionState.connected);
 
         Logger.info(
@@ -426,6 +524,19 @@ class ConnectionManager {
         unawaited(_syncPendingMessages(senderUuid));
       } else {
         // ── INITIATOR side: handshake reply confirms peer is ready ──
+        // Also update the peer's name if the handshake carries a better one.
+        const _handshakePlaceholders = {'', 'Offlink Peer', 'Connecting…'};
+        final handshakeName = (handshake['senderName'] as String?)?.trim();
+        if (handshakeName != null && handshakeName.isNotEmpty) {
+          unawaited(DeviceStorage.setDeviceDisplayName(_connectedPeerId!, handshakeName));
+          _refreshDeviceNameInCache(_connectedPeerId!, handshakeName);
+          if (_connectedDevice != null &&
+              _handshakePlaceholders.contains(_connectedDevice!.name)) {
+            _connectedDevice = _connectedDevice!.copyWith(name: handshakeName);
+            _lastConnectedDevice = _connectedDevice;
+          }
+        }
+
         Logger.info(
             'ConnectionManager: peer confirmed UUID handshake '
             '(our _connectedPeerId=${_connectedPeerId!})');
@@ -645,6 +756,21 @@ class ConnectionManager {
   /// the data-plane connection is always Wi-Fi Direct.
   Future<bool> connectToDevice(DeviceModel device) async {
     try {
+      // ── Guard: already connected to the same peer ─────────────────
+      // This can happen when the native layer reconnects passively BEFORE
+      // the Dart-side reconnect timer or the chat-screen "Reconnect" button
+      // fires connectToDevice.  If we let it proceed, line 778 would emit
+      // ConnectionState.connecting; Kotlin would return "already connected"
+      // without generating a new connection event, leaving the UI stuck at
+      // "connecting" indefinitely.
+      if (isConnected() && _connectedPeerId == device.id) {
+        Logger.info(
+            'ConnectionManager: already connected to "${device.name}" '
+            '— skipping connectToDevice, re-asserting connected state');
+        _connectionController.add(ConnectionState.connected);
+        return true;
+      }
+
       // Stop BLE scan to free radio resources (Wi-Fi Direct also needs them)
       Logger.info(
           'ConnectionManager: stopping BLE scan before Wi-Fi Direct connect');
@@ -653,6 +779,15 @@ class ConnectionManager {
         await Future.delayed(const Duration(milliseconds: 500));
       } catch (e) {
         Logger.warning('Error stopping scan before connect: $e');
+      }
+
+      // If connecting to a different device, cancel any pending auto-reconnect.
+      if (_lastConnectedDevice != null && _lastConnectedDevice!.id != device.id) {
+        Logger.info(
+            'ConnectionManager: connecting to new device "${device.name}" — '
+            'cancelling auto-reconnect for "${_lastConnectedDevice!.name}"');
+        _lastConnectedDevice = null;
+        _cancelReconnect();
       }
 
       _connectionController.add(ConnectionState.connecting);
@@ -731,6 +866,12 @@ class ConnectionManager {
   /// Disconnect from the current Wi-Fi Direct peer.
   Future<void> disconnect() async {
     try {
+      // Mark as user-initiated BEFORE calling the native layer so that the
+      // resulting CONNECTION_CHANGED broadcast doesn't trigger auto-reconnect.
+      _userInitiatedDisconnect = true;
+      _lastConnectedDevice = null;
+      _cancelReconnect();
+
       await _wifiDirectService.disconnect();
 
       if (_connectedPeerId != null) {
@@ -749,6 +890,78 @@ class ConnectionManager {
     } catch (e) {
       Logger.error('ConnectionManager: error disconnecting', e);
     }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Auto-reconnect
+  // ═══════════════════════════════════════════════════════════════════
+
+  /// Schedule the next reconnect attempt using exponential back-off.
+  /// Delays: 5s → 10s → 15s … capped at 60s per attempt.
+  ///
+  /// UUID tiebreaker: when both peers lose the connection simultaneously, both
+  /// schedule a reconnect. If both fire `connect()` at the same time, Android's
+  /// Wi-Fi Direct group-owner negotiation deadlocks (5× CONNECTING timeouts).
+  /// To break the symmetry, the device whose UUID is lexicographically SMALLER
+  /// than the peer's UUID waits an extra 8 s. This consistently makes the
+  /// "larger UUID" device initiate, and the "smaller UUID" device receives the
+  /// incoming invitation passively — avoiding the collision.
+  void _scheduleReconnect() {
+    // Guard: prevent duplicate timers.  removeGroupAfterError() in Kotlin causes
+    // a second CONNECTION_CHANGED disconnect event which calls _scheduleReconnect
+    // again.  If a timer is already pending, the second call is a no-op.
+    if (_reconnectTimer != null) {
+      Logger.info(
+          'ConnectionManager: reconnect already scheduled — ignoring duplicate trigger');
+      return;
+    }
+    _reconnectAttempt++;
+    final baseDelay = (_reconnectAttempt * 5).clamp(5, 60);
+    final myUuid   = DeviceStorage.getDeviceId();
+    final peerUuid = _lastConnectedDevice?.id ?? '';
+    // If we are the "smaller" peer, wait longer so the "larger" peer always
+    // initiates first. The extra delay must exceed the Kotlin CONNECTING timeout
+    // (15 s) to allow the first-initiator's attempt to either succeed or fail
+    // cleanly before we start our own attempt.
+    final extraDelay = (peerUuid.isNotEmpty && myUuid.compareTo(peerUuid) < 0) ? 16 : 0;
+    final delaySeconds = baseDelay + extraDelay;
+    Logger.info(
+        'ConnectionManager: auto-reconnect #$_reconnectAttempt '
+        'scheduled in ${delaySeconds}s (base=$baseDelay extra=$extraDelay) '
+        '→ "${_lastConnectedDevice?.name}"');
+    _reconnectTimer = Timer(Duration(seconds: delaySeconds), () async {
+      _reconnectTimer = null;
+      final target = _lastConnectedDevice;
+      if (target == null) return; // user disconnected or switched peer
+
+      // The native layer may have already passively reconnected while we were
+      // waiting (e.g. the peer invited us before the timer fired).  In that
+      // case, abort the active-reconnect attempt and just reset the counter.
+      if (isConnected()) {
+        Logger.info(
+            'ConnectionManager: auto-reconnect #$_reconnectAttempt timer fired '
+            'but native layer already reconnected — resetting counter');
+        _reconnectAttempt = 0;
+        return;
+      }
+
+      Logger.info(
+          'ConnectionManager: auto-reconnect #$_reconnectAttempt '
+          '— dialling "${target.name}"…');
+      final success = await connectToDevice(target);
+      // connectToDevice emits connecting/connected states itself.
+      // If it fails synchronously the state handler will retry via _scheduleReconnect.
+      if (!success && _lastConnectedDevice != null) {
+        _scheduleReconnect();
+      }
+    });
+  }
+
+  /// Cancel any pending reconnect timer and reset the attempt counter.
+  void _cancelReconnect() {
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _reconnectAttempt = 0;
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -933,25 +1146,39 @@ class ConnectionManager {
           ? DeviceType.classicBluetooth
           : DeviceType.ble;
 
+      const _nativeScanPlaceholders = {
+        'Unknown Device', 'Unknown', 'Offlink Peer', 'Connecting…'
+      };
+
       final storedName =
           DeviceStorage.getDeviceDisplayName(finalDeviceId);
-      String displayName = storedName ?? deviceName;
 
-      if (deviceUuid != null &&
-          finalDeviceId == deviceUuid &&
-          deviceName.isNotEmpty &&
-          deviceName != 'Unknown Device' &&
-          deviceName != 'Unknown' &&
+      // A "fresh" name is one from the BLE advertisement that is neither a
+      // placeholder nor the raw device/MAC identifier.
+      final hasFreshName = deviceName.isNotEmpty &&
+          !_nativeScanPlaceholders.contains(deviceName) &&
           deviceName != finalDeviceId &&
-          deviceName != macAddress &&
-          !finalDeviceId.contains(':') &&
-          storedName == null) {
-        unawaited(
-            DeviceStorage.setDeviceDisplayName(finalDeviceId, deviceName));
+          deviceName != macAddress;
+
+      String displayName;
+      if (hasFreshName) {
         displayName = deviceName;
-        Logger.info(
-            'Storing discovered device name from native scan: '
-            '$finalDeviceId → $deviceName');
+        // Persist if the stored name is absent or is a stale placeholder.
+        if (deviceUuid != null &&
+            finalDeviceId == deviceUuid &&
+            !finalDeviceId.contains(':') &&
+            (storedName == null || _nativeScanPlaceholders.contains(storedName))) {
+          unawaited(
+              DeviceStorage.setDeviceDisplayName(finalDeviceId, deviceName));
+          Logger.info(
+              'Native scan: storing/updating device name '
+              '$finalDeviceId → $deviceName');
+        }
+      } else if (storedName != null &&
+          !_nativeScanPlaceholders.contains(storedName)) {
+        displayName = storedName;
+      } else {
+        displayName = deviceName.isNotEmpty ? deviceName : 'Unknown Device';
       }
 
       final device = DeviceModel(
@@ -1043,6 +1270,11 @@ class ConnectionManager {
       final started = await _blePeripheralService.startAdvertising(
         deviceName: deviceName as String?,
       );
+      // Embed our username in the Wi-Fi Direct DNS-SD TXT record so peers
+      // can display our name when discovered at Wi-Fi Direct range (~200 m).
+      if (deviceName is String && deviceName.isNotEmpty) {
+        unawaited(_wifiDirectService.setOwnUsername(deviceName));
+      }
       _isAdvertising = started;
       if (!started) {
         Logger.warning('Failed to start BLE advertising');
@@ -1087,14 +1319,49 @@ class ConnectionManager {
 
   void _emitDiscoveredDevices() {
     final Map<String, DeviceModel> combined = {};
+    // Wi-Fi Direct background DNS-SD discoveries (lowest priority — no RSSI)
+    for (final d in _wifiDirectDiscoveredDevices.values) {
+      combined[d.id] = d;
+    }
+    // BLE discoveries override (have RSSI, fresher signal info)
     for (final d in _bleDevices) {
       combined[d.id] = d;
     }
-    // Native-scan devices take priority (fresher RSSI / more metadata)
+    // Native-scan devices take highest priority (freshest RSSI / most metadata)
     for (final d in _nativeScanDevices.values) {
       combined[d.id] = d;
     }
     _deviceStreamController.add(combined.values.toList());
+  }
+
+  /// Update the cached name for [uuid] across all in-memory device maps and
+  /// re-emit the device list so the home screen reflects the correct name
+  /// immediately (e.g. right after a UUID handshake resolves the peer name).
+  void _refreshDeviceNameInCache(String uuid, String name) {
+    if (name.isEmpty) return;
+    bool changed = false;
+
+    final nativeEntry = _nativeScanDevices[uuid];
+    if (nativeEntry != null && nativeEntry.name != name) {
+      _nativeScanDevices[uuid] = nativeEntry.copyWith(name: name);
+      changed = true;
+    }
+
+    final wdEntry = _wifiDirectDiscoveredDevices[uuid];
+    if (wdEntry != null && wdEntry.name != name) {
+      _wifiDirectDiscoveredDevices[uuid] = wdEntry.copyWith(name: name);
+      changed = true;
+    }
+
+    final bleIdx = _bleDevices.indexWhere((d) => d.id == uuid);
+    if (bleIdx >= 0 && _bleDevices[bleIdx].name != name) {
+      final updated = List<DeviceModel>.from(_bleDevices);
+      updated[bleIdx] = _bleDevices[bleIdx].copyWith(name: name);
+      _bleDevices = updated;
+      changed = true;
+    }
+
+    if (changed) _emitDiscoveredDevices();
   }
 
   // ═══════════════════════════════════════════════════════════════════

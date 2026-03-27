@@ -8,6 +8,7 @@ import '../../models/device_model.dart';
 import '../../providers/device_provider.dart';
 import '../../providers/connection_provider.dart';
 import '../../services/communication/connection_manager.dart';
+import '../../utils/logger.dart';
 import '../chat/chat_screen.dart';
 import '../connection/connection_status_screen.dart';
 import '../messages/messages_screen.dart';
@@ -53,6 +54,17 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   /// Called when another device sends us a Wi-Fi Direct connection invitation.
   Future<void> _onIncomingInvitation(Map<String, String> payload) async {
     if (!mounted || _invitationDialogOpen) return;
+
+    // If we are in auto-reconnect mode the invitation is almost certainly from
+    // the peer we just lost contact with.  Accept silently — no dialog needed.
+    final notifier = ref.read(connectionProvider.notifier);
+    if (notifier.isReconnecting) {
+      Logger.info(
+          'HomeScreen: auto-accepting reconnect invitation from '
+          '${payload["deviceName"]}');
+      await notifier.acceptInvitation();
+      return;
+    }
 
     final callerName = payload['deviceName'] ?? 'Unknown Device';
     _invitationDialogOpen = true;
@@ -132,7 +144,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     _invitationDialogOpen = false;
     if (!mounted) return;
 
-    final notifier = ref.read(connectionProvider.notifier);
     if (accepted == true) {
       await notifier.acceptInvitation();
       // Chat screen will open automatically when SOCKET_CONNECTED fires via

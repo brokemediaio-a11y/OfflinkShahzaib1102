@@ -94,6 +94,14 @@ class ConnectionNotifier extends StateNotifier<ConnectionProviderState> {
               error: 'Connection error occurred',
             );
             break;
+          case ConnectionState.reconnecting:
+            // Show the same spinner as "connecting" — the user sees the app
+            // trying to restore the session without any extra prompt.
+            state = state.copyWith(
+              state: ConnectionStateType.connecting,
+              error: null,
+            );
+            break;
         }
       },
     );
@@ -322,6 +330,9 @@ class ConnectionNotifier extends StateNotifier<ConnectionProviderState> {
   bool isConnected() {
     return _connectionManager.isConnected();
   }
+
+  /// [true] while the manager is trying to restore a lost connection.
+  bool get isReconnecting => _connectionManager.isReconnecting;
 
   /// Accept the pending incoming Wi-Fi Direct invitation.
   Future<void> acceptInvitation() =>

@@ -31,6 +31,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     final connectionNotifier = ref.read(connectionProvider.notifier);
     final deviceNotifier = ref.read(deviceProvider.notifier);
 
+    // If already connected to this peer, don't disrupt the session with a
+    // redundant BLE scan + connectToDevice call.
+    final connectionState = ref.read(connectionProvider);
+    if (connectionState.state == ConnectionStateType.connected &&
+        connectionState.connectedDevice?.id == widget.device.id) {
+      Logger.info('ChatScreen: already connected to ${widget.device.name} — skipping reconnect');
+      return;
+    }
+
     if (mounted) setState(() {});
 
     await deviceNotifier.startScan();

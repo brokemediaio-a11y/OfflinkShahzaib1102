@@ -87,6 +87,8 @@ class WifiDirectService {
       EventChannel('com.offlink.wifi_direct/peers');
   static const _invitationEventChannel =
       EventChannel('com.offlink.wifi_direct/invitation');
+  static const _discoveredServicesEventChannel =
+      EventChannel('com.offlink.wifi_direct/discovered_services');
 
   // ── Dart-side streams ─────────────────────────────────────────────
   final _messageController =
@@ -97,11 +99,14 @@ class WifiDirectService {
       StreamController<List<WifiDirectPeer>>.broadcast();
   final _invitationController =
       StreamController<Map<String, String>>.broadcast();
+  final _discoveredServicesController =
+      StreamController<List<Map<String, dynamic>>>.broadcast();
 
   StreamSubscription? _messageSubscription;
   StreamSubscription? _connectionStateSubscription;
   StreamSubscription? _peersSubscription;
   StreamSubscription? _invitationSubscription;
+  StreamSubscription? _discoveredServicesSubscription;
 
   bool _initialized = false;
 
@@ -125,6 +130,12 @@ class WifiDirectService {
   /// Flutter must respond by calling [acceptInvitation] or [rejectInvitation].
   Stream<Map<String, String>> get incomingInvitations =>
       _invitationController.stream;
+
+  /// Stream of OffLink peers discovered via background Wi-Fi Direct DNS-SD
+  /// service browsing (~200 m range), independent of BLE discovery (~50 m).
+  /// Each list entry: { "uuid": String, "name": String?, "address": String }
+  Stream<List<Map<String, dynamic>>> get discoveredServices =>
+      _discoveredServicesController.stream;
 
   // ═════════════════════════════════════════════════════════════════
   // Initialization
@@ -237,6 +248,35 @@ class WifiDirectService {
       onError: (e) =>
           Logger.error('WifiDirectService: invitation stream error', e),
     );
+
+    // ── Background DNS-SD discovered services ─────────────────────
+    _discoveredServicesSubscription?.cancel();
+    _discoveredServicesSubscription =
+        _discoveredServicesEventChannel.receiveBroadcastStream().listen(
+      (event) {
+        if (event is List) {
+          final services = event
+              .whereType<Map>()
+              .map((m) => Map<String, dynamic>.from(m))
+              .toList();
+          Logger.info(
+              'WifiDirectService: ${services.length} peer(s) found via Wi-Fi Direct DNS-SD');
+          _discoveredServicesController.add(services);
+        }
+      },
+      onError: (e) =>
+          Logger.error('WifiDirectService: discovered services stream error', e),
+    );
+  }
+
+  /// Embed our display name in the Wi-Fi Direct DNS-SD TXT record so remote
+  /// devices can show our username even without a prior BLE discovery.
+  Future<void> setOwnUsername(String name) async {
+    try {
+      await _methodChannel.invokeMethod('setOwnUsername', {'name': name});
+    } catch (e) {
+      Logger.error('WifiDirectService: setOwnUsername error', e);
+    }
   }
 
   // ═════════════════════════════════════════════════════════════════

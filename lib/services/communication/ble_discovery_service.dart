@@ -301,7 +301,8 @@ class BleDiscoveryService {
       // device name.  "Unknown Device" / "Unknown" are never used as the final
       // display name — they're treated as absent.
       bool _isUnknown(String? s) =>
-          s == null || s.isEmpty || s == 'Unknown Device' || s == 'Unknown';
+          s == null || s.isEmpty || s == 'Unknown Device' || s == 'Unknown' ||
+          s == 'Offlink Peer';
 
       String displayName;
       if (!_isUnknown(extractedUsername)) {

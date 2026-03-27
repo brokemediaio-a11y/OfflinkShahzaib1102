@@ -30,6 +30,7 @@ class MainActivity : FlutterActivity() {
     private val wifiDirectConnectionStateChannelName = "com.offlink.wifi_direct/connection_state"
     private val wifiDirectPeersChannelName = "com.offlink.wifi_direct/peers"
     private val wifiDirectInvitationChannelName = "com.offlink.wifi_direct/invitation"
+    private val wifiDirectDiscoveredServicesChannelName = "com.offlink.wifi_direct/discovered_services"
 
     private val blePeripheralManager by lazy { BlePeripheralManager(applicationContext) }
     private val classicBluetoothManager by lazy { ClassicBluetoothManager(applicationContext) }
@@ -45,6 +46,7 @@ class MainActivity : FlutterActivity() {
     private var wifiDirectConnectionStateSink: EventChannel.EventSink? = null
     private var wifiDirectPeersSink: EventChannel.EventSink? = null
     private var wifiDirectInvitationSink: EventChannel.EventSink? = null
+    private var wifiDirectDiscoveredServicesSink: EventChannel.EventSink? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -414,6 +416,14 @@ class MainActivity : FlutterActivity() {
                         result.success(null)
                     }
 
+                    "setOwnUsername" -> {
+                        val name = call.argument<String>("name")
+                        if (!name.isNullOrBlank()) {
+                            wifiDirectManager.setOwnUsername(name)
+                        }
+                        result.success(null)
+                    }
+
                     else -> result.notImplemented()
                 }
             }
@@ -485,6 +495,26 @@ class MainActivity : FlutterActivity() {
             override fun onCancel(arguments: Any?) {
                 wifiDirectInvitationSink = null
                 wifiDirectManager.incomingInvitationListener = null
+            }
+        })
+
+        // Wi-Fi Direct Discovered Services Event Channel
+        // Fires when background DNS-SD service browser finds OffLink peers via
+        // Wi-Fi Direct (~200 m range), independent of BLE discovery (~50 m).
+        // Each event is a List of Maps: [{ "uuid": String, "name": String?, "address": String }]
+        EventChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            wifiDirectDiscoveredServicesChannelName
+        ).setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(arguments: Any?, events: EventChannel.EventSink) {
+                wifiDirectDiscoveredServicesSink = events
+                wifiDirectManager.discoveredServicesListener = { services ->
+                    mainHandler.post { wifiDirectDiscoveredServicesSink?.success(services) }
+                }
+            }
+            override fun onCancel(arguments: Any?) {
+                wifiDirectDiscoveredServicesSink = null
+                wifiDirectManager.discoveredServicesListener = null
             }
         })
     }

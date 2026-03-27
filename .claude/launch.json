@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "Flutter Run (debug)",
+      "runtimeExecutable": "flutter",
+      "runtimeArgs": ["run"],
+      "port": 8080
+    },
+    {
+      "name": "Flutter Run (release)",
+      "runtimeExecutable": "flutter",
+      "runtimeArgs": ["run", "--release"],
+      "port": 8080
+    }
+  ]
+}

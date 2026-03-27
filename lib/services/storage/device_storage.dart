@@ -195,6 +195,26 @@ class DeviceStorage {
     }
   }
 
+  // ── One-time migration flags ──────────────────────────────────────
+
+  /// Returns [true] if the named migration has already been applied.
+  static bool getMigrationFlag(String key) {
+    try {
+      return _deviceBox?.get('_migration_$key', defaultValue: false) as bool? ?? false;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /// Marks the named migration as applied so it never runs again.
+  static Future<void> setMigrationFlag(String key) async {
+    try {
+      await _deviceBox?.put('_migration_$key', true);
+    } catch (e) {
+      Logger.error('Error setting migration flag "$key"', e);
+    }
+  }
+
   /// @deprecated Use UUID as the sole device identity.
   @Deprecated('Do not use MAC addresses for routing or conversation keying')
   static Future<void> removeMacMapping(String uuid) async {
