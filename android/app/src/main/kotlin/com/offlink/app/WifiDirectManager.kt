@@ -111,7 +111,8 @@ class WifiDirectManager(private val context: Context) {
 
     // Discovery retry state
     private val discoveryRetryCount = AtomicInteger(0)
-    private val maxDiscoveryRetries = 4
+    /** BUSY recovery may need several stop+rediscover cycles on congested stacks. */
+    private val maxDiscoveryRetries = 6
 
     // Safety timeout: reset if we stay CONNECTING with no response for 15 s
     private var connectingTimeoutRunnable: Runnable? = null
@@ -127,6 +128,12 @@ class WifiDirectManager(private val context: Context) {
     // from 60 s) doubles beaconing frequency, improving discoverability at range.
     private val passiveDiscoveryIntervalMs = 30_000L
     private var passiveDiscoveryRunnable: Runnable? = null
+
+    /** Single coalesced "no peers yet" rediscovery — avoids stacked 4 s timers from PEERS_CHANGED spam. */
+    private var pendingRediscoverRunnable: Runnable? = null
+
+    /** At most one deferred discoverPeers while P2P is still DISABLED (init race on some Samsung builds). */
+    private var deferredP2pDiscoverRunnable: Runnable? = null
 
     // ─── Background DNS-SD Service Browser ────────────────────────────────────
     // Periodically queries _offlink._tcp services over Wi-Fi Direct so nearby
@@ -292,8 +299,30 @@ class WifiDirectManager(private val context: Context) {
     @SuppressLint("MissingPermission")
     fun discoverPeers(): Map<String, Any> {
         if (!initialized) return mapOf("success" to false, "error" to "Not initialized")
-        val mgr = wifiP2pManager ?: return mapOf("success" to false, "error" to "Manager null")
-        val ch  = p2pChannel   ?: return mapOf("success" to false, "error" to "Channel null")
+        wifiP2pManager ?: return mapOf("success" to false, "error" to "Manager null")
+        p2pChannel ?: return mapOf("success" to false, "error" to "Channel null")
+
+        if (!isP2pEnabled.get()) {
+            Log.w(tag, "discoverPeers deferred — Wi-Fi P2P not enabled yet")
+            deferredP2pDiscoverRunnable?.let { mainHandler.removeCallbacks(it) }
+            deferredP2pDiscoverRunnable = Runnable {
+                deferredP2pDiscoverRunnable = null
+                discoverPeers()
+            }
+            mainHandler.postDelayed(deferredP2pDiscoverRunnable!!, 1500)
+            return mapOf("success" to true, "deferred" to true)
+        }
+
+        // Always stop any in-flight scan first — prevents BUSY when passive + connect +
+        // background DNS-SD overlap (Samsung logs).
+        stopPeerDiscoveryThenRun(300L) { discoverPeersCore() }
+        return mapOf("success" to true)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun discoverPeersCore() {
+        val mgr = wifiP2pManager ?: return
+        val ch = p2pChannel ?: return
 
         val attempt = discoveryRetryCount.get() + 1
         Log.d(tag, "Starting Wi-Fi Direct peer discovery… (attempt $attempt/$maxDiscoveryRetries)")
@@ -335,7 +364,7 @@ class WifiDirectManager(private val context: Context) {
                     reason == WifiP2pManager.BUSY &&
                     discoveryRetryCount.incrementAndGet() <= maxDiscoveryRetries -> {
                         val delayMs = 1500L * discoveryRetryCount.get()
-                        Log.d(tag, "Peer discovery BUSY — retrying in ${delayMs}ms " +
+                        Log.d(tag, "Peer discovery BUSY — retry in ${delayMs}ms " +
                               "(attempt ${discoveryRetryCount.get()}/$maxDiscoveryRetries)")
                         mainHandler.postDelayed({ discoverPeers() }, delayMs)
                     }
@@ -351,7 +380,6 @@ class WifiDirectManager(private val context: Context) {
                 }
             }
         })
-        return mapOf("success" to true)
     }
 
     /**
@@ -398,7 +426,7 @@ class WifiDirectManager(private val context: Context) {
             }
         }
 
-        // Peers not yet discovered — start discovery; auto-connect fires in broadcast receiver
+        // Peers not yet discovered — discoverPeers() stops any stale scan first.
         Log.d(tag, "No matching peer in cache — starting peer discovery…")
         discoverPeers()
         return mapOf("success" to true, "waiting" to true)
@@ -733,30 +761,32 @@ class WifiDirectManager(private val context: Context) {
         }
 
         // ── Step 2: DNS-SD service discovery ────────────────────────────────
-        // Use the unified DNS-SD listener which handles both background peer
-        // caching and active-connect UUID matching in a single registration.
-        setupUnifiedDnsSdListeners()
+        // Stop any in-flight peer scan first — otherwise addServiceRequest /
+        // discoverServices often returns BUSY (Samsung A52 logs).
+        stopPeerDiscoveryThenRun(350L) {
+            setupUnifiedDnsSdListeners()
 
-        val request = WifiP2pDnsSdServiceRequest.newInstance()
-        mgr.addServiceRequest(ch, request, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() {
-                Log.d(tag, "DNS-SD service request added — starting service discovery")
-                mgr.discoverServices(ch, object : WifiP2pManager.ActionListener {
-                    override fun onSuccess() {
-                        Log.d(tag, "DNS-SD service discovery started for UUID=$targetUuid")
-                        scheduleServiceDiscoveryTimeout(fallbackName)
-                    }
-                    override fun onFailure(reason: Int) {
-                        Log.w(tag, "discoverServices failed (${failureReason(reason)}) — falling back to name-based")
-                        fallbackToNameBased(fallbackName)
-                    }
-                })
-            }
-            override fun onFailure(reason: Int) {
-                Log.w(tag, "addServiceRequest failed (${failureReason(reason)}) — falling back to name-based")
-                fallbackToNameBased(fallbackName)
-            }
-        })
+            val request = WifiP2pDnsSdServiceRequest.newInstance()
+            mgr.addServiceRequest(ch, request, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {
+                    Log.d(tag, "DNS-SD service request added — starting service discovery")
+                    mgr.discoverServices(ch, object : WifiP2pManager.ActionListener {
+                        override fun onSuccess() {
+                            Log.d(tag, "DNS-SD service discovery started for UUID=$targetUuid")
+                            scheduleServiceDiscoveryTimeout(fallbackName)
+                        }
+                        override fun onFailure(reason: Int) {
+                            Log.w(tag, "discoverServices failed (${failureReason(reason)}) — falling back to name-based")
+                            fallbackToNameBased(fallbackName)
+                        }
+                    })
+                }
+                override fun onFailure(reason: Int) {
+                    Log.w(tag, "addServiceRequest failed (${failureReason(reason)}) — falling back to name-based")
+                    fallbackToNameBased(fallbackName)
+                }
+            })
+        }
     }
 
     private fun scheduleServiceDiscoveryTimeout(fallbackName: String) {
@@ -845,10 +875,18 @@ class WifiDirectManager(private val context: Context) {
         val mgr = wifiP2pManager ?: return
         val ch  = p2pChannel   ?: return
         val phase = connectionPhase.get()
-        // Don't interfere with an active connection
+        // Don't interfere with an active connection or hard-failure recovery
         if (phase == ConnectionPhase.CONNECTING || phase == ConnectionPhase.GROUP_FORMED ||
             phase == ConnectionPhase.SOCKET_CONNECTING || phase == ConnectionPhase.SOCKET_CONNECTED) {
             Log.d(tag, "Background DNS-SD skipped — connection in progress (phase=$phase)")
+            return
+        }
+        if (phase == ConnectionPhase.FAILED) {
+            Log.d(tag, "Background DNS-SD skipped — phase=FAILED (avoid P2P BUSY contention)")
+            return
+        }
+        if (phase == ConnectionPhase.DISCOVERING) {
+            Log.d(tag, "Background DNS-SD skipped — peer discovery in progress (avoid BUSY)")
             return
         }
         Log.d(tag, "Background DNS-SD service discovery starting…")
@@ -1119,6 +1157,44 @@ class WifiDirectManager(private val context: Context) {
         })
     }
 
+    /**
+     * Stops an in-flight peer scan, then runs [block] on the main thread after a short
+     * delay.  Use this before starting a new [discoverPeers] / DNS-SD sequence when
+     * the framework returns [WifiP2pManager.BUSY] — overlapping discoverPeers +
+     * discoverServices + passive heartbeats will wedge Samsung and other stacks until
+     * the previous operation is explicitly stopped.
+     */
+    @SuppressLint("MissingPermission")
+    private fun stopPeerDiscoveryThenRun(delayMs: Long = 350L, block: () -> Unit) {
+        val mgr = wifiP2pManager
+        val ch  = p2pChannel
+        if (mgr == null || ch == null) {
+            mainHandler.postDelayed(block, delayMs)
+            return
+        }
+        mgr.stopPeerDiscovery(ch, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                Log.d(tag, "stopPeerDiscovery (preflight) OK — next step in ${delayMs}ms")
+                mainHandler.postDelayed(block, delayMs)
+            }
+            override fun onFailure(reason: Int) {
+                Log.w(tag, "stopPeerDiscovery preflight failed (${failureReason(reason)}) — running next step anyway")
+                mainHandler.postDelayed(block, delayMs + 200L)
+            }
+        })
+    }
+
+    /** Replaces stacked [mainHandler.postDelayed] { discoverPeers } from repeated PEERS_CHANGED. */
+    private fun scheduleCoalescedRediscover(delayMs: Long, reason: String) {
+        pendingRediscoverRunnable?.let { mainHandler.removeCallbacks(it) }
+        pendingRediscoverRunnable = Runnable {
+            pendingRediscoverRunnable = null
+            Log.d(tag, "Coalesced rediscovery ($reason) — discoverPeers()")
+            discoverPeers()
+        }
+        mainHandler.postDelayed(pendingRediscoverRunnable!!, delayMs)
+    }
+
     fun disconnect() {
         Log.d(tag, "Disconnecting Wi-Fi Direct…")
         // Mark disconnected immediately so in-flight callbacks don't trigger reconnect
@@ -1153,6 +1229,10 @@ class WifiDirectManager(private val context: Context) {
         cancelPassiveDiscovery()
         cancelBackgroundServiceDiscovery()
         cancelInvitationTimeout()
+        pendingRediscoverRunnable?.let { mainHandler.removeCallbacks(it) }
+        pendingRediscoverRunnable = null
+        deferredP2pDiscoverRunnable?.let { mainHandler.removeCallbacks(it) }
+        deferredP2pDiscoverRunnable = null
         pendingInvitedPeer = null
         disconnect()
         unregisterReceiver()
@@ -1333,7 +1413,10 @@ class WifiDirectManager(private val context: Context) {
         cancelPassiveDiscovery()
         passiveDiscoveryRunnable = Runnable {
             val phase = connectionPhase.get()
+            // Do NOT run passive discovery in FAILED — it fights user-initiated reconnect
+            // and keeps the framework BUSY (discoverPeers + DNS-SD pile-up).
             if (initialized &&
+                phase != ConnectionPhase.FAILED &&
                 phase != ConnectionPhase.CONNECTING &&
                 phase != ConnectionPhase.GROUP_FORMED &&
                 phase != ConnectionPhase.SOCKET_CONNECTING &&
@@ -1368,6 +1451,10 @@ class WifiDirectManager(private val context: Context) {
         // Clear any pending consent request so a stale invitation doesn't linger.
         cancelInvitationTimeout()
         pendingInvitedPeer = null
+        pendingRediscoverRunnable?.let { mainHandler.removeCallbacks(it) }
+        pendingRediscoverRunnable = null
+        deferredP2pDiscoverRunnable?.let { mainHandler.removeCallbacks(it) }
+        deferredP2pDiscoverRunnable = null
         connectionPhase.set(ConnectionPhase.DISCONNECTED)
         isGroupOwner.set(false)
         groupOwnerAddress = null
@@ -1546,10 +1633,18 @@ class WifiDirectManager(private val context: Context) {
             when (intent.action) {
 
                 WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION -> {
+                    val wasEnabled = isP2pEnabled.get()
                     val state = intent.getIntExtra(WifiP2pManager.EXTRA_WIFI_STATE, -1)
-                    isP2pEnabled.set(state == WifiP2pManager.WIFI_P2P_STATE_ENABLED)
-                    Log.d(tag, "Wi-Fi P2P state: ${if (isP2pEnabled.get()) "ENABLED" else "DISABLED"}")
-                    if (!isP2pEnabled.get()) {
+                    val nowEnabled = state == WifiP2pManager.WIFI_P2P_STATE_ENABLED
+                    isP2pEnabled.set(nowEnabled)
+                    Log.d(tag, "Wi-Fi P2P state: ${if (nowEnabled) "ENABLED" else "DISABLED"}")
+                    if (!wasEnabled && nowEnabled && initialized) {
+                        deferredP2pDiscoverRunnable?.let { mainHandler.removeCallbacks(it) }
+                        deferredP2pDiscoverRunnable = null
+                        Log.d(tag, "Wi-Fi P2P became available — scheduling peer discovery")
+                        mainHandler.postDelayed({ discoverPeers() }, 600)
+                    }
+                    if (!nowEnabled) {
                         // Wi-Fi Direct was turned off — full reset
                         Log.w(tag, "Wi-Fi Direct DISABLED — resetting state machine")
                         closeSocket()
@@ -1665,8 +1760,8 @@ class WifiDirectManager(private val context: Context) {
             phase0 != ConnectionPhase.CONNECTING &&
             phase0 != ConnectionPhase.SOCKET_CONNECTING &&
             phase0 != ConnectionPhase.GROUP_FORMED) {
-            Log.d(tag, "No peers found — scheduling rediscovery in 4 s…")
-            mainHandler.postDelayed({ discoverPeers() }, 4000)
+            Log.d(tag, "No peers found — scheduling coalesced rediscovery in 4 s…")
+            scheduleCoalescedRediscover(4000, "empty peer list")
         }
 
         // Notify Dart
@@ -1740,7 +1835,7 @@ class WifiDirectManager(private val context: Context) {
                 // Named peer not yet visible — schedule a rediscovery and wait.
                 Log.w(tag, "Auto-connect skipped — no peer matching '$targetDeviceName' found " +
                       "(${availablePeers.size} other peer(s) visible). Retrying discovery in 4 s…")
-                mainHandler.postDelayed({ discoverPeers() }, 4000)
+                scheduleCoalescedRediscover(4000, "no name match")
             }
         } else if (targetDeviceName != null) {
             Log.d(tag, "Auto-connect skipped — phase=$phase, target=$targetDeviceName")
