@@ -513,19 +513,15 @@ class WifiDirectManager(private val context: Context) {
         }
 
         Log.d(tag, "connect() called — target MAC: $deviceAddress")
-        // On API 29+ use the Builder API to force 2.4 GHz band.
-        // 2.4 GHz has roughly 2× the range of 5 GHz at the cost of lower throughput,
-        // which is fine for text-chat payloads.
-        val config = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            WifiP2pConfig.Builder()
-                .setDeviceAddress(android.net.MacAddress.fromString(deviceAddress))
-                .setGroupOperatingBand(WifiP2pConfig.GROUP_OWNER_BAND_2GHZ)
-                .build()
-        } else {
-            WifiP2pConfig().apply {
-                this.deviceAddress = deviceAddress
-                wps.setup = WpsInfo.PBC
-            }
+        // Use the legacy WifiP2pConfig on all API levels.
+        // WifiP2pConfig.Builder was introduced in API 29 for group-creation features
+        // (setNetworkName, setPassphrase, setGroupOperatingBand) that we do NOT need
+        // when simply connecting to a peer. Several OEM Android 12 ROMs (e.g. Infinix)
+        // throw IllegalStateException("network name must be non-empty") from Builder.build()
+        // even without setGroupOperatingBand, so we avoid the Builder entirely.
+        val config = WifiP2pConfig().apply {
+            this.deviceAddress = deviceAddress
+            wps.setup = WpsInfo.PBC
         }
 
         mgr.connect(ch, config, object : WifiP2pManager.ActionListener {
