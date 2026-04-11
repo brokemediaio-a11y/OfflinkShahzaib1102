@@ -7,7 +7,6 @@ import '../../models/device_model.dart';
 import '../../models/message_model.dart';
 import '../../providers/chat_provider.dart';
 import '../../providers/connection_provider.dart';
-import '../../providers/device_provider.dart';
 import '../../services/storage/device_storage.dart';
 import '../../utils/logger.dart';
 
@@ -25,85 +24,75 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   final ScrollController _scrollController = ScrollController();
   String? _currentDeviceId;
 
+  // Tracks the last known message count so we can detect new arrivals.
+  int _lastMessageCount = 0;
+
+  // Whether the reconnecting dialog is currently on screen.
+  bool _reconnectDialogOpen = false;
+
+  // ── Reconnect dialog ────────────────────────────────────────────────
+
+  void _showReconnectingDialog() {
+    if (_reconnectDialogOpen) return;
+    _reconnectDialogOpen = true;
+
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => _ReconnectingDialog(
+        deviceName: widget.device.name,
+        onStop: () async {
+          Navigator.of(ctx).pop();
+          await ref.read(connectionProvider.notifier).cancelConnection();
+        },
+      ),
+    ).then((_) {
+      if (mounted) _reconnectDialogOpen = false;
+    });
+  }
+
+  void _dismissReconnectDialog() {
+    if (!_reconnectDialogOpen) return;
+    _reconnectDialogOpen = false;
+    if (mounted && Navigator.of(context).canPop()) {
+      Navigator.of(context).pop();
+    }
+  }
+
   // ── Connect ────────────────────────────────────────────────────────
 
   Future<void> _connectToDevice() async {
-    final connectionNotifier = ref.read(connectionProvider.notifier);
-    final deviceNotifier = ref.read(deviceProvider.notifier);
-
-    // If already connected to this peer, don't disrupt the session with a
-    // redundant BLE scan + connectToDevice call.
     final connectionState = ref.read(connectionProvider);
+
+    // Already connected to this peer — nothing to do.
     if (connectionState.state == ConnectionStateType.connected &&
         connectionState.connectedDevice?.id == widget.device.id) {
-      Logger.info('ChatScreen: already connected to ${widget.device.name} — skipping reconnect');
+      Logger.info(
+          'ChatScreen: already connected to ${widget.device.name} — skipping');
       return;
     }
 
-    if (mounted) setState(() {});
-
-    await deviceNotifier.startScan();
-    await Future.delayed(const Duration(seconds: 5));
-
-    final discoveredDevices = ref.read(deviceProvider).discoveredDevices;
-    Logger.info('Found ${discoveredDevices.length} devices during scan');
-
-    DeviceModel? foundDevice;
-
-    // Exact UUID match
-    for (final d in discoveredDevices) {
-      if (d.id == widget.device.id) {
-        foundDevice = d;
-        break;
-      }
+    // Another connection attempt already in flight — don't stack requests.
+    if (connectionState.state == ConnectionStateType.connecting) {
+      Logger.info('ChatScreen: connection attempt already in progress');
+      return;
     }
 
-    // Fallback: name match
-    if (foundDevice == null) {
-      for (final d in discoveredDevices) {
-        if (d.name == widget.device.name) {
-          foundDevice = d;
-          break;
-        }
-      }
-    }
+    final connectionNotifier = ref.read(connectionProvider.notifier);
+    final started = await connectionNotifier.connectToDevice(widget.device);
 
-    // Fallback: single "Offlink" device
-    if (foundDevice == null) {
-      final offlink = discoveredDevices
-          .where((d) => d.name.toLowerCase().contains('offlink'))
-          .toList();
-      if (offlink.length == 1) foundDevice = offlink.first;
-    }
+    if (!mounted) return;
 
-    await deviceNotifier.stopScan();
-
-    if (foundDevice != null) {
-      final connected = await connectionNotifier.connectToDevice(foundDevice);
-      if (connected && mounted) {
-        final chatNotifier =
-            ref.read(chatProvider(widget.device.id).notifier);
-        chatNotifier.setDeviceInfo(foundDevice);
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Connected to ${foundDevice.name}'),
-            backgroundColor: AppColors.primary,
-          ),
-        );
-      } else if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Failed to connect. Please try again.'),
-            backgroundColor: AppColors.error,
-          ),
-        );
-      }
-    } else if (mounted) {
+    if (started) {
+      _showReconnectingDialog();
+    } else {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
+        SnackBar(
           content: Text(
-              'Device not found. Message will be queued for delivery.'),
-          backgroundColor: AppColors.primary,
+              'Could not reach ${widget.device.name}. '
+              'Ensure both devices have Wi-Fi Direct enabled.'),
+          backgroundColor: AppColors.error,
+          duration: const Duration(seconds: 5),
         ),
       );
     }
@@ -124,7 +113,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     await chatNotifier.sendMessage(message, widget.device.id,
         device: widget.device);
 
-    // Scroll to bottom
+    _scrollToBottom();
+  }
+
+  /// Smoothly scroll to the most recent message.
+  void _scrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_scrollController.hasClients) {
         _scrollController.animateTo(
@@ -153,6 +146,35 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     final isConnecting =
         connectionState.state == ConnectionStateType.connecting;
 
+    // Dismiss reconnect dialog when socket opens or attempt ends.
+    ref.listen<ConnectionProviderState>(connectionProvider, (prev, next) {
+      if (!mounted) return;
+      if (next.state == ConnectionStateType.connected) {
+        _dismissReconnectDialog();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Connected to ${widget.device.name}'),
+            backgroundColor: AppColors.primary,
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      } else if (next.state == ConnectionStateType.error ||
+          (next.state == ConnectionStateType.disconnected &&
+              prev?.state == ConnectionStateType.connecting)) {
+        _dismissReconnectDialog();
+        final errorMsg =
+            ref.read(connectionProvider.notifier).lastConnectionError ??
+            'Connection to ${widget.device.name} failed. Try again.';
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(errorMsg),
+            backgroundColor: AppColors.error,
+            duration: const Duration(seconds: 5),
+          ),
+        );
+      }
+    });
+
     // Load messages on first open
     if (_currentDeviceId != widget.device.id) {
       _currentDeviceId = widget.device.id;
@@ -162,6 +184,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         chatNotifier.setDeviceInfo(widget.device);
         chatNotifier.loadMessagesForConversation(widget.device.id);
       });
+    }
+
+    // Auto-scroll whenever a new message is added (sent or received).
+    final currentCount = chatState.messages.length;
+    if (currentCount > _lastMessageCount) {
+      _lastMessageCount = currentCount;
+      _scrollToBottom();
     }
 
     final storedName =
@@ -351,6 +380,98 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                     ),
                   ),
                 ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Reconnecting dialog
+// ══════════════════════════════════════════════════════════════════════
+
+class _ReconnectingDialog extends StatelessWidget {
+  final String deviceName;
+  final VoidCallback onStop;
+
+  const _ReconnectingDialog({
+    required this.deviceName,
+    required this.onStop,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      contentPadding:
+          const EdgeInsets.symmetric(horizontal: 28, vertical: 28),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 64,
+            height: 64,
+            decoration: BoxDecoration(
+              color: AppColors.primary.withOpacity(0.08),
+              shape: BoxShape.circle,
+            ),
+            child: const Padding(
+              padding: EdgeInsets.all(16),
+              child: CircularProgressIndicator(
+                strokeWidth: 3,
+                valueColor:
+                    AlwaysStoppedAnimation<Color>(AppColors.primary),
+              ),
+            ),
+          ),
+          const SizedBox(height: 20),
+          const Text(
+            'Reconnecting…',
+            style: TextStyle(
+              fontSize: 18,
+              fontWeight: FontWeight.bold,
+              color: AppColors.textPrimary,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            deviceName,
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              fontSize: 15,
+              fontWeight: FontWeight.w600,
+              color: AppColors.primary,
+            ),
+          ),
+          const SizedBox(height: 6),
+          const Text(
+            'Trying to re-establish the Wi-Fi Direct link.\nThis may take up to 30 seconds.',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 13,
+              color: AppColors.textSecondary,
+              height: 1.5,
+            ),
+          ),
+          const SizedBox(height: 24),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: onStop,
+              icon: const Icon(Icons.stop_circle_outlined,
+                  color: AppColors.error),
+              label: const Text(
+                'Stop',
+                style: TextStyle(color: AppColors.error),
+              ),
+              style: OutlinedButton.styleFrom(
+                side: const BorderSide(color: AppColors.error),
+                padding: const EdgeInsets.symmetric(vertical: 12),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(10)),
               ),
             ),
           ),

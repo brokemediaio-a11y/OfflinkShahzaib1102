@@ -3,10 +3,12 @@ import 'dart:convert';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:uuid/uuid.dart';
 import '../models/message_model.dart';
+import '../models/message_packet.dart';
 import '../models/device_model.dart';
 import '../services/storage/message_storage.dart';
 import '../services/storage/device_storage.dart';
 import '../services/storage/pending_message_storage.dart';
+import '../services/dtn_queue.dart';
 import '../providers/connection_provider.dart';
 import 'conversations_provider.dart';
 import '../utils/logger.dart';
@@ -132,31 +134,37 @@ class ChatNotifier extends StateNotifier<ChatState> {
         Logger.error('Error updating conversations', e);
       }
 
-      // ── Check connection ──────────────────────────────────────────
-      final connectionState = _ref.read(connectionProvider);
-      final isConnected =
-          connectionState.state == ConnectionStateType.connected;
+      // ── Build MessagePacket for DTN routing ──────────────────────
+      final packet = MessagePacket(
+        msgId: messageId,
+        toUserId: finalReceiverId,
+        fromUserId: _myDeviceId,
+        payload: content.trim(),
+        ttl: 7,
+        hopCount: 0,
+        timestamp: DateTime.now().millisecondsSinceEpoch,
+        type: 'message',
+      );
 
-      if (isConnected) {
-        // ── ONLINE: send directly ─────────────────────────────────
-        final messageJson = jsonEncode(message.toJson());
-        final sent = await _connectionNotifier.sendMessage(messageJson);
+      // ── Route via DTN mesh layer (handles online + offline) ───────
+      // routePacket returns true if sent now, false if buffered in DtnQueue.
+      final sent = await _connectionNotifier.routePacket(packet);
 
-        if (sent) {
-          await MessageStorage.updateMessageStatus(
-              message.id, MessageStatus.sent);
-          _updateMessageInState(message.id, MessageStatus.sent);
-          Logger.info('ChatNotifier: ✅ message sent successfully');
-        } else {
-          // Send failed even though connected — queue as pending
-          await _queueAsPending(message);
-        }
+      if (sent) {
+        await MessageStorage.updateMessageStatus(message.id, MessageStatus.sent);
+        _updateMessageInState(message.id, MessageStatus.sent);
+        Logger.info('ChatNotifier: ✅ message routed (sent over air)');
       } else {
-        // ── OFFLINE: queue for store-and-forward ─────────────────
+        // Buffered in DtnQueue — also update UI status to pending
+        await MessageStorage.updateMessageStatus(message.id, MessageStatus.pending);
+        _updateMessageInState(message.id, MessageStatus.pending);
+        state = state.copyWith(isSending: false);
         Logger.info(
-            'ChatNotifier: peer offline — queuing message ${message.messageId} '
-            'for store-and-forward delivery');
-        await _queueAsPending(message);
+            'ChatNotifier: 📥 message ${message.messageId} buffered in DTN queue');
+        // Also keep in Hive pending storage so _syncPendingMessages can deliver
+        // via the legacy path while devices are directly connected.
+        await PendingMessageStorage.savePendingMessage(
+            message.copyWith(status: MessageStatus.pending));
       }
     } catch (e) {
       Logger.error('Error sending message', e);

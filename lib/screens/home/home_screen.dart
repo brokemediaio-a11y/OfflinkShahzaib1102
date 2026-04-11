@@ -22,9 +22,11 @@ class HomeScreen extends ConsumerStatefulWidget {
 }
 
 class _HomeScreenState extends ConsumerState<HomeScreen> {
-
   // Tracks which device the user last tapped — used by ref.listen to navigate.
   DeviceModel? _pendingConnectionDevice;
+
+  // Whether the connecting dialog is currently on screen.
+  bool _connectingDialogOpen = false;
 
   // Prevents showing duplicate consent dialogs for the same invitation.
   bool _invitationDialogOpen = false;
@@ -34,8 +36,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   @override
   void initState() {
     super.initState();
-    // Subscribe to incoming Wi-Fi Direct invitations.
-    // We must do this in initState (not build) to avoid multiple subscriptions.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _invitationSubscription?.cancel();
       _invitationSubscription = ref
@@ -51,12 +51,43 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     super.dispose();
   }
 
-  /// Called when another device sends us a Wi-Fi Direct connection invitation.
+  // ─── Connecting dialog ────────────────────────────────────────────────────
+
+  /// Show a non-dismissible modal dialog with a spinner and a "Stop" button.
+  void _showConnectingDialog(String deviceName) {
+    if (_connectingDialogOpen) return;
+    _connectingDialogOpen = true;
+
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => _ConnectingDialog(
+        deviceName: deviceName,
+        onStop: () async {
+          Navigator.of(ctx).pop();
+          await ref.read(connectionProvider.notifier).cancelConnection();
+        },
+      ),
+    ).then((_) {
+      // Ensure the flag is cleared even if the dialog is popped externally.
+      if (mounted) _connectingDialogOpen = false;
+    });
+  }
+
+  /// Dismiss the connecting dialog if it is currently shown.
+  void _dismissConnectingDialog() {
+    if (!_connectingDialogOpen) return;
+    _connectingDialogOpen = false;
+    if (mounted && Navigator.of(context).canPop()) {
+      Navigator.of(context).pop();
+    }
+  }
+
+  // ─── Incoming invitation ──────────────────────────────────────────────────
+
   Future<void> _onIncomingInvitation(Map<String, String> payload) async {
     if (!mounted || _invitationDialogOpen) return;
 
-    // If we are in auto-reconnect mode the invitation is almost certainly from
-    // the peer we just lost contact with.  Accept silently — no dialog needed.
     final notifier = ref.read(connectionProvider.notifier);
     if (notifier.isReconnecting) {
       Logger.info(
@@ -99,7 +130,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           children: [
             RichText(
               text: TextSpan(
-                style: const TextStyle(fontSize: 15, color: AppColors.textPrimary),
+                style: const TextStyle(
+                    fontSize: 15, color: AppColors.textPrimary),
                 children: [
                   TextSpan(
                     text: callerName,
@@ -131,8 +163,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               backgroundColor: AppColors.primary,
               foregroundColor: AppColors.textLight,
               shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(8),
-              ),
+                  borderRadius: BorderRadius.circular(8)),
             ),
             onPressed: () => Navigator.of(ctx).pop(true),
             child: const Text('Accept'),
@@ -146,53 +177,32 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
     if (accepted == true) {
       await notifier.acceptInvitation();
-      // Chat screen will open automatically when SOCKET_CONNECTED fires via
-      // the existing ref.listen in build().
+      // Chat screen opens via ref.listen when SOCKET_CONNECTED fires.
     } else {
       await notifier.rejectInvitation();
     }
   }
 
-  Future<void> _connectToDevice(DeviceModel device) async {
-    // Remember the intended peer so ref.listen can navigate when the socket
-    // is confirmed open (SOCKET_CONNECTED).  Do NOT navigate here.
-    _pendingConnectionDevice = device;
+  // ─── Connect to device ────────────────────────────────────────────────────
 
-    // Show a persistent "connecting…" snackbar — dismissed when state changes.
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Row(
-          children: [
-            const SizedBox(
-              width: 16,
-              height: 16,
-              child: CircularProgressIndicator(
-                strokeWidth: 2,
-                color: Colors.white,
-              ),
-            ),
-            const SizedBox(width: 12),
-            Text('Connecting to ${device.name} via Wi-Fi Direct…'),
-          ],
-        ),
-        duration: const Duration(seconds: 60),
-        backgroundColor: AppColors.primary,
-      ),
-    );
+  Future<void> _connectToDevice(DeviceModel device) async {
+    _pendingConnectionDevice = device;
 
     final connectionNotifier = ref.read(connectionProvider.notifier);
     final started = await connectionNotifier.connectToDevice(device);
 
     if (!mounted) return;
 
-    if (!started) {
-      // The native layer rejected the attempt immediately.
+    if (started) {
+      // Show the modal connecting dialog with Stop button.
+      _showConnectingDialog(device.name);
+    } else {
+      // Native layer rejected immediately — no need for a dialog.
       _pendingConnectionDevice = null;
-      ScaffoldMessenger.of(context).hideCurrentSnackBar();
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            'Could not start Wi-Fi Direct connection to ${device.name}. '
+            'Could not start connection to ${device.name}. '
             'Ensure Wi-Fi Direct is enabled on both devices.',
           ),
           backgroundColor: AppColors.error,
@@ -200,58 +210,53 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         ),
       );
     }
-    // If started == true we stay in "connecting" state.
-    // ref.listen (in build) will fire when state transitions to
-    // ConnectionStateType.connected (i.e., socket is confirmed open).
   }
+
+  // ─── Build ────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
     final deviceState = ref.watch(deviceProvider);
     final connectionState = ref.watch(connectionProvider);
 
-    // ── React to Wi-Fi Direct state changes ───────────────────────────────
-    // Navigate to Chat ONLY when the state machine confirms SOCKET_CONNECTED.
-    // This fires from _handleWifiDirectState in ConnectionManager, which only
-    // emits ConnectionState.connected when socketActive == true.
+    // React to Wi-Fi Direct state transitions.
     ref.listen<ConnectionProviderState>(connectionProvider, (previous, next) {
       if (!mounted) return;
 
       if (previous?.state != ConnectionStateType.connected &&
           next.state == ConnectionStateType.connected) {
-        // Socket confirmed open — dismiss the "connecting…" snackbar.
-        ScaffoldMessenger.of(context).hideCurrentSnackBar();
+        // ── Socket confirmed open ────────────────────────────────────
+        _dismissConnectingDialog();
 
-        // Resolve the device to open chat with:
-        //   1. Use the pending device the user tapped (has the correct UUID).
-        //   2. Fall back to the connected device from state (may have generic name).
         final chatDevice = _pendingConnectionDevice ?? next.connectedDevice;
         _pendingConnectionDevice = null;
 
         if (chatDevice != null) {
           Navigator.of(context).push(
-            MaterialPageRoute(
-              builder: (_) => ChatScreen(device: chatDevice),
-            ),
+            MaterialPageRoute(builder: (_) => ChatScreen(device: chatDevice)),
           );
         }
       } else if (next.state == ConnectionStateType.error ||
-                 next.state == ConnectionStateType.disconnected) {
-        // Connection failed or was lost — dismiss spinner and show error.
-        ScaffoldMessenger.of(context).hideCurrentSnackBar();
+          (next.state == ConnectionStateType.disconnected &&
+              previous?.state == ConnectionStateType.connecting)) {
+        // ── Connection attempt failed or timed out ───────────────────
+        _dismissConnectingDialog();
 
-        if (_pendingConnectionDevice != null &&
-            next.state == ConnectionStateType.error) {
+        if (_pendingConnectionDevice != null) {
           final name = _pendingConnectionDevice!.name;
           _pendingConnectionDevice = null;
+
+          // Use the human-readable error from the manager if available.
+          final errorMsg =
+              ref.read(connectionProvider.notifier).lastConnectionError ??
+              'Connection to $name failed. '
+                  'Ensure both devices have Wi-Fi Direct enabled.';
+
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-              content: Text(
-                'Wi-Fi Direct connection to $name failed. '
-                'Ensure both devices have Wi-Fi Direct enabled.',
-              ),
+              content: Text(errorMsg),
               backgroundColor: AppColors.error,
-              duration: const Duration(seconds: 5),
+              duration: const Duration(seconds: 6),
             ),
           );
         } else {
@@ -274,9 +279,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 context: context,
                 builder: (_) => const EditNameDialog(),
               );
-              
               if (result == true && mounted) {
-                // Restart advertising with new name
                 final connectionManager = ConnectionManager();
                 await connectionManager.restartAdvertising();
               }
@@ -284,17 +287,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           ),
           IconButton(
             icon: Stack(
-              children: [
-                const Icon(Icons.message),
-                // You can add a badge here for unread count
-              ],
+              children: const [Icon(Icons.message)],
             ),
             tooltip: 'Messages',
             onPressed: () {
               Navigator.of(context).push(
-                MaterialPageRoute(
-                  builder: (_) => const MessagesScreen(),
-                ),
+                MaterialPageRoute(builder: (_) => const MessagesScreen()),
               );
             },
           ),
@@ -306,7 +304,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               onPressed: () {
                 Navigator.of(context).push(
                   MaterialPageRoute(
-                    builder: (_) => ChatScreen(device: connectionState.connectedDevice!),
+                    builder: (_) =>
+                        ChatScreen(device: connectionState.connectedDevice!),
                   ),
                 );
               },
@@ -319,7 +318,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                   if (connectionState.connectedDevice != null) {
                     Navigator.of(context).push(
                       MaterialPageRoute(
-                        builder: (_) => ChatScreen(device: connectionState.connectedDevice!),
+                        builder: (_) =>
+                            ChatScreen(device: connectionState.connectedDevice!),
                       ),
                     );
                   } else {
@@ -334,8 +334,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 case 'connection':
                   Navigator.of(context).push(
                     MaterialPageRoute(
-                      builder: (_) => const ConnectionStatusScreen(),
-                    ),
+                        builder: (_) => const ConnectionStatusScreen()),
                   );
                   break;
               }
@@ -368,6 +367,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       ),
       body: Column(
         children: [
+          // ── Scan button ────────────────────────────────────────────
           Container(
             padding: const EdgeInsets.all(AppConstants.defaultPadding),
             color: AppColors.surface,
@@ -379,20 +379,17 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                         ? () => ref.read(deviceProvider.notifier).stopScan()
                         : () => ref.read(deviceProvider.notifier).startScan(),
                     icon: Icon(
-                      deviceState.isScanning ? Icons.stop : Icons.search,
-                    ),
-                    label: Text(
-                      deviceState.isScanning
-                          ? AppStrings.stopScan
-                          : AppStrings.scanDevices,
-                    ),
+                        deviceState.isScanning ? Icons.stop : Icons.search),
+                    label: Text(deviceState.isScanning
+                        ? AppStrings.stopScan
+                        : AppStrings.scanDevices),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: AppColors.primary,
                       foregroundColor: AppColors.textLight,
                       padding: const EdgeInsets.symmetric(vertical: 16),
                       shape: RoundedRectangleBorder(
-                        borderRadius:
-                            BorderRadius.circular(AppConstants.defaultBorderRadius),
+                        borderRadius: BorderRadius.circular(
+                            AppConstants.defaultBorderRadius),
                       ),
                     ),
                   ),
@@ -400,7 +397,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               ],
             ),
           ),
-          // ── BLE scanning indicator ────────────────────────────────
+
+          // ── BLE scanning indicator ─────────────────────────────────
           if (deviceState.isScanning)
             Container(
               padding: const EdgeInsets.symmetric(vertical: 8),
@@ -422,36 +420,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               ),
             ),
 
-          // ── Wi-Fi Direct connection status banner ─────────────────
-          if (connectionState.state == ConnectionStateType.connecting)
-            Container(
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-              color: Colors.orange.withOpacity(0.15),
-              child: Row(
-                children: [
-                  const SizedBox(
-                    width: 16,
-                    height: 16,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      color: Colors.orange,
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  const Expanded(
-                    child: Text(
-                      'Connecting via Wi-Fi Direct…',
-                      style: TextStyle(
-                        color: Colors.orange,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            )
-          else if (connectionState.state == ConnectionStateType.connected &&
+          // ── Wi-Fi Direct status banner ─────────────────────────────
+          if (connectionState.state == ConnectionStateType.connected &&
               connectionState.connectedDevice != null)
             Container(
               padding:
@@ -464,9 +434,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                   const SizedBox(width: 10),
                   Expanded(
                     child: Text(
-                      'Connected to '
-                      '${connectionState.connectedDevice!.name} '
-                      'via Wi-Fi Direct',
+                      'Connected to ${connectionState.connectedDevice!.name}',
                       style: const TextStyle(
                         color: Colors.green,
                         fontWeight: FontWeight.w600,
@@ -484,6 +452,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 ],
               ),
             ),
+
+          // ── Error banner ───────────────────────────────────────────
           if (deviceState.error != null)
             Container(
               padding: const EdgeInsets.all(12),
@@ -506,6 +476,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 ],
               ),
             ),
+
+          // ── Device list ────────────────────────────────────────────
           Expanded(
             child: deviceState.discoveredDevices.isEmpty
                 ? Center(
@@ -537,10 +509,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                     ),
                   )
                 : ListView.builder(
-                    padding: const EdgeInsets.all(AppConstants.defaultPadding),
+                    padding:
+                        const EdgeInsets.all(AppConstants.defaultPadding),
                     itemCount: deviceState.discoveredDevices.length,
                     itemBuilder: (context, index) {
-                      final device = deviceState.discoveredDevices[index];
+                      final device =
+                          deviceState.discoveredDevices[index];
                       return _DeviceCard(
                         device: device,
                         onTap: () => _connectToDevice(device),
@@ -553,6 +527,102 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     );
   }
 }
+
+// ─── Connecting dialog widget ──────────────────────────────────────────────
+
+class _ConnectingDialog extends StatelessWidget {
+  final String deviceName;
+  final VoidCallback onStop;
+
+  const _ConnectingDialog({
+    required this.deviceName,
+    required this.onStop,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      contentPadding:
+          const EdgeInsets.symmetric(horizontal: 28, vertical: 28),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Animated spinner
+          Container(
+            width: 64,
+            height: 64,
+            decoration: BoxDecoration(
+              color: AppColors.primary.withOpacity(0.08),
+              shape: BoxShape.circle,
+            ),
+            child: const Padding(
+              padding: EdgeInsets.all(16),
+              child: CircularProgressIndicator(
+                strokeWidth: 3,
+                valueColor:
+                    AlwaysStoppedAnimation<Color>(AppColors.primary),
+              ),
+            ),
+          ),
+          const SizedBox(height: 20),
+          // Title
+          const Text(
+            'Connecting…',
+            style: TextStyle(
+              fontSize: 18,
+              fontWeight: FontWeight.bold,
+              color: AppColors.textPrimary,
+            ),
+          ),
+          const SizedBox(height: 8),
+          // Device name
+          Text(
+            deviceName,
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              fontSize: 15,
+              fontWeight: FontWeight.w600,
+              color: AppColors.primary,
+            ),
+          ),
+          const SizedBox(height: 6),
+          const Text(
+            'Establishing Wi-Fi Direct link.\nThis may take up to 30 seconds.',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 13,
+              color: AppColors.textSecondary,
+              height: 1.5,
+            ),
+          ),
+          const SizedBox(height: 24),
+          // Stop button
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: onStop,
+              icon: const Icon(Icons.stop_circle_outlined,
+                  color: AppColors.error),
+              label: const Text(
+                'Stop Connecting',
+                style: TextStyle(color: AppColors.error),
+              ),
+              style: OutlinedButton.styleFrom(
+                side: const BorderSide(color: AppColors.error),
+                padding: const EdgeInsets.symmetric(vertical: 12),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(10)),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ─── Device card ──────────────────────────────────────────────────────────
 
 class _DeviceCard extends StatelessWidget {
   final DeviceModel device;
@@ -569,16 +639,17 @@ class _DeviceCard extends StatelessWidget {
       margin: const EdgeInsets.only(bottom: 12),
       elevation: 2,
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(AppConstants.defaultBorderRadius),
+        borderRadius:
+            BorderRadius.circular(AppConstants.defaultBorderRadius),
       ),
       child: InkWell(
         onTap: onTap,
-        borderRadius: BorderRadius.circular(AppConstants.defaultBorderRadius),
+        borderRadius:
+            BorderRadius.circular(AppConstants.defaultBorderRadius),
         child: Padding(
           padding: const EdgeInsets.all(16),
           child: Row(
             children: [
-              // Device avatar: BLE icon (all discovered via BLE)
               Container(
                 width: 48,
                 height: 48,
@@ -596,7 +667,6 @@ class _DeviceCard extends StatelessWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    // Device name
                     Text(
                       device.name,
                       style: const TextStyle(
@@ -611,16 +681,13 @@ class _DeviceCard extends StatelessWidget {
                       runSpacing: 4,
                       crossAxisAlignment: WrapCrossAlignment.center,
                       children: [
-                        // RSSI badge
                         if (device.rssi != 0)
                           Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
-                              const Icon(
-                                Icons.signal_cellular_alt,
-                                size: 14,
-                                color: AppColors.textSecondary,
-                              ),
+                              const Icon(Icons.signal_cellular_alt,
+                                  size: 14,
+                                  color: AppColors.textSecondary),
                               const SizedBox(width: 4),
                               Text(
                                 '${device.rssi} dBm',
@@ -631,62 +698,58 @@ class _DeviceCard extends StatelessWidget {
                               ),
                             ],
                           ),
-                        // "BLE Discovered" badge
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 6, vertical: 2),
-                          decoration: BoxDecoration(
-                            color: AppColors.primary.withOpacity(0.08),
-                            borderRadius: BorderRadius.circular(10),
-                          ),
-                          child: const Text(
-                            'BLE Discovered',
-                            style: TextStyle(
-                              fontSize: 9,
-                              fontWeight: FontWeight.bold,
-                              color: AppColors.primary,
-                            ),
-                          ),
-                        ),
-                        // "Wi-Fi Direct" hint badge
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 6, vertical: 2),
-                          decoration: BoxDecoration(
-                            color: Colors.green.withOpacity(0.08),
-                            borderRadius: BorderRadius.circular(10),
-                          ),
-                          child: const Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(Icons.wifi_tethering,
-                                  size: 10, color: Colors.green),
-                              SizedBox(width: 3),
-                              Text(
-                                'Wi-Fi Direct',
-                                style: TextStyle(
-                                  fontSize: 9,
-                                  fontWeight: FontWeight.bold,
-                                  color: Colors.green,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
+                        _badge('BLE Discovered',
+                            AppColors.primary.withOpacity(0.08),
+                            AppColors.primary),
+                        _wifiDirectBadge(),
                       ],
                     ),
                   ],
                 ),
               ),
-              const Icon(
-                Icons.arrow_forward_ios,
-                size: 16,
-                color: AppColors.textSecondary,
-              ),
+              const Icon(Icons.arrow_forward_ios,
+                  size: 16, color: AppColors.textSecondary),
             ],
           ),
         ),
       ),
     );
   }
+
+  Widget _badge(String label, Color bg, Color fg) => Container(
+        padding:
+            const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+        decoration: BoxDecoration(
+          color: bg,
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+              fontSize: 9, fontWeight: FontWeight.bold, color: fg),
+        ),
+      );
+
+  Widget _wifiDirectBadge() => Container(
+        padding:
+            const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+        decoration: BoxDecoration(
+          color: Colors.green.withOpacity(0.08),
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.wifi_tethering, size: 10, color: Colors.green),
+            SizedBox(width: 3),
+            Text(
+              'Wi-Fi Direct',
+              style: TextStyle(
+                  fontSize: 9,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.green),
+            ),
+          ],
+        ),
+      );
 }

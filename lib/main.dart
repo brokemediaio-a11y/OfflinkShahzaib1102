@@ -10,6 +10,7 @@ import 'services/storage/message_storage.dart';
 import 'services/storage/device_storage.dart';
 import 'services/storage/known_contacts_storage.dart';
 import 'services/storage/pending_message_storage.dart';
+import 'services/database_helper.dart';
 import 'utils/logger.dart';
 
 void main() async {
@@ -41,6 +42,9 @@ void main() async {
   await DeviceStorage.init();
   await KnownContactsStorage.init();
   await PendingMessageStorage.init();
+
+  // ── Initialize SQLite (DTN routing / seen cache / outbound queue) ────
+  await DatabaseHelper.database;
 
   // ── MIGRATION: one-time clear of pre-routing messages ────────────
   // The MessageModel gained routing fields (messageId, hopCount, etc.)

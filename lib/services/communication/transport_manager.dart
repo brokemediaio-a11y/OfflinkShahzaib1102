@@ -47,21 +47,12 @@ class TransportManager {
 
   /// Register a new peer connection.
   ///
-  /// Maintains single-connection semantics (clears existing peers).
-  /// Structured for future multi-connection support.
+  /// Supports multiple simultaneous peers for multi-hop mesh routing.
   void addNeighbor(PeerConnection peer) {
     Logger.info(
         'TransportManager: adding neighbor ${peer.peerId} '
         '(${peer.transportType}, ${peer.role}, '
         'ip=${peer.ipAddress}, socket=${peer.socketActive})');
-
-    // Single-connection mode — clear any previous peer.
-    // Future: remove this clear() to support multiple simultaneous connections.
-    if (_neighbors.isNotEmpty) {
-      Logger.info(
-          'TransportManager: replacing existing neighbor (single-connection mode)');
-      _neighbors.clear();
-    }
 
     _neighbors[peer.peerId] = peer;
     Logger.info('TransportManager: ${_neighbors.length} neighbor(s) registered');

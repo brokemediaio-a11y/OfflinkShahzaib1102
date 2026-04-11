@@ -111,7 +111,11 @@ class WifiDirectManager(private val context: Context) {
 
     // Discovery retry state
     private val discoveryRetryCount = AtomicInteger(0)
-    private val maxDiscoveryRetries = 4
+    private val maxDiscoveryRetries = 6
+
+    // Set to true while a hard BUSY recovery is in progress to suppress
+    // concurrent discoverPeers() calls from the passive-discovery heartbeat.
+    private val isBusyRecovering = AtomicBoolean(false)
 
     // Safety timeout: reset if we stay CONNECTING with no response for 15 s
     private var connectingTimeoutRunnable: Runnable? = null
@@ -275,8 +279,8 @@ class WifiDirectManager(private val context: Context) {
         // its Wi-Fi Direct beacon even when the user never taps "Scan for Devices".
         schedulePassiveDiscovery()
 
-        // Start background DNS-SD service browser after a short delay (5 s) so
-        // the Wi-Fi Direct stack is settled before we call discoverServices().
+        // Start background DNS-SD service browser after a delay so peer discovery
+        // can own the P2P channel first (Xiaomi/MIUI often returns BUSY if overlapped).
         // This discovers nearby OffLink peers at Wi-Fi Direct range (~200 m)
         // independent of BLE, then continues on a 90-second cycle.
         mainHandler.postDelayed({
@@ -284,9 +288,75 @@ class WifiDirectManager(private val context: Context) {
                 runBackgroundServiceDiscovery()
                 scheduleBackgroundServiceDiscovery()
             }
-        }, 5_000)
+        }, 12_000)
 
         return true
+    }
+
+    /**
+     * Xiaomi / some Samsung builds leave [WifiP2pManager] in BUSY when
+     * [discoverPeers], DNS-SD [discoverServices], and passive heartbeats overlap.
+     * Stopping peer discovery and clearing service requests frees the slot.
+     */
+    @SuppressLint("MissingPermission")
+    private fun recoverP2pDiscoverySlot(delayBeforeRetryMs: Long, onReady: () -> Unit) {
+        val mgr = wifiP2pManager ?: run {
+            mainHandler.postDelayed(onReady, delayBeforeRetryMs)
+            return
+        }
+        val ch = p2pChannel ?: run {
+            mainHandler.postDelayed(onReady, delayBeforeRetryMs)
+            return
+        }
+        val proceed = Runnable { mainHandler.postDelayed(onReady, delayBeforeRetryMs) }
+        mgr.stopPeerDiscovery(ch, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                mgr.clearServiceRequests(ch, object : WifiP2pManager.ActionListener {
+                    override fun onSuccess() = proceed.run()
+                    override fun onFailure(@Suppress("UNUSED_PARAMETER") r: Int) = proceed.run()
+                })
+            }
+            override fun onFailure(@Suppress("UNUSED_PARAMETER") r: Int) {
+                mgr.clearServiceRequests(ch, object : WifiP2pManager.ActionListener {
+                    override fun onSuccess() = proceed.run()
+                    override fun onFailure(@Suppress("UNUSED_PARAMETER") r2: Int) = proceed.run()
+                })
+            }
+        })
+    }
+
+    /**
+     * Aggressive BUSY recovery for persistent cases (Samsung Android 14+).
+     * Extends [recoverP2pDiscoverySlot] by also calling removeGroup(), which
+     * frees any lingering P2P group that is the root cause of the BUSY state.
+     * After all async calls complete, waits [delayBeforeRetryMs] then calls [onReady].
+     */
+    @SuppressLint("MissingPermission")
+    private fun hardRecoverP2pSlot(delayBeforeRetryMs: Long, onReady: () -> Unit) {
+        val mgr = wifiP2pManager ?: run { mainHandler.postDelayed(onReady, delayBeforeRetryMs); return }
+        val ch  = p2pChannel   ?: run { mainHandler.postDelayed(onReady, delayBeforeRetryMs); return }
+        val proceed = Runnable { mainHandler.postDelayed(onReady, delayBeforeRetryMs) }
+
+        mgr.stopPeerDiscovery(ch, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() { clearAndRemove(mgr, ch, proceed) }
+            override fun onFailure(@Suppress("UNUSED_PARAMETER") r: Int) { clearAndRemove(mgr, ch, proceed) }
+        })
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun clearAndRemove(mgr: WifiP2pManager, ch: WifiP2pManager.Channel, proceed: Runnable) {
+        mgr.clearServiceRequests(ch, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() { removeGroupForRecover(mgr, ch, proceed) }
+            override fun onFailure(@Suppress("UNUSED_PARAMETER") r: Int) { removeGroupForRecover(mgr, ch, proceed) }
+        })
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun removeGroupForRecover(mgr: WifiP2pManager, ch: WifiP2pManager.Channel, proceed: Runnable) {
+        mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() { proceed.run() }
+            override fun onFailure(@Suppress("UNUSED_PARAMETER") r: Int) { proceed.run() }
+        })
     }
 
     @SuppressLint("MissingPermission")
@@ -295,8 +365,8 @@ class WifiDirectManager(private val context: Context) {
         val mgr = wifiP2pManager ?: return mapOf("success" to false, "error" to "Manager null")
         val ch  = p2pChannel   ?: return mapOf("success" to false, "error" to "Channel null")
 
-        val attempt = discoveryRetryCount.get() + 1
-        Log.d(tag, "Starting Wi-Fi Direct peer discovery… (attempt $attempt/$maxDiscoveryRetries)")
+        val fails = discoveryRetryCount.get()
+        Log.d(tag, "Starting Wi-Fi Direct peer discovery… (busyRetries=$fails/$maxDiscoveryRetries)")
 
         mgr.discoverPeers(ch, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
@@ -334,17 +404,34 @@ class WifiDirectManager(private val context: Context) {
                 when {
                     reason == WifiP2pManager.BUSY &&
                     discoveryRetryCount.incrementAndGet() <= maxDiscoveryRetries -> {
-                        val delayMs = 1500L * discoveryRetryCount.get()
-                        Log.d(tag, "Peer discovery BUSY — retrying in ${delayMs}ms " +
-                              "(attempt ${discoveryRetryCount.get()}/$maxDiscoveryRetries)")
-                        mainHandler.postDelayed({ discoverPeers() }, delayMs)
+                        val delayMs = (800L * discoveryRetryCount.get()).coerceAtMost(5000L)
+                        Log.d(tag, "Peer discovery BUSY — recover slot then retry in ${delayMs}ms " +
+                              "(${discoveryRetryCount.get()}/$maxDiscoveryRetries)")
+                        recoverP2pDiscoverySlot(delayMs) { discoverPeers() }
+                    }
+                    reason == WifiP2pManager.BUSY -> {
+                        discoveryRetryCount.set(0)
+                        Log.w(tag, "Peer discovery still BUSY — hard recover + delayed retry")
+                        connectionPhase.set(ConnectionPhase.DISCONNECTED)
+                        notifyConnectionState(
+                            connected = false,
+                            error = "Wi-Fi Direct was busy; clearing and retrying…"
+                        )
+                        // Suppress the passive-discovery heartbeat so it doesn't
+                        // fire concurrent discoverPeers() calls during recovery and
+                        // make the BUSY state worse (Samsung Android 14 pattern).
+                        isBusyRecovering.set(true)
+                        // Use the aggressive path: removeGroup() included so any
+                        // lingering stale group (the most common BUSY root cause on
+                        // Samsung devices) is torn down before the next attempt.
+                        hardRecoverP2pSlot(6_000L) {
+                            isBusyRecovering.set(false)
+                            discoverPeers()
+                        }
                     }
                     else -> {
                         discoveryRetryCount.set(0)
-                        val errorMsg = if (reason == WifiP2pManager.BUSY)
-                            "Peer discovery unavailable (framework busy after $maxDiscoveryRetries retries)"
-                        else
-                            "Peer discovery failed: ${failureReason(reason)}"
+                        val errorMsg = "Peer discovery failed: ${failureReason(reason)}"
                         connectionPhase.set(ConnectionPhase.FAILED)
                         notifyConnectionState(connected = false, error = errorMsg)
                     }
@@ -553,7 +640,7 @@ class WifiDirectManager(private val context: Context) {
                 w.write(message)
                 w.newLine()
                 w.flush()
-                Log.d(tag, "Message sent via Wi-Fi Direct socket (${message.length} chars)")
+                Log.v(tag, "Message sent via Wi-Fi Direct socket (${message.length} chars)")
             } catch (e: Exception) {
                 Log.e(tag, "Error writing to socket", e)
                 handleSocketError(e)
@@ -845,10 +932,11 @@ class WifiDirectManager(private val context: Context) {
         val mgr = wifiP2pManager ?: return
         val ch  = p2pChannel   ?: return
         val phase = connectionPhase.get()
-        // Don't interfere with an active connection
-        if (phase == ConnectionPhase.CONNECTING || phase == ConnectionPhase.GROUP_FORMED ||
+        // Don't interfere with an active connection or a failed state (avoid BUSY loops)
+        if (phase == ConnectionPhase.FAILED ||
+            phase == ConnectionPhase.CONNECTING || phase == ConnectionPhase.GROUP_FORMED ||
             phase == ConnectionPhase.SOCKET_CONNECTING || phase == ConnectionPhase.SOCKET_CONNECTED) {
-            Log.d(tag, "Background DNS-SD skipped — connection in progress (phase=$phase)")
+            Log.d(tag, "Background DNS-SD skipped — phase=$phase")
             return
         }
         Log.d(tag, "Background DNS-SD service discovery starting…")
@@ -1150,6 +1238,13 @@ class WifiDirectManager(private val context: Context) {
 
     fun shutdown() {
         Log.d(tag, "Shutting down WifiDirectManager")
+        // Drop Dart callbacks first so DNS-SD / P2P posts after engine detach
+        // don't hit a dead binary messenger (hot restart, activity finish).
+        peerListListener = null
+        connectionStateListener = null
+        messageListener = null
+        discoveredServicesListener = null
+        incomingInvitationListener = null
         cancelPassiveDiscovery()
         cancelBackgroundServiceDiscovery()
         cancelInvitationTimeout()
@@ -1280,10 +1375,10 @@ class WifiDirectManager(private val context: Context) {
                         }
                         // Silently absorb heartbeat pings — never forward to Dart.
                         if (line == heartbeatPingMessage) {
-                            Log.d(tag, "Heartbeat PING received — connection alive")
+                            Log.v(tag, "Heartbeat PING received — connection alive")
                             continue
                         }
-                        Log.d(tag, "Wi-Fi Direct received: ${line.take(80)}")
+                        Log.v(tag, "Wi-Fi Direct received: ${line.take(80)}")
                         mainHandler.post { messageListener?.invoke(line) }
                     }
                 } catch (e: Exception) {
@@ -1334,6 +1429,8 @@ class WifiDirectManager(private val context: Context) {
         passiveDiscoveryRunnable = Runnable {
             val phase = connectionPhase.get()
             if (initialized &&
+                !isBusyRecovering.get() &&
+                phase != ConnectionPhase.FAILED &&
                 phase != ConnectionPhase.CONNECTING &&
                 phase != ConnectionPhase.GROUP_FORMED &&
                 phase != ConnectionPhase.SOCKET_CONNECTING &&
@@ -1456,7 +1553,7 @@ class WifiDirectManager(private val context: Context) {
                             w.write(heartbeatPingMessage)
                             w.newLine()
                             w.flush()
-                            Log.d(tag, "Heartbeat PING sent")
+                            Log.v(tag, "Heartbeat PING sent")
                         }
                     } catch (e: Exception) {
                         Log.w(tag, "Heartbeat PING failed — connection lost: ${e.message}")
@@ -1580,6 +1677,36 @@ class WifiDirectManager(private val context: Context) {
                         Log.d(tag, "Wi-Fi P2P network disconnected")
                         val phase = connectionPhase.get()
 
+                        // SOCKET_CONNECTING: a real group teardown also emits
+                        // isConnected=false. If we always ignore it, we stay stuck in
+                        // SOCKET_CONNECTING with ServerSocket.accept() blocking while
+                        // peers drop to 0 (common on Samsung + mixed GO/client flows).
+                        if (phase == ConnectionPhase.SOCKET_CONNECTING) {
+                            wifiP2pManager?.requestConnectionInfo(p2pChannel) { info ->
+                                mainHandler.post {
+                                    if (connectionPhase.get() != ConnectionPhase.SOCKET_CONNECTING) {
+                                        return@post
+                                    }
+                                    if (!info.groupFormed) {
+                                        Log.w(
+                                            tag,
+                                            "Disconnect during SOCKET_CONNECTING — P2P group gone — resetting"
+                                        )
+                                        closeSocket()
+                                        resetState(restartPassiveDiscovery = true)
+                                        notifyConnectionState(connected = false)
+                                    } else {
+                                        Log.d(
+                                            tag,
+                                            "Disconnect during SOCKET_CONNECTING — group still formed; " +
+                                                "ignoring spurious broadcast"
+                                        )
+                                    }
+                                }
+                            }
+                            return
+                        }
+
                         // During active P2P negotiation the Android framework fires
                         // a spurious "disconnected" broadcast before the new group
                         // is established. Ignore it so we don't tear down a
@@ -1593,8 +1720,7 @@ class WifiDirectManager(private val context: Context) {
                         // the socket forms successfully (race condition).
                         if (phase == ConnectionPhase.DISCOVERING ||
                             phase == ConnectionPhase.CONNECTING ||
-                            phase == ConnectionPhase.GROUP_FORMED ||
-                            phase == ConnectionPhase.SOCKET_CONNECTING) {
+                            phase == ConnectionPhase.GROUP_FORMED) {
                             Log.d(tag, "Spurious disconnect during P2P negotiation " +
                                   "(phase=$phase) — ignoring")
                             return
@@ -1700,7 +1826,28 @@ class WifiDirectManager(private val context: Context) {
                     Log.d(tag, "🔔 Invitation still pending from ${invitedPeer.deviceName} — waiting for user")
                     return
                 }
-                // New invitation — ask the user for consent.
+
+                // ── Cross-invite: we are the initiator targeting this exact peer ───
+                // When both devices tap "connect" simultaneously, or when the first
+                // connect() call collides and the peer retries, Android marks the peer
+                // INVITED on OUR side too.  Since WE initiated, auto-accept silently —
+                // there is no need to show the user a consent dialog.
+                val target = targetDeviceName
+                if (target != null &&
+                    invitedPeer.deviceName.contains(target, ignoreCase = true)) {
+                    Log.d(tag, "🤝 Cross-invite from our own target ${invitedPeer.deviceName} — auto-accepting (no dialog)")
+                    pendingInvitedPeer = invitedPeer
+                    cancelInvitationTimeout()
+                    val currentGroupPhase = connectionPhase.get()
+                    if (currentGroupPhase == ConnectionPhase.GROUP_FORMED) {
+                        startSocketOrFail()
+                    } else {
+                        connectToPeer(invitedPeer.deviceAddress)
+                    }
+                    return
+                }
+
+                // New invitation from an unknown/unexpected peer — ask user for consent.
                 pendingInvitedPeer = invitedPeer
                 scheduleInvitationTimeout()
                 notifyIncomingInvitation(invitedPeer)

@@ -19,7 +19,11 @@ dependencies:
   # Local Storage
   hive: ^2.2.3
   hive_flutter: ^1.1.0
-  
+
+  # DTN / Routing Storage (SQLite)
+  sqflite: ^2.3.3
+  path: ^1.9.0
+
   # Utilities
   uuid: ^4.3.3
   intl: ^0.19.0

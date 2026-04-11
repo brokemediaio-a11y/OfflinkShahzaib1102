@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/device_model.dart';
+import '../models/message_packet.dart';
 import '../services/communication/connection_manager.dart';
+import '../services/dtn_queue.dart';
 import '../utils/logger.dart';
 import 'conversations_provider.dart';
 import 'chat_provider.dart';
@@ -218,8 +220,9 @@ class ConnectionNotifier extends StateNotifier<ConnectionProviderState> {
           'ConnectionProvider: 📬 delivery ACK — messageId=$messageId, '
           'ackSenderId=$ackSenderId');
 
-      // Remove from pending queue
+      // Remove from both the Hive pending queue and the SQLite DTN queue
       unawaited(PendingMessageStorage.removePendingMessage(messageId));
+      unawaited(DtnQueue.recordAttempt(messageId, delivered: true));
 
       // Update status in persistent storage
       unawaited(
@@ -327,12 +330,31 @@ class ConnectionNotifier extends StateNotifier<ConnectionProviderState> {
     }
   }
 
+  /// Route a [MessagePacket] through the DTN mesh layer.
+  ///
+  /// Returns true if the packet was sent over the air now.
+  /// Returns false if it was buffered in the DTN queue for later delivery.
+  Future<bool> routePacket(MessagePacket packet) async {
+    try {
+      return await _connectionManager.routePacket(packet);
+    } catch (e) {
+      Logger.error('ConnectionProvider: routePacket error', e);
+      return false;
+    }
+  }
+
   bool isConnected() {
     return _connectionManager.isConnected();
   }
 
   /// [true] while the manager is trying to restore a lost connection.
   bool get isReconnecting => _connectionManager.isReconnecting;
+
+  /// Cancel an in-progress connection attempt (user tapped "Stop").
+  Future<void> cancelConnection() => _connectionManager.cancelConnection();
+
+  /// Human-readable reason for the last connection error/timeout (or null).
+  String? get lastConnectionError => _connectionManager.lastConnectionError;
 
   /// Accept the pending incoming Wi-Fi Direct invitation.
   Future<void> acceptInvitation() =>

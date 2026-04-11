@@ -6,6 +6,7 @@ import 'package:device_info_plus/device_info_plus.dart';
 import '../../core/constants.dart';
 import '../../models/device_model.dart';
 import '../../models/message_model.dart';
+import '../../models/message_packet.dart';
 import '../../models/peer_connection_model.dart';
 import '../../utils/logger.dart';
 import '../../utils/permissions_helper.dart';
@@ -14,6 +15,10 @@ import '../storage/device_storage.dart';
 import '../storage/pending_message_storage.dart';
 import '../storage/known_contacts_storage.dart';
 import '../routing/routing_manager.dart';
+import '../mesh_handler.dart';
+import '../peer_discovery.dart';
+import '../dtn_retry_loop.dart';
+import '../routing_engine.dart';
 import 'transport_manager.dart';
 import 'ble_discovery_service.dart';      // ← Control Plane (discovery only)
 import 'ble_peripheral_service.dart';
@@ -83,6 +88,12 @@ class ConnectionManager {
   final RoutingManager _routingManager = RoutingManager();
   final TransportManager _transportManager = TransportManager();
 
+  // ── DTN mesh layer ────────────────────────────────────────────────
+  MeshHandler? _meshHandler;
+  final PeerDiscovery _peerDiscovery = PeerDiscovery.instance;
+  DtnRetryLoop? _dtnRetryLoop;
+  StreamSubscription<String>? _meshDeliveredSubscription;
+
   // ── State ─────────────────────────────────────────────────────────
   ConnectionType _currentConnectionType = ConnectionType.none;
 
@@ -94,24 +105,35 @@ class ConnectionManager {
 
   // ── Auto-reconnect state ──────────────────────────────────────────
   /// Last device we had a full SOCKET_CONNECTED session with.
-  /// Preserved across unexpected disconnects; cleared only on user-initiated
-  /// [disconnect] or when [connectToDevice] is called for a different peer.
   DeviceModel? _lastConnectedDevice;
 
-  /// Set to [true] just before a user-initiated [disconnect].
-  /// Tells [_handleWifiDirectState] NOT to trigger auto-reconnect.
   bool _userInitiatedDisconnect = false;
-
-  /// Exponential-backoff timer driving auto-reconnect attempts.
   Timer? _reconnectTimer;
-
-  /// Number of consecutive auto-reconnect attempts (reset to 0 on success).
   int _reconnectAttempt = 0;
 
-  /// [true] while the manager is trying to restore a lost connection.
+  /// Hard cap on auto-reconnect before giving up and showing an error.
+  static const int _maxReconnectAttempts = 8;
+
   bool get isReconnecting =>
       _reconnectTimer != null ||
       (_lastConnectedDevice != null && _reconnectAttempt > 0);
+
+  // ── Connection timeout ────────────────────────────────────────────
+  /// Fires if the TCP socket has not opened within [_connectionTimeoutSeconds].
+  Timer? _connectionTimeoutTimer;
+
+  /// Seconds before a pending connection attempt is abandoned automatically.
+  static const int _connectionTimeoutSeconds = 30;
+
+  /// Display name of the peer we are actively trying to connect to.
+  /// Consumed by the UI to populate the "Connecting to …" stop-dialog.
+  String? _connectingPeerName;
+  String? get connectingPeerName => _connectingPeerName;
+
+  /// Last human-readable failure reason.
+  /// Read by [ConnectionNotifier] to surface descriptive error messages.
+  String? _lastConnectionError;
+  String? get lastConnectionError => _lastConnectionError;
 
   // ── Streams (exposed to UI / providers) ──────────────────────────
   final _connectionController =
@@ -179,6 +201,29 @@ class ConnectionManager {
       final deviceUuid = DeviceStorage.getDeviceId();
       final wifiInitialized =
           await _wifiDirectService.initialize(deviceUuid: deviceUuid);
+
+      // ── DTN Mesh layer ────────────────────────────────────────────
+      final myUuid = DeviceStorage.getDeviceId();
+      _meshHandler = MeshHandler(
+        myUserId: myUuid,
+        sendViaTransport: (wireData) => _wifiDirectService.sendMessage(wireData),
+      );
+
+      // Delivered packets (converted to MessageModel JSON) → UI pipeline
+      _meshDeliveredSubscription?.cancel();
+      _meshDeliveredSubscription =
+          _meshHandler!.deliveredMessages.listen((json) {
+        _messageController.add(json);
+      });
+
+      // Route advert on every new peer connection
+      _peerDiscovery.onPeerAdded = (peer) {
+        unawaited(_meshHandler!.sendRouteAdvert(peer));
+      };
+
+      // Start background DTN retry loop
+      _dtnRetryLoop = DtnRetryLoop(meshHandler: _meshHandler!);
+      _dtnRetryLoop!.start();
 
       // ── RoutingManager: locally delivered messages ────────────────
       _routingManager.localMessages.listen((message) {
@@ -295,6 +340,10 @@ class ConnectionManager {
 
       if (state.connected && state.socketActive) {
         // ── Socket open ────────────────────────────────────────────
+        // Cancel the 30-second watchdog — we made it in time.
+        _cancelConnectionTimeout();
+        _connectingPeerName = null;
+
         // Always send a UUID handshake so the RECEIVING side (which never
         // called connectToDevice) can learn our UUID before chat opens.
         _sendUuidHandshake();
@@ -393,6 +442,11 @@ class ConnectionManager {
 
           final idToRemove = _connectedPeerId ?? '__uuid_pending__';
           _transportManager.removeNeighbor(idToRemove);
+
+          // Remove from DTN peer discovery
+          if (_connectedPeerId != null) {
+            _peerDiscovery.removePeer(_connectedPeerId!);
+          }
 
           _currentConnectionType = ConnectionType.none;
           _connectedDevice = null;
@@ -520,6 +574,14 @@ class ConnectionManager {
           displayName: peerName,
         ));
 
+        // Register in DTN peer discovery (triggers route advert)
+        final ipAddr = lastState.ipAddress ?? senderUuid;
+        _peerDiscovery.addPeer(PeerInfo(
+          userId: senderUuid,
+          address: ipAddr,
+          transport: 'wifi_direct',
+        ));
+
         // Flush any pending messages for this peer
         unawaited(_syncPendingMessages(senderUuid));
       } else {
@@ -540,6 +602,15 @@ class ConnectionManager {
         Logger.info(
             'ConnectionManager: peer confirmed UUID handshake '
             '(our _connectedPeerId=${_connectedPeerId!})');
+
+        // Register in DTN peer discovery (triggers route advert)
+        final lastState2 = _wifiDirectService.lastKnownState;
+        final ipAddr2 = lastState2.ipAddress ?? _connectedPeerId!;
+        _peerDiscovery.addPeer(PeerInfo(
+          userId: _connectedPeerId!,
+          address: ipAddr2,
+          transport: 'wifi_direct',
+        ));
 
         // Flush pending messages now that the socket is confirmed open
         unawaited(_syncPendingMessages(_connectedPeerId!));
@@ -790,12 +861,16 @@ class ConnectionManager {
         _cancelReconnect();
       }
 
+      _connectingPeerName = device.name;
+      _lastConnectionError = null;
       _connectionController.add(ConnectionState.connecting);
       Logger.info(
           'ConnectionManager: initiating Wi-Fi Direct connection to "${device.name}"');
 
+      // Start watchdog: if socket is not open within 30 s, emit error.
+      _startConnectionTimeout(device.name);
+
       // Store the peer UUID — this is the single authoritative identity key.
-      // UUID comes from BLE discovery; it is never a MAC address.
       _connectedPeerId = device.id;
 
       // Store display name
@@ -907,14 +982,25 @@ class ConnectionManager {
   /// "larger UUID" device initiate, and the "smaller UUID" device receives the
   /// incoming invitation passively — avoiding the collision.
   void _scheduleReconnect() {
-    // Guard: prevent duplicate timers.  removeGroupAfterError() in Kotlin causes
-    // a second CONNECTION_CHANGED disconnect event which calls _scheduleReconnect
-    // again.  If a timer is already pending, the second call is a no-op.
     if (_reconnectTimer != null) {
-      Logger.info(
-          'ConnectionManager: reconnect already scheduled — ignoring duplicate trigger');
+      Logger.info('ConnectionManager: reconnect already scheduled — ignoring duplicate trigger');
       return;
     }
+
+    // ── Hard limit: give up after _maxReconnectAttempts ───────────────
+    if (_reconnectAttempt >= _maxReconnectAttempts) {
+      Logger.warning(
+          'ConnectionManager: reached max reconnect attempts ($_maxReconnectAttempts) '
+          '— giving up on "${_lastConnectedDevice?.name}"');
+      _lastConnectionError =
+          'Could not reconnect to "${_lastConnectedDevice?.name}" '
+          'after $_maxReconnectAttempts attempts.';
+      _lastConnectedDevice = null;
+      _reconnectAttempt = 0;
+      _connectionController.add(ConnectionState.error);
+      return;
+    }
+
     _reconnectAttempt++;
     final baseDelay = (_reconnectAttempt * 5).clamp(5, 60);
     final myUuid   = DeviceStorage.getDeviceId();
@@ -962,6 +1048,73 @@ class ConnectionManager {
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     _reconnectAttempt = 0;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Connection timeout
+  // ═══════════════════════════════════════════════════════════════════
+
+  /// Start a [_connectionTimeoutSeconds]-second watchdog timer.
+  /// If the TCP socket is not open by the time it fires, we emit an error
+  /// and clean up — preventing the UI from spinning forever.
+  void _startConnectionTimeout(String peerName) {
+    _cancelConnectionTimeout();
+    _connectionTimeoutTimer =
+        Timer(const Duration(seconds: _connectionTimeoutSeconds), () {
+      if (!isConnected()) {
+        Logger.warning(
+            'ConnectionManager: connection to "$peerName" timed out '
+            'after ${_connectionTimeoutSeconds}s');
+        _lastConnectionError =
+            'Connection to "$peerName" timed out. '
+            'Make sure both devices have Wi-Fi Direct enabled and are in range.';
+        _cancelConnectionTimeout();
+        _cancelReconnect();
+        _userInitiatedDisconnect = true; // suppress auto-reconnect on this timeout
+        _wifiDirectService.disconnect();
+        final idToRemove = _connectedPeerId ?? '__uuid_pending__';
+        _transportManager.removeNeighbor(idToRemove);
+        if (_connectedPeerId != null) _peerDiscovery.removePeer(_connectedPeerId!);
+        _currentConnectionType = ConnectionType.none;
+        _connectedDevice = null;
+        _connectedPeerId = null;
+        _connectingPeerName = null;
+        _connectionController.add(ConnectionState.error);
+      }
+    });
+  }
+
+  void _cancelConnectionTimeout() {
+    _connectionTimeoutTimer?.cancel();
+    _connectionTimeoutTimer = null;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // User-initiated cancel (mid-connecting Stop button)
+  // ═══════════════════════════════════════════════════════════════════
+
+  /// Cancel any in-progress connection attempt.
+  /// Called when the user taps "Stop Connecting" in the UI.
+  Future<void> cancelConnection() async {
+    try {
+      Logger.info('ConnectionManager: connection cancelled by user');
+      _cancelConnectionTimeout();
+      _cancelReconnect();
+      _userInitiatedDisconnect = true;
+      _lastConnectionError = null;
+      _connectingPeerName = null;
+      await _wifiDirectService.disconnect();
+      final idToRemove = _connectedPeerId ?? '__uuid_pending__';
+      _transportManager.removeNeighbor(idToRemove);
+      if (_connectedPeerId != null) _peerDiscovery.removePeer(_connectedPeerId!);
+      _currentConnectionType = ConnectionType.none;
+      _connectedDevice = null;
+      _connectedPeerId = null;
+      _lastConnectedDevice = null; // don't auto-reconnect after a cancel
+      _connectionController.add(ConnectionState.disconnected);
+    } catch (e) {
+      Logger.error('ConnectionManager: cancelConnection error', e);
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -1058,15 +1211,26 @@ class ConnectionManager {
       // ── UUID handshake — intercept before routing ─────────────────
       if (jsonMap['__type'] == '__uuid_handshake__') {
         _handleUuidHandshake(jsonMap);
-        return; // Do NOT route to RoutingManager or ChatNotifier
+        return;
       }
 
-      // ── Delivery ACK — intercept before routing ────────────────────
+      // ── Delivery ACK (legacy path) — intercept before routing ─────
       if (jsonMap['__type'] == '__delivery_ack__') {
         _handleDeliveryAck(jsonMap);
         return;
       }
 
+      // ── MessagePacket (DTN format) → MeshHandler ──────────────────
+      // Detect by presence of 'msgId' + 'toUserId' fields.
+      if (MessagePacket.looksLikePacket(jsonMap)) {
+        unawaited(_meshHandler?.onRawReceived(
+          message,
+          currentPeers: _peerDiscovery.currentPeers,
+        ));
+        return;
+      }
+
+      // ── Legacy MessageModel format → RoutingManager ───────────────
       final messageModel = MessageModel.fromJson(jsonMap);
       unawaited(_routingManager.routeMessage(
         messageModel,
@@ -1100,6 +1264,27 @@ class ConnectionManager {
 
   bool isConnected() => _currentConnectionType == ConnectionType.wifiDirect &&
       _wifiDirectService.isFullyConnected;
+
+  // ═══════════════════════════════════════════════════════════════════
+  // DTN routing — send a MessagePacket through the mesh layer
+  // ═══════════════════════════════════════════════════════════════════
+
+  /// Route a new outbound [MessagePacket] created by the local user.
+  ///
+  /// Uses [MeshHandler] + [RoutingEngine] to decide: direct send, relay,
+  /// or buffer in [DtnQueue] for when a peer comes into range.
+  ///
+  /// Returns true if sent over the air now; false if queued in DTN.
+  Future<bool> routePacket(MessagePacket packet) async {
+    if (_meshHandler == null) {
+      Logger.warning('ConnectionManager: MeshHandler not ready — cannot route packet');
+      return false;
+    }
+    return await _meshHandler!.sendMessage(
+      packet: packet,
+      currentPeers: _peerDiscovery.currentPeers,
+    );
+  }
 
   Stream<List<DeviceModel>> getDiscoveredDevices() =>
       _deviceStreamController.stream;
@@ -1474,6 +1659,9 @@ class ConnectionManager {
   // ═══════════════════════════════════════════════════════════════════
 
   void dispose() {
+    _dtnRetryLoop?.stop();
+    _meshDeliveredSubscription?.cancel();
+    _meshHandler?.dispose();
     _bleDiscoveryService.dispose();
     _wifiDirectService.dispose();
     _blePeripheralService.dispose();
@@ -1489,6 +1677,7 @@ class ConnectionManager {
     _deviceStreamController.close();
     _invitationController.close();
     _transportManager.dispose();
+    _peerDiscovery.dispose();
   }
 
   // ═══════════════════════════════════════════════════════════════════
