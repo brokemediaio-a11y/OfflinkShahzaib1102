@@ -33,8 +33,14 @@ class DtnRetryLoop {
 
   Future<void> _tick() async {
     try {
+      // ── Housekeeping runs ALWAYS, regardless of peer presence ──
+      await DtnQueue.purgeExpired();
+      await RoutingEngine.evictStaleRoutes();
+      await SeenCache.evictExpired();
+
+      // ── Delivery retries only when peers are available ──
       final peers = PeerDiscovery.instance.currentPeers;
-      if (peers.isEmpty) return; // nothing to do without peers
+      if (peers.isEmpty) return;
 
       final pending = await DtnQueue.getPendingPackets();
       if (pending.isEmpty) return;
@@ -47,11 +53,6 @@ class DtnRetryLoop {
         final sent = await meshHandler.forward(packet, peers);
         await DtnQueue.recordAttempt(packet.msgId, delivered: sent);
       }
-
-      // Housekeeping
-      await DtnQueue.purgeExpired();
-      await RoutingEngine.evictStaleRoutes();
-      await SeenCache.evictExpired();
     } catch (e) {
       Logger.error('[DtnRetryLoop] Error during tick', e);
     }

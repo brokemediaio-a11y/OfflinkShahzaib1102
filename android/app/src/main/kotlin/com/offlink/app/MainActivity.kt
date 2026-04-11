@@ -32,6 +32,10 @@ class MainActivity : FlutterActivity() {
     private val wifiDirectInvitationChannelName = "com.offlink.wifi_direct/invitation"
     private val wifiDirectDiscoveredServicesChannelName = "com.offlink.wifi_direct/discovered_services"
 
+    // ── Presence Tracker channel names ────────────────────────────────
+    private val presenceMethodChannelName = "com.offlink.presence"
+    private val presenceEventChannelName = "com.offlink.presence/events"
+
     private val blePeripheralManager by lazy { BlePeripheralManager(applicationContext) }
     private val classicBluetoothManager by lazy { ClassicBluetoothManager(applicationContext) }
     private val wifiDirectManager by lazy { WifiDirectManager(applicationContext) }
@@ -47,6 +51,8 @@ class MainActivity : FlutterActivity() {
     private var wifiDirectPeersSink: EventChannel.EventSink? = null
     private var wifiDirectInvitationSink: EventChannel.EventSink? = null
     private var wifiDirectDiscoveredServicesSink: EventChannel.EventSink? = null
+    // ── Presence Tracker event sink ───────────────────────────────────
+    private var presenceEventSink: EventChannel.EventSink? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -517,9 +523,59 @@ class MainActivity : FlutterActivity() {
                 wifiDirectManager.discoveredServicesListener = null
             }
         })
+
+        // ── Presence Tracker Method Channel ──────────────────────────────
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, presenceMethodChannelName)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "startPresenceTracking" -> {
+                        val contactUuids = call.argument<List<String>>("contactUuids") ?: emptyList()
+                        PresenceTracker.updateWatchedContacts(contactUuids)
+                        val intent = android.content.Intent(this, PresenceTracker::class.java)
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            startForegroundService(intent)
+                        } else {
+                            startService(intent)
+                        }
+                        result.success(true)
+                    }
+                    "stopPresenceTracking" -> {
+                        val intent = android.content.Intent(this, PresenceTracker::class.java)
+                        stopService(intent)
+                        result.success(true)
+                    }
+                    "updateWatchedContacts" -> {
+                        val contactUuids = call.argument<List<String>>("contactUuids") ?: emptyList()
+                        PresenceTracker.updateWatchedContacts(contactUuids)
+                        result.success(true)
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+
+        // ── Presence Tracker Event Channel ───────────────────────────────
+        EventChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            presenceEventChannelName
+        ).setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(arguments: Any?, events: EventChannel.EventSink) {
+                presenceEventSink = events
+                PresenceTracker.presenceListener = { event ->
+                    mainHandler.post { presenceEventSink?.success(event) }
+                }
+            }
+            override fun onCancel(arguments: Any?) {
+                presenceEventSink = null
+                PresenceTracker.presenceListener = null
+            }
+        })
     }
 
     override fun onDestroy() {
+        // Stop presence tracking service
+        val presenceIntent = android.content.Intent(this, PresenceTracker::class.java)
+        stopService(presenceIntent)
+
         blePeripheralManager.shutdown()
         classicBluetoothManager.shutdown()
         wifiDirectManager.shutdown()

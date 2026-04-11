@@ -11,6 +11,7 @@ import '../../services/communication/connection_manager.dart';
 import '../../utils/logger.dart';
 import '../chat/chat_screen.dart';
 import '../connection/connection_status_screen.dart';
+import '../contacts/contact_book_screen.dart';
 import '../messages/messages_screen.dart';
 import '../settings/edit_name_dialog.dart';
 
@@ -283,6 +284,15 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 final connectionManager = ConnectionManager();
                 await connectionManager.restartAdvertising();
               }
+            },
+          ),
+          IconButton(
+            icon: const Icon(Icons.contacts),
+            tooltip: 'Contact Book',
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const ContactBookScreen()),
+              );
             },
           ),
           IconButton(

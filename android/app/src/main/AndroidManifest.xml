@@ -28,7 +28,11 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- Required by WifiP2pManager to bring up/down the Wi-Fi Direct network interface -->
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
-    
+    <!-- Foreground service for presence tracking (BLE scanning in background) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:label="OFFLINK"
         android:name="${applicationName}"
@@ -50,6 +54,12 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <!-- PresenceTracker foreground service for BLE presence scanning -->
+        <service
+            android:name=".PresenceTracker"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
