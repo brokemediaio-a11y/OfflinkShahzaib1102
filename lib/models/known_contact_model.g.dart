@@ -21,13 +21,15 @@ class KnownContactAdapter extends TypeAdapter<KnownContact> {
       displayName: fields[1] as String,
       deviceAddress: fields[2] as String?,
       lastSeen: fields[3] as DateTime,
+      addedVia: fields[4] as String? ?? 'discovery',
+      avatarHash: fields[5] as String?,
     );
   }
 
   @override
   void write(BinaryWriter writer, KnownContact obj) {
     writer
-      ..writeByte(4)
+      ..writeByte(6)
       ..writeByte(0)
       ..write(obj.peerId)
       ..writeByte(1)
@@ -35,7 +37,11 @@ class KnownContactAdapter extends TypeAdapter<KnownContact> {
       ..writeByte(2)
       ..write(obj.deviceAddress)
       ..writeByte(3)
-      ..write(obj.lastSeen);
+      ..write(obj.lastSeen)
+      ..writeByte(4)
+      ..write(obj.addedVia)
+      ..writeByte(5)
+      ..write(obj.avatarHash);
   }
 
   @override

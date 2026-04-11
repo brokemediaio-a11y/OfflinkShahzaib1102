@@ -29,11 +29,14 @@ class KnownContactsStorage {
   /// Save or update a known contact.
   ///
   /// If the peer already exists, updates displayName, deviceAddress, and lastSeen.
-  /// If new, creates a new entry.
+  /// If new, creates a new entry. Contacts are never auto-removed — only
+  /// explicit [deleteContact] removes them.
   static Future<void> saveContact({
     required String peerId,
     required String displayName,
     String? deviceAddress,
+    String addedVia = 'discovery',
+    String? avatarHash,
   }) async {
     try {
       if (_box == null) return;
@@ -43,10 +46,13 @@ class KnownContactsStorage {
 
       final existing = _box!.get(peerId);
       if (existing != null) {
-        // Update existing contact
+        // Update existing contact — preserve addedVia from original save
         existing.displayName = displayName;
         if (deviceAddress != null && deviceAddress.isNotEmpty) {
           existing.deviceAddress = deviceAddress;
+        }
+        if (avatarHash != null) {
+          existing.avatarHash = avatarHash;
         }
         existing.lastSeen = DateTime.now();
         await existing.save();
@@ -58,13 +64,25 @@ class KnownContactsStorage {
           displayName: displayName,
           deviceAddress: deviceAddress,
           lastSeen: DateTime.now(),
+          addedVia: addedVia,
+          avatarHash: avatarHash,
         );
         await _box!.put(peerId, contact);
         Logger.info(
-            'KnownContactsStorage: ✨ new contact saved — $peerId ($displayName)');
+            'KnownContactsStorage: ✨ new contact saved — $peerId ($displayName) via $addedVia');
       }
     } catch (e) {
       Logger.error('KnownContactsStorage: error saving contact $peerId', e);
+    }
+  }
+
+  /// Permanently delete a contact. Only called by explicit user action.
+  static Future<void> deleteContact(String peerId) async {
+    try {
+      await _box?.delete(peerId);
+      Logger.info('KnownContactsStorage: deleted contact $peerId');
+    } catch (e) {
+      Logger.error('KnownContactsStorage: error deleting contact $peerId', e);
     }
   }
 

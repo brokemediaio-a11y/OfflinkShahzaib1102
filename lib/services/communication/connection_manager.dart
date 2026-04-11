@@ -18,7 +18,9 @@ import '../routing/routing_manager.dart';
 import '../mesh_handler.dart';
 import '../peer_discovery.dart';
 import '../dtn_retry_loop.dart';
+import '../dtn_queue.dart';
 import '../routing_engine.dart';
+import '../presence_service.dart';
 import 'transport_manager.dart';
 import 'ble_discovery_service.dart';      // ← Control Plane (discovery only)
 import 'ble_peripheral_service.dart';
@@ -72,6 +74,9 @@ class ConnectionManager {
         _bleDiscoveryService.discoveredDevices.listen((devices) {
       _bleDevices = devices;
       _emitDiscoveredDevices();
+      // Check if any newly discovered peer has pending DTN messages
+      // and silently connect to deliver them (T2 fix).
+      unawaited(_checkAndAutoConnectForPendingMessages(devices));
     });
 
     // ── Native scan results (TECNO / problematic-device fallback) ──
@@ -318,6 +323,8 @@ class ConnectionManager {
         if (bleInitialized) {
           unawaited(_ensurePeripheralStarted());
         }
+        // Start presence tracking for saved contacts (Feature 4)
+        unawaited(_startPresenceTracking());
       }
 
       return initialized;
@@ -446,6 +453,8 @@ class ConnectionManager {
           // Remove from DTN peer discovery
           if (_connectedPeerId != null) {
             _peerDiscovery.removePeer(_connectedPeerId!);
+            // Stamp lastSeen so contact book shows accurate "last seen X ago"
+            unawaited(KnownContactsStorage.updateLastSeen(_connectedPeerId!));
           }
 
           _currentConnectionType = ConnectionType.none;
@@ -827,6 +836,39 @@ class ConnectionManager {
   /// the data-plane connection is always Wi-Fi Direct.
   Future<bool> connectToDevice(DeviceModel device) async {
     try {
+      // ── Guard: connected to a DIFFERENT peer — disconnect first ───────
+      // Android Wi-Fi Direct supports only one active P2P group at a time.
+      // When the Kotlin layer is in SOCKET_CONNECTED state, connectToPeer()
+      // returns {"duplicate": true} without invoking WifiP2pManager.connect(),
+      // so the new peer never receives an invitation.
+      //
+      // Fix: tear down the current link before starting the new negotiation.
+      // We send a graceful-disconnect frame so the old peer suppresses its
+      // auto-reconnect, wait for the group to dissolve (1.5 s), then proceed.
+      if (isConnected() && _connectedPeerId != null && _connectedPeerId != device.id) {
+        Logger.info(
+            'ConnectionManager: switching peer — disconnecting from '
+            '"${_connectedDevice?.name ?? _connectedPeerId}" '
+            'before connecting to "${device.name}"');
+        await _sendGracefulDisconnect();
+        _userInitiatedDisconnect = true;
+        _lastConnectedDevice = null;  // suppress auto-reconnect to old peer
+        _cancelReconnect();
+        await _wifiDirectService.disconnect();
+        if (_connectedPeerId != null) {
+          _transportManager.removeNeighbor(_connectedPeerId!);
+          _peerDiscovery.removePeer(_connectedPeerId!);
+          unawaited(KnownContactsStorage.updateLastSeen(_connectedPeerId!));
+        }
+        _currentConnectionType = ConnectionType.none;
+        _connectedDevice = null;
+        _connectedPeerId = null;
+        // Give Android time to fully dissolve the P2P group before we
+        // request a new one; without this the new connect() call races
+        // with the teardown broadcast and is silently ignored.
+        await Future.delayed(const Duration(milliseconds: 1500));
+      }
+
       // ── Guard: already connected to the same peer ─────────────────
       // This can happen when the native layer reconnects passively BEFORE
       // the Dart-side reconnect timer or the chat-screen "Reconnect" button
@@ -938,9 +980,26 @@ class ConnectionManager {
     }
   }
 
+  /// Send a graceful disconnect notification to the peer so they suppress
+  /// auto-reconnect on their side.
+  Future<void> _sendGracefulDisconnect() async {
+    if (_connectedPeerId == null) return;
+    try {
+      final msg = jsonEncode({'__type': '__graceful_disconnect__'});
+      await _wifiDirectService.sendMessage(msg);
+      // Small delay so the frame can flush before socket closes
+      await Future.delayed(const Duration(milliseconds: 150));
+    } catch (_) {
+      // Best-effort — ignore errors, we're disconnecting anyway
+    }
+  }
+
   /// Disconnect from the current Wi-Fi Direct peer.
   Future<void> disconnect() async {
     try {
+      // Send graceful notice FIRST so the peer suppresses auto-reconnect.
+      await _sendGracefulDisconnect();
+
       // Mark as user-initiated BEFORE calling the native layer so that the
       // resulting CONNECTION_CHANGED broadcast doesn't trigger auto-reconnect.
       _userInitiatedDisconnect = true;
@@ -1079,6 +1138,7 @@ class ConnectionManager {
         _connectedDevice = null;
         _connectedPeerId = null;
         _connectingPeerName = null;
+        _lastConnectedDevice = null; // prevent auto-reconnect after timeout
         _connectionController.add(ConnectionState.error);
       }
     });
@@ -1100,6 +1160,7 @@ class ConnectionManager {
       Logger.info('ConnectionManager: connection cancelled by user');
       _cancelConnectionTimeout();
       _cancelReconnect();
+      await _sendGracefulDisconnect();
       _userInitiatedDisconnect = true;
       _lastConnectionError = null;
       _connectingPeerName = null;
@@ -1195,7 +1256,7 @@ class ConnectionManager {
   // Incoming message handler
   // ═══════════════════════════════════════════════════════════════════
 
-  void _handleIncomingMessage(String message) {
+  Future<void> _handleIncomingMessage(String message) async {
     try {
       Logger.info('ConnectionManager: handling incoming message');
 
@@ -1214,6 +1275,16 @@ class ConnectionManager {
         return;
       }
 
+      // ── Graceful disconnect — peer is intentionally closing ───────
+      // Suppress auto-reconnect so we don't keep pestering the peer.
+      if (jsonMap['__type'] == '__graceful_disconnect__') {
+        Logger.info('ConnectionManager: peer sent graceful disconnect — suppressing auto-reconnect');
+        _userInitiatedDisconnect = true;
+        _lastConnectedDevice = null;
+        _cancelReconnect();
+        return;
+      }
+
       // ── Delivery ACK (legacy path) — intercept before routing ─────
       if (jsonMap['__type'] == '__delivery_ack__') {
         _handleDeliveryAck(jsonMap);
@@ -1221,21 +1292,29 @@ class ConnectionManager {
       }
 
       // ── MessagePacket (DTN format) → MeshHandler ──────────────────
-      // Detect by presence of 'msgId' + 'toUserId' fields.
+      // Detect by presence of 'msgId' + 'toUserId' + 'ttl' + 'type' fields.
       if (MessagePacket.looksLikePacket(jsonMap)) {
-        unawaited(_meshHandler?.onRawReceived(
-          message,
-          currentPeers: _peerDiscovery.currentPeers,
-        ));
+        try {
+          await _meshHandler?.onRawReceived(
+            message,
+            currentPeers: _peerDiscovery.currentPeers,
+          );
+        } catch (e, st) {
+          Logger.error('ConnectionManager: MeshHandler.onRawReceived failed', e, st);
+        }
         return;
       }
 
       // ── Legacy MessageModel format → RoutingManager ───────────────
       final messageModel = MessageModel.fromJson(jsonMap);
-      unawaited(_routingManager.routeMessage(
-        messageModel,
-        senderPeerId: _connectedPeerId,
-      ));
+      try {
+        await _routingManager.routeMessage(
+          messageModel,
+          senderPeerId: _connectedPeerId,
+        );
+      } catch (e, st) {
+        Logger.error('ConnectionManager: RoutingManager.routeMessage failed', e, st);
+      }
     } catch (e, st) {
       Logger.error(
           'ConnectionManager: error handling incoming message', e, st);
@@ -1713,30 +1792,69 @@ class ConnectionManager {
 
   /// Flush pending messages to a newly connected peer.
   ///
-  /// Sends all pending messages via Wi-Fi Direct.  RoutingManager on the
-  /// remote side will either deliver locally (if that device is the
-  /// final receiver) or relay further.
+  /// Only sends messages destined for [connectedPeerId] (direct delivery)
+  /// or messages that need relay via this peer. Does NOT send all buffered
+  /// messages to every peer — that was a privacy leak.
+  ///
+  /// Uses the DTN queue (DtnQueue) as the single source of truth for
+  /// buffered messages. PendingMessageStorage (Hive) is the legacy path.
   Future<void> _syncPendingMessages(String connectedPeerId) async {
-    final pending = PendingMessageStorage.getAllPendingMessages();
-    if (pending.isEmpty) {
+    // ── Primary path: DtnQueue (SQLite) ───────────────────────────
+    final dtnPending = await DtnQueue.getPendingPackets();
+    final relevant = dtnPending.where((pkt) =>
+        pkt.toUserId == connectedPeerId).toList();
+
+    if (relevant.isEmpty) {
       Logger.info(
-          'ConnectionManager: no pending messages to sync for $connectedPeerId');
-      return;
+          'ConnectionManager: no pending DTN messages for $connectedPeerId');
+    } else {
+      Logger.info(
+          'ConnectionManager: syncing ${relevant.length} DTN packet(s) '
+          'to newly connected peer $connectedPeerId');
+
+      int synced = 0;
+      for (final packet in relevant) {
+        try {
+          final sent = await _wifiDirectService.sendMessage(packet.toWire());
+          if (sent) {
+            synced++;
+            await DtnQueue.recordAttempt(packet.msgId, delivered: true);
+            Logger.debug(
+                'ConnectionManager: synced DTN packet '
+                '${packet.msgId} → $connectedPeerId');
+          }
+        } catch (e) {
+          Logger.error(
+              'ConnectionManager: error syncing DTN packet ${packet.msgId}', e);
+        }
+      }
+      Logger.info(
+          'ConnectionManager: DTN sync complete — $synced/${relevant.length} '
+          'packet(s) forwarded to $connectedPeerId');
     }
 
-    Logger.info(
-        'ConnectionManager: syncing ${pending.length} pending message(s) '
-        'to newly connected peer $connectedPeerId');
+    // ── Legacy path: PendingMessageStorage (Hive) ─────────────────
+    // Only sync messages destined for this specific peer.
+    final hivePending = PendingMessageStorage.getAllPendingMessages();
+    final hiveRelevant = hivePending.where((msg) =>
+        msg.receiverId == connectedPeerId).toList();
 
-    int synced = 0;
-    for (final message in pending) {
+    if (hiveRelevant.isEmpty) return;
+
+    Logger.info(
+        'ConnectionManager: syncing ${hiveRelevant.length} legacy pending '
+        'message(s) to $connectedPeerId');
+
+    int legacySynced = 0;
+    for (final message in hiveRelevant) {
       try {
         final messageJson = jsonEncode(message.toJson());
         final sent = await _wifiDirectService.sendMessage(messageJson);
         if (sent) {
-          synced++;
+          legacySynced++;
+          await PendingMessageStorage.removePendingMessage(message.messageId);
           Logger.debug(
-              'ConnectionManager: synced pending message '
+              'ConnectionManager: synced legacy message '
               '${message.messageId} → $connectedPeerId');
         }
       } catch (e) {
@@ -1746,8 +1864,60 @@ class ConnectionManager {
     }
 
     Logger.info(
-        'ConnectionManager: sync complete — $synced/${pending.length} '
+        'ConnectionManager: legacy sync complete — $legacySynced/${hiveRelevant.length} '
         'message(s) forwarded to $connectedPeerId');
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // DTN auto-connect: silently connect when BLE sees a peer with pending msgs
+  // ═══════════════════════════════════════════════════════════════════
+
+  /// Called every time BLE discovers a batch of devices.
+  /// If any device has pending DTN messages and we're not already connected,
+  /// silently initiate a Wi-Fi Direct connection to flush the queue (T2).
+  Future<void> _checkAndAutoConnectForPendingMessages(
+      List<DeviceModel> discoveredDevices) async {
+    // Don't interrupt an existing connection or connecting attempt.
+    if (isConnected() || _currentConnectionType != ConnectionType.none) return;
+    // Don't auto-connect if user explicitly cancelled / disconnected recently.
+    if (_userInitiatedDisconnect) return;
+
+    try {
+      final pending = await DtnQueue.getPendingPackets();
+      if (pending.isEmpty) return;
+
+      // Build a set of peer UUIDs that have pending outbound messages.
+      final pendingTargets = pending.map((p) => p.toUserId).toSet();
+
+      // Check if any currently visible BLE device is a pending target.
+      for (final device in discoveredDevices) {
+        if (pendingTargets.contains(device.id)) {
+          Logger.info(
+              '[DTN] BLE rediscovered ${device.name} (${device.id}) '
+              'with ${pending.where((p) => p.toUserId == device.id).length} '
+              'pending message(s) — auto-connecting to deliver');
+          // connectToDevice is safe to call: it guards against double-invocation.
+          unawaited(connectToDevice(device));
+          return; // only connect to one peer at a time
+        }
+      }
+    } catch (e) {
+      Logger.error('[DTN] Error in auto-connect check', e);
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Feature 4: Presence Tracking
+  // ═══════════════════════════════════════════════════════════════════
+
+  /// Start the background BLE presence scanner for saved contacts.
+  /// Safe to call multiple times — will no-op if already tracking.
+  Future<void> _startPresenceTracking() async {
+    try {
+      await PresenceService.instance.startTracking();
+    } catch (e) {
+      Logger.error('ConnectionManager: error starting presence tracking', e);
+    }
   }
 
   // ── Storage helper (inline, avoids extra import) ───────────────────

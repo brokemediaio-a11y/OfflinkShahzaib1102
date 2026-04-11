@@ -52,7 +52,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   }
 
   void _dismissReconnectDialog() {
-    if (!_reconnectDialogOpen) return;
+    // Always clear the flag — regardless of whether the dialog is physically open.
+    // Removes the race condition where connected state fires before the dialog
+    // finishes opening (and the old guard caused a permanent stuck dialog).
     _reconnectDialogOpen = false;
     if (mounted && Navigator.of(context).canPop()) {
       Navigator.of(context).pop();
@@ -84,7 +86,24 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     if (!mounted) return;
 
     if (started) {
-      _showReconnectingDialog();
+      // Re-read state AFTER connectToDevice() returns.
+      //
+      // connectToDevice() may re-emit ConnectionState.connected synchronously
+      // (e.g. when the peer was already connected, or when the native layer
+      // re-established the link during the await). In that case ref.listen
+      // fires BEFORE this point — there is no dialog open yet, so the dismiss
+      // call inside the listener is a no-op, and the dialog would be stuck
+      // forever if we unconditionally call _showReconnectingDialog() here.
+      //
+      // Solution: check current state immediately after the await and only
+      // show the dialog if we are still in the connecting/not-yet-connected
+      // state.
+      final stateAfter = ref.read(connectionProvider);
+      final alreadyConnected = stateAfter.state == ConnectionStateType.connected &&
+          stateAfter.connectedDevice?.id == widget.device.id;
+      if (!alreadyConnected) {
+        _showReconnectingDialog();
+      }
     } else {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -141,15 +160,33 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     final chatState = ref.watch(chatProvider(widget.device.id));
     final connectionState = ref.watch(connectionProvider);
 
-    final isConnected =
-        connectionState.state == ConnectionStateType.connected;
-    final isConnecting =
-        connectionState.state == ConnectionStateType.connecting;
+    // Only count as "connected" if the active connection is specifically to THIS device.
+    // Prevents showing "Connected" in B's chat while A is actually connected to C.
+    final isConnectedToThis =
+        connectionState.state == ConnectionStateType.connected &&
+        connectionState.connectedDevice?.id == widget.device.id;
+
+    // Safety dismiss: guard against the async race where connected state was
+    // re-emitted inside connectToDevice() (before our await returned), causing
+    // ref.listen to fire with no dialog on screen.  If we are now connected to
+    // this peer AND the dialog flag is still set, close it on the next frame.
+    if (isConnectedToThis && _reconnectDialogOpen) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _dismissReconnectDialog());
+    }
+
+    // Show connecting spinner only when an attempt is in flight.
+    // If connected to a DIFFERENT device, treat this chat as offline (not connecting).
+    final isConnecting = connectionState.state == ConnectionStateType.connecting;
 
     // Dismiss reconnect dialog when socket opens or attempt ends.
     ref.listen<ConnectionProviderState>(connectionProvider, (prev, next) {
       if (!mounted) return;
-      if (next.state == ConnectionStateType.connected) {
+
+      final nowConnectedToThis =
+          next.state == ConnectionStateType.connected &&
+          next.connectedDevice?.id == widget.device.id;
+
+      if (nowConnectedToThis) {
         _dismissReconnectDialog();
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -204,7 +241,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     // Connection status label
     String statusLabel;
     Color statusColor;
-    if (isConnected) {
+    if (isConnectedToThis) {
       statusLabel = AppStrings.connected;
       statusColor = Colors.green;
     } else if (isConnecting) {
@@ -240,7 +277,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         backgroundColor: AppColors.primary,
         foregroundColor: AppColors.textLight,
         actions: [
-          if (!isConnected && !isConnecting)
+          if (!isConnectedToThis && !isConnecting)
             IconButton(
               icon: const Icon(Icons.bluetooth_searching),
               tooltip: 'Connect',
@@ -251,7 +288,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       body: Column(
         children: [
           // ── Offline banner ────────────────────────────────────────
-          if (!isConnected && !isConnecting)
+          if (!isConnectedToThis && !isConnecting)
             Container(
               width: double.infinity,
               padding:
@@ -293,7 +330,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                             color: AppColors.textSecondary,
                           ),
                         ),
-                        if (!isConnected) ...[
+                        if (!isConnectedToThis) ...[
                           const SizedBox(height: 8),
                           Text(
                             'Send a message — it will be delivered when\nthe peer comes into range.',
@@ -338,7 +375,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                     child: TextField(
                       controller: _messageController,
                       decoration: InputDecoration(
-                        hintText: isConnected
+                        hintText: isConnectedToThis
                             ? AppStrings.typeMessage
                             : 'Type a message (will queue if offline)…',
                         border: OutlineInputBorder(

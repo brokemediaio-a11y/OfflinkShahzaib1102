@@ -2,6 +2,13 @@
 ///
 /// Transport-agnostic: the routing layer never inspects transport details.
 /// The transport layer uses this model to route bytes to the right service.
+///
+/// ## Feature 2: Multi-Device Connections
+///
+/// Each peer connection independently negotiates its best available transport.
+/// Connection priority: WiFi Direct (highest throughput) → BLE → Classic Bluetooth.
+/// The [ConnectionPool] (TransportManager._neighbors) maintains a map of
+/// deviceUUID → PeerConnection supporting multiple simultaneous peers.
 class PeerConnection {
   /// Unique identifier for the peer (device UUID).
   final String peerId;
@@ -32,6 +39,9 @@ class PeerConnection {
   /// ready for bidirectional message exchange.
   final bool socketActive;
 
+  /// Connection state for this specific peer session.
+  final PeerConnectionState connectionState;
+
   PeerConnection({
     required this.peerId,
     required this.transportType,
@@ -40,6 +50,7 @@ class PeerConnection {
     this.connectionObject,
     this.ipAddress,
     this.socketActive = false,
+    this.connectionState = PeerConnectionState.connected,
   });
 
   /// Create a copy with selectively overridden fields.
@@ -51,6 +62,7 @@ class PeerConnection {
     Object? connectionObject,
     String? ipAddress,
     bool? socketActive,
+    PeerConnectionState? connectionState,
   }) {
     return PeerConnection(
       peerId: peerId ?? this.peerId,
@@ -60,6 +72,7 @@ class PeerConnection {
       connectionObject: connectionObject ?? this.connectionObject,
       ipAddress: ipAddress ?? this.ipAddress,
       socketActive: socketActive ?? this.socketActive,
+      connectionState: connectionState ?? this.connectionState,
     );
   }
 
@@ -137,4 +150,43 @@ enum ConnectionRole {
 
   /// They initiated / we are hosting — BLE Peripheral, Wi-Fi Direct Group Owner.
   peripheral,
+}
+
+// ── Peer connection state ────────────────────────────────────────────────────
+
+/// State of a specific peer connection session.
+enum PeerConnectionState {
+  /// Connection is being established.
+  connecting,
+
+  /// Connection is active and ready for data exchange.
+  connected,
+
+  /// Connection was lost, queuing messages via DTN.
+  dtnPending,
+
+  /// Connection was intentionally closed.
+  disconnected,
+}
+
+// ── Transport priority ──────────────────────────────────────────────────────
+
+/// Connection priority order (Feature 2).
+///
+/// Each peer connection independently negotiates its best available transport.
+/// ```
+/// WiFi Direct (highest throughput) → BLE → Classic Bluetooth (fallback)
+/// ```
+extension TransportPriority on TransportType {
+  /// Lower number = higher priority.
+  int get priority {
+    switch (this) {
+      case TransportType.wifiDirect:
+        return 0; // Highest throughput
+      case TransportType.ble:
+        return 1;
+      case TransportType.classicBluetooth:
+        return 2; // Fallback for budget devices
+    }
+  }
 }

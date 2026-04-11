@@ -19,6 +19,19 @@ import 'database_helper.dart';
 /// Delivered packets are emitted on [deliveredMessages] as
 /// [MessageModel]-compatible JSON strings so the existing UI pipeline
 /// (ConnectionProvider → ChatNotifier) works unchanged.
+///
+/// ## Range Extension (Feature 5)
+///
+/// Physical range is extended through **multi-hop mesh relay**, not by
+/// increasing radio power beyond safe/permitted limits:
+///   - Single-hop BLE range: ~10–30 m (real-world)
+///   - Single-hop WiFi Direct range: ~50 m
+///   - Effective logical range = sum of relay hops × single-hop range
+///   - With TTL=7 and mesh relay, theoretical range is 7× the single-hop distance
+///
+/// Each relay hop is transparent to the sender and receiver — the MeshHandler
+/// on each intermediate node decrements TTL, increments hopCount, checks
+/// SeenCache, and forwards to the best next hop via [RoutingEngine].
 class MeshHandler {
   final String myUserId;
 
@@ -70,6 +83,9 @@ class MeshHandler {
 
     // Step 2: Am I the destination?
     if (packet.toUserId == myUserId) {
+      Logger.info(
+          '[HOP][MeshHandler] $myUserId | ${packet.msgId} | DELIVER_LOCAL | '
+          'from=${packet.fromUserId} hop=${packet.hopCount} ttl=${packet.ttl}');
       await _deliverToSelf(packet);
       // Never ACK an ACK — that ping-pongs forever (msgId becomes _ack_ack_…).
       if (packet.type != 'ack') {
@@ -80,11 +96,16 @@ class MeshHandler {
 
     // Step 3: TTL check
     if (packet.isExpired) {
-      Logger.warning('[MeshHandler] TTL=0 for ${packet.msgId} — dropping');
+      Logger.warning(
+          '[HOP][MeshHandler] $myUserId | ${packet.msgId} | TTL_EXHAUSTED | '
+          'from=${packet.fromUserId} to=${packet.toUserId} hop=${packet.hopCount}');
       return;
     }
 
     // Step 4: Forward
+    Logger.info(
+        '[HOP][MeshHandler] $myUserId | ${packet.msgId} | RELAY_FORWARD | '
+        'from=${packet.fromUserId} to=${packet.toUserId} hop=${packet.hopCount} ttl=${packet.ttl}');
     final hopped = packet.hop();
     await _forward(hopped, currentPeers);
   }
@@ -113,15 +134,20 @@ class MeshHandler {
         final sent = await _sendViaTransport(packet.toWire());
         if (!sent) {
           await DtnQueue.enqueue(packet);
+          Logger.info(
+              '[DTN][MeshHandler] $myUserId | ${packet.msgId} | SEND_FAILED_QUEUED | '
+              'to=${packet.toUserId} route=${decision.type.name}');
           return false;
         }
         Logger.info(
-            '[MeshHandler] ✅ Sent ${packet.msgId} (${decision.type.name})');
+            '[HOP][MeshHandler] $myUserId | ${packet.msgId} | SENT | '
+            'to=${packet.toUserId} route=${decision.type.name} hop=${packet.hopCount}');
         return true;
 
       case RouteType.store:
         Logger.info(
-            '[MeshHandler] No route to ${packet.toUserId} — buffering ${packet.msgId}');
+            '[DTN][MeshHandler] $myUserId | ${packet.msgId} | NO_ROUTE_BUFFERED | '
+            'to=${packet.toUserId}');
         await DtnQueue.enqueue(packet);
         return false;
     }

@@ -73,6 +73,13 @@ class MessagePacket {
 
   /// Returns true if a JSON map looks like a [MessagePacket] wire format.
   /// Used to distinguish packets from legacy [MessageModel] JSON in the receive path.
+  ///
+  /// Checks 5 fields to avoid false positives from legacy [MessageModel] JSON
+  /// which may contain 'fromUserId' or 'toUserId' but never 'ttl' or 'type'.
   static bool looksLikePacket(Map<String, dynamic> json) =>
-      json.containsKey('msgId') && json.containsKey('toUserId') && json.containsKey('fromUserId');
+      json.containsKey('msgId') &&
+      json.containsKey('toUserId') &&
+      json.containsKey('fromUserId') &&
+      json.containsKey('ttl') &&
+      json.containsKey('type');
 }

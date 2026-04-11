@@ -8,7 +8,6 @@ import '../models/device_model.dart';
 import '../services/storage/message_storage.dart';
 import '../services/storage/device_storage.dart';
 import '../services/storage/pending_message_storage.dart';
-import '../services/dtn_queue.dart';
 import '../providers/connection_provider.dart';
 import 'conversations_provider.dart';
 import '../utils/logger.dart';
@@ -161,10 +160,9 @@ class ChatNotifier extends StateNotifier<ChatState> {
         state = state.copyWith(isSending: false);
         Logger.info(
             'ChatNotifier: 📥 message ${message.messageId} buffered in DTN queue');
-        // Also keep in Hive pending storage so _syncPendingMessages can deliver
-        // via the legacy path while devices are directly connected.
-        await PendingMessageStorage.savePendingMessage(
-            message.copyWith(status: MessageStatus.pending));
+        // NOTE: Do NOT double-write to PendingMessageStorage here.
+        // DtnQueue is the single source of truth for buffered messages.
+        // DtnRetryLoop will handle delivery when a peer comes in range.
       }
     } catch (e) {
       Logger.error('Error sending message', e);
