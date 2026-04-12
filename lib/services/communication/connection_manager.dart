@@ -628,6 +628,18 @@ class ConnectionManager {
             'ConnectionManager: peer confirmed UUID handshake '
             '(our _connectedPeerId=${_connectedPeerId!})');
 
+        // Save as a known contact — the INITIATOR side must also persist the
+        // peer so both devices end up in each other's contact books after a
+        // single successful connection, regardless of whether BLE discovery
+        // managed to parse and store the UUID beforehand.
+        final initiatorPeerName = (_connectedDevice?.name.trim().isNotEmpty == true)
+            ? _connectedDevice!.name
+            : (DeviceStorage.getDeviceDisplayName(_connectedPeerId!) ?? 'Offlink Peer');
+        unawaited(KnownContactsStorage.saveContact(
+          peerId: _connectedPeerId!,
+          displayName: initiatorPeerName,
+        ));
+
         // Register in DTN peer discovery (triggers route advert)
         final lastState2 = _wifiDirectService.lastKnownState;
         final ipAddr2 = lastState2.ipAddress ?? _connectedPeerId!;
