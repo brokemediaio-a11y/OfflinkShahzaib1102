@@ -12,6 +12,7 @@ import '../../utils/logger.dart';
 import '../../utils/permissions_helper.dart';
 import '../storage/scan_log_storage.dart';
 import '../storage/device_storage.dart';
+import '../storage/message_storage.dart';
 import '../storage/pending_message_storage.dart';
 import '../storage/known_contacts_storage.dart';
 import '../routing/routing_manager.dart';
@@ -113,6 +114,15 @@ class ConnectionManager {
   DeviceModel? _lastConnectedDevice;
 
   bool _userInitiatedDisconnect = false;
+  /// True when the current Wi-Fi Direct connection was established solely to
+  /// flush queued DTN messages.  After delivery the manager disconnects
+  /// gracefully so the auto-reconnect loop never fires for a pure delivery run.
+  bool _isDtnAutoConnection = false;
+  /// Guard against concurrent _syncPendingMessages invocations.
+  /// Two back-to-back connections (e.g. initiator + immediate receiver)
+  /// can both trigger a sync before the first one finishes, sending the
+  /// same DTN packets twice and creating duplicate messages on the receiver.
+  bool _syncInProgress = false;
   Timer? _reconnectTimer;
   int _reconnectAttempt = 0;
 
@@ -307,7 +317,13 @@ class ConnectionManager {
           _wifiDirectDiscoveredDevices[uuid] = device;
           changed = true;
         }
-        if (changed) _emitDiscoveredDevices();
+        if (changed) {
+          _emitDiscoveredDevices();
+          // Wi-Fi Direct peers are visible — check if any has queued messages
+          // so they are delivered without waiting for the next BLE scan cycle.
+          unawaited(_checkAndAutoConnectForPendingMessages(
+              _wifiDirectDiscoveredDevices.values.toList()));
+        }
       });
 
       // ── Device-specific scan mode detection ──────────────────────
@@ -834,8 +850,13 @@ class ConnectionManager {
   ///
   /// Regardless of how the device was discovered (BLE or native scan),
   /// the data-plane connection is always Wi-Fi Direct.
-  Future<bool> connectToDevice(DeviceModel device) async {
+  Future<bool> connectToDevice(DeviceModel device,
+      {bool forDtnDelivery = false}) async {
     try {
+      // A direct, user-initiated call overrides any pending DTN-only session so
+      // we never auto-disconnect while the user is actively chatting.
+      if (!forDtnDelivery) _isDtnAutoConnection = false;
+
       // ── Guard: connected to a DIFFERENT peer — disconnect first ───────
       // Android Wi-Fi Direct supports only one active P2P group at a time.
       // When the Kotlin layer is in SOCKET_CONNECTED state, connectToPeer()
@@ -1359,10 +1380,62 @@ class ConnectionManager {
       Logger.warning('ConnectionManager: MeshHandler not ready — cannot route packet');
       return false;
     }
-    return await _meshHandler!.sendMessage(
+    final sent = await _meshHandler!.sendMessage(
       packet: packet,
       currentPeers: _peerDiscovery.currentPeers,
     );
+    if (!sent) {
+      // Message queued — if the target is already visible via BLE or Wi-Fi
+      // Direct, auto-connect now rather than waiting for the next BLE scan.
+      unawaited(_triggerAutoConnectForTarget(packet.toUserId));
+    }
+    return sent;
+  }
+
+  /// Silently connect to [targetUserId] if that device is currently visible
+  /// (BLE, native scan, or Wi-Fi Direct DNS-SD) and we are not already
+  /// connected or connecting.  Called after a message is queued in the DTN
+  /// store-and-forward queue so delivery happens without user interaction.
+  Future<void> _triggerAutoConnectForTarget(String targetUserId) async {
+    if (isConnected() || _currentConnectionType != ConnectionType.none) return;
+
+    // When the user explicitly disconnected, that flag prevents unwanted
+    // reconnects to the OLD peer.  But a brand-new message to any peer
+    // (even the same one) represents fresh intent — honour it.
+    // A new outbound message queued for ANY peer represents fresh delivery
+    // intent.  Clear the "user disconnected" flag so we can auto-connect
+    // to deliver it.  The flag's only purpose is to suppress reconnect to a
+    // peer the user explicitly left — but a new message overrides that wish.
+    if (_userInitiatedDisconnect) {
+      _userInitiatedDisconnect = false;
+    }
+    if (_userInitiatedDisconnect) return; // (never reached, kept for safety)
+
+    DeviceModel? target;
+
+    // 1. BLE discovered devices
+    for (final d in _bleDevices) {
+      if (d.id == targetUserId) { target = d; break; }
+    }
+    // 2. Native scan devices (highest RSSI accuracy)
+    if (target == null) {
+      target = _nativeScanDevices[targetUserId];
+    }
+    // 3. Wi-Fi Direct DNS-SD discovered services
+    if (target == null) {
+      target = _wifiDirectDiscoveredDevices[targetUserId];
+    }
+
+    if (target == null) {
+      Logger.info(
+          '[DTN] Target $targetUserId not currently visible — will connect when discovered');
+      return;
+    }
+
+    Logger.info(
+        '[DTN] Target ${target.name} visible — auto-connecting to deliver queued message');
+    _isDtnAutoConnection = true;
+    unawaited(connectToDevice(target, forDtnDelivery: true));
   }
 
   Stream<List<DeviceModel>> getDiscoveredDevices() =>
@@ -1799,6 +1872,22 @@ class ConnectionManager {
   /// Uses the DTN queue (DtnQueue) as the single source of truth for
   /// buffered messages. PendingMessageStorage (Hive) is the legacy path.
   Future<void> _syncPendingMessages(String connectedPeerId) async {
+    // Prevent two simultaneous syncs from racing: if a first sync is still
+    // running when a second connection opens, skip rather than double-send.
+    if (_syncInProgress) {
+      Logger.info(
+          'ConnectionManager: _syncPendingMessages already in progress — skipping duplicate call');
+      return;
+    }
+    _syncInProgress = true;
+    try {
+      await _syncPendingMessagesInner(connectedPeerId);
+    } finally {
+      _syncInProgress = false;
+    }
+  }
+
+  Future<void> _syncPendingMessagesInner(String connectedPeerId) async {
     // ── Primary path: DtnQueue (SQLite) ───────────────────────────
     final dtnPending = await DtnQueue.getPendingPackets();
     final relevant = dtnPending.where((pkt) =>
@@ -1818,10 +1907,16 @@ class ConnectionManager {
           final sent = await _wifiDirectService.sendMessage(packet.toWire());
           if (sent) {
             synced++;
-            await DtnQueue.recordAttempt(packet.msgId, delivered: true);
+            // Advance UI status to 'sent' so the chat bubble stops showing
+            // "pending".  Do NOT mark the DTN entry as delivered yet — only
+            // the receiving device's ACK confirms delivery.  Marking delivered
+            // here would remove the queue entry prematurely; if the connection
+            // drops before the ACK arrives the message would be stuck forever.
+            unawaited(MessageStorage.updateMessageStatus(
+                packet.msgId, MessageStatus.sent));
             Logger.debug(
                 'ConnectionManager: synced DTN packet '
-                '${packet.msgId} → $connectedPeerId');
+                '${packet.msgId} → $connectedPeerId (status→sent, awaiting ACK)');
           }
         } catch (e) {
           Logger.error(
@@ -1839,33 +1934,61 @@ class ConnectionManager {
     final hiveRelevant = hivePending.where((msg) =>
         msg.receiverId == connectedPeerId).toList();
 
-    if (hiveRelevant.isEmpty) return;
+    if (hiveRelevant.isNotEmpty) {
+      Logger.info(
+          'ConnectionManager: syncing ${hiveRelevant.length} legacy pending '
+          'message(s) to $connectedPeerId');
 
-    Logger.info(
-        'ConnectionManager: syncing ${hiveRelevant.length} legacy pending '
-        'message(s) to $connectedPeerId');
-
-    int legacySynced = 0;
-    for (final message in hiveRelevant) {
-      try {
-        final messageJson = jsonEncode(message.toJson());
-        final sent = await _wifiDirectService.sendMessage(messageJson);
-        if (sent) {
-          legacySynced++;
-          await PendingMessageStorage.removePendingMessage(message.messageId);
-          Logger.debug(
-              'ConnectionManager: synced legacy message '
-              '${message.messageId} → $connectedPeerId');
+      int legacySynced = 0;
+      for (final message in hiveRelevant) {
+        try {
+          final messageJson = jsonEncode(message.toJson());
+          final sent = await _wifiDirectService.sendMessage(messageJson);
+          if (sent) {
+            legacySynced++;
+            await PendingMessageStorage.removePendingMessage(message.messageId);
+            Logger.debug(
+                'ConnectionManager: synced legacy message '
+                '${message.messageId} → $connectedPeerId');
+          }
+        } catch (e) {
+          Logger.error(
+              'ConnectionManager: error syncing message ${message.messageId}', e);
         }
-      } catch (e) {
-        Logger.error(
-            'ConnectionManager: error syncing message ${message.messageId}', e);
       }
+
+      Logger.info(
+          'ConnectionManager: legacy sync complete — $legacySynced/${hiveRelevant.length} '
+          'message(s) forwarded to $connectedPeerId');
     }
 
-    Logger.info(
-        'ConnectionManager: legacy sync complete — $legacySynced/${hiveRelevant.length} '
-        'message(s) forwarded to $connectedPeerId');
+    // ── DTN-only: auto-disconnect once all queued messages are delivered ──────
+    // If this connection was established silently by the DTN auto-connect path
+    // (not by the user opening a chat screen), disconnect gracefully after
+    // delivery.  This prevents the auto-reconnect loop from firing and keeps
+    // the UI clean — the user will see "Offline — messages queued → ✓ delivered"
+    // rather than a perpetual "Connecting…" spinner.
+    if (_isDtnAutoConnection) {
+      try {
+        final remaining = await DtnQueue.getPendingPackets();
+        final stillPending =
+            remaining.where((p) => p.toUserId == connectedPeerId).isNotEmpty;
+        if (!stillPending) {
+          Logger.info(
+              'ConnectionManager: DTN delivery to $connectedPeerId complete '
+              '— disconnecting gracefully to prevent reconnect loop');
+          // Small grace period so ACKs can arrive before we tear down.
+          await Future.delayed(const Duration(seconds: 2));
+          // Guard: user might have opened the chat and cleared the flag.
+          if (_isDtnAutoConnection) {
+            _isDtnAutoConnection = false;
+            await disconnect();
+          }
+        }
+      } catch (e) {
+        Logger.error('ConnectionManager: error in DTN auto-disconnect', e);
+      }
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -1896,8 +2019,8 @@ class ConnectionManager {
               '[DTN] BLE rediscovered ${device.name} (${device.id}) '
               'with ${pending.where((p) => p.toUserId == device.id).length} '
               'pending message(s) — auto-connecting to deliver');
-          // connectToDevice is safe to call: it guards against double-invocation.
-          unawaited(connectToDevice(device));
+          _isDtnAutoConnection = true;
+          unawaited(connectToDevice(device, forDtnDelivery: true));
           return; // only connect to one peer at a time
         }
       }

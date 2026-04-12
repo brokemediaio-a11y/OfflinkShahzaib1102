@@ -365,7 +365,23 @@ class WifiDirectManager(private val context: Context) {
         val mgr = wifiP2pManager ?: return mapOf("success" to false, "error" to "Manager null")
         val ch  = p2pChannel   ?: return mapOf("success" to false, "error" to "Channel null")
 
-        val fails = discoveryRetryCount.get()
+        // ── Guard: never restart peer discovery while a connection is in progress ──
+    // When handlePeerListUpdate() fails to find a name-matching peer it schedules
+    // discoverPeers() 4 s later.  If connect() succeeds during those 4 s the
+    // delayed callback fires mid-negotiation and floods the P2P stack with BUSY
+    // errors.  The resulting hardRecoverP2pSlot() calls removeGroup() which
+    // tears down the very connection we are forming — the peer never sees the
+    // invitation and the group is silently destroyed.
+    val guardPhase = connectionPhase.get()
+    if (guardPhase == ConnectionPhase.CONNECTING ||
+        guardPhase == ConnectionPhase.GROUP_FORMED ||
+        guardPhase == ConnectionPhase.SOCKET_CONNECTING ||
+        guardPhase == ConnectionPhase.SOCKET_CONNECTED) {
+        Log.d(tag, "discoverPeers: skipping — connection in progress ($guardPhase)")
+        return mapOf("success" to true, "skipped" to true)
+    }
+
+    val fails = discoveryRetryCount.get()
         Log.d(tag, "Starting Wi-Fi Direct peer discovery… (busyRetries=$fails/$maxDiscoveryRetries)")
 
         mgr.discoverPeers(ch, object : WifiP2pManager.ActionListener {
@@ -601,12 +617,36 @@ class WifiDirectManager(private val context: Context) {
                         Log.d(tag, "Auto-retrying Wi-Fi Direct discovery in ${delayMs}ms…")
                         mainHandler.postDelayed({ discoverPeers() }, delayMs)
                     }
-                }.also { mainHandler.postDelayed(it, 15_000) }
+                }.also { mainHandler.postDelayed(it, 25_000) }
             }
             override fun onFailure(reason: Int) {
                 Log.e(tag, "Wi-Fi Direct connect() to $deviceAddress failed: ${failureReason(reason)}")
                 connectingTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
                 connectingTimeoutRunnable = null
+
+                if (reason == WifiP2pManager.BUSY) {
+                    // The P2P stack is still processing the original connect() call
+                    // (common when the CONNECTING timeout retries while the first attempt
+                    // is still pending — Android returns BUSY but the group forms anyway).
+                    // DO NOT notify Dart of failure; CONNECTION_CHANGED will arrive when
+                    // the group forms.  Flip phase back to CONNECTING and start a shorter
+                    // watchdog so we still give up if the group never appears.
+                    Log.w(tag, "connect() BUSY — prior call still in progress; waiting for CONNECTION_CHANGED")
+                    connectionPhase.compareAndSet(ConnectionPhase.FAILED, ConnectionPhase.CONNECTING)
+                    connectingTimeoutRunnable = Runnable {
+                        if (connectionPhase.get() == ConnectionPhase.CONNECTING) {
+                            Log.e(tag, "Post-BUSY CONNECTING watchdog expired — giving up")
+                            val savedTarget = targetDeviceName
+                            closeSocket()
+                            resetState()
+                            if (savedTarget != null) {
+                                notifyConnectionState(connected = false, error = "Connection timed out")
+                            }
+                        }
+                    }.also { mainHandler.postDelayed(it, 20_000) }
+                    return
+                }
+
                 connectionPhase.set(ConnectionPhase.FAILED)
                 notifyConnectionState(connected = false, error = "Connect failed: ${failureReason(reason)}")
             }
@@ -1166,11 +1206,21 @@ class WifiDirectManager(private val context: Context) {
     }
 
     private fun notifyIncomingInvitation(peer: WifiP2pDevice) {
+        // Resolve the UUID for this MAC from our background DNS-SD cache so that
+        // the Dart layer can auto-accept invitations from known contacts without
+        // showing a dialog.
+        val peerUuid = synchronized(backgroundDiscoveredServices) {
+            backgroundDiscoveredServices.values.firstOrNull {
+                (it["address"] as? String) == peer.deviceAddress
+            }?.get("uuid") as? String
+        } ?: ""
+
         val payload = mapOf(
             "deviceName"    to peer.deviceName,
-            "deviceAddress" to peer.deviceAddress
+            "deviceAddress" to peer.deviceAddress,
+            "peerUuid"      to peerUuid
         )
-        Log.d(tag, "🔔 Notifying Flutter of incoming invitation from ${peer.deviceName}")
+        Log.d(tag, "🔔 Notifying Flutter of incoming invitation from ${peer.deviceName} (uuid=${peerUuid.ifEmpty { "unknown" }})")
         mainHandler.post { incomingInvitationListener?.invoke(payload) }
     }
 

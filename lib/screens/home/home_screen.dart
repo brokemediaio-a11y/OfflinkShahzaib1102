@@ -8,6 +8,7 @@ import '../../models/device_model.dart';
 import '../../providers/device_provider.dart';
 import '../../providers/connection_provider.dart';
 import '../../services/communication/connection_manager.dart';
+import '../../services/storage/known_contacts_storage.dart';
 import '../../utils/logger.dart';
 import '../chat/chat_screen.dart';
 import '../connection/connection_status_screen.dart';
@@ -90,10 +91,23 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     if (!mounted || _invitationDialogOpen) return;
 
     final notifier = ref.read(connectionProvider.notifier);
+
+    // Auto-accept: ongoing session reconnect
     if (notifier.isReconnecting) {
       Logger.info(
           'HomeScreen: auto-accepting reconnect invitation from '
           '${payload["deviceName"]}');
+      await notifier.acceptInvitation();
+      return;
+    }
+
+    // Auto-accept: caller is a known contact — deliver messages seamlessly
+    // without any dialog. The UUID is provided by the Kotlin layer via DNS-SD.
+    final peerUuid = payload['peerUuid'] ?? '';
+    if (peerUuid.isNotEmpty && KnownContactsStorage.hasContact(peerUuid)) {
+      Logger.info(
+          'HomeScreen: auto-accepting invitation from known contact '
+          '${payload["deviceName"]} (uuid=$peerUuid)');
       await notifier.acceptInvitation();
       return;
     }

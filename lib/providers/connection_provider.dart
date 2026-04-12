@@ -177,11 +177,23 @@ class ConnectionNotifier extends StateNotifier<ConnectionProviderState> {
       // chatProvider is keyed by peerUuid.  If the chat screen for this
       // peer is mounted, the provider exists and will show the message.
       // If not, the message is already persisted and will load on open.
+      //
+      // We call receiveMessage() for the optimistic in-memory update AND
+      // schedule a loadMessagesForConversation() on the next microtask to
+      // guarantee the UI reflects storage (covers async-write race conditions).
       try {
         final chatNotifier = _ref.read(chatProvider(peerUuid).notifier);
         chatNotifier.receiveMessage(messageJson);
         Logger.info(
             'ConnectionProvider: delivered message to chatProvider($peerUuid)');
+        // Deferred reload: ensures the storage write from saveMessage() above
+        // has completed before we refresh the message list from storage.
+        Future.microtask(() {
+          try {
+            final n = _ref.read(chatProvider(peerUuid).notifier);
+            n.loadMessagesForConversation(peerUuid);
+          } catch (_) {}
+        });
       } catch (e) {
         Logger.debug(
             'ConnectionProvider: chatProvider($peerUuid) not active — '
@@ -228,12 +240,23 @@ class ConnectionNotifier extends StateNotifier<ConnectionProviderState> {
       unawaited(
           MessageStorage.updateMessageStatus(messageId, MessageStatus.delivered));
 
-      // Update UI in the open chat screen (keyed by the recipient's UUID)
+      // Update UI in the open chat screen (keyed by the recipient's UUID).
+      // updateMessageDeliveryStatus handles the optimistic in-memory bubble
+      // update.  The deferred loadMessagesForConversation guarantees the UI
+      // is correct even if the async updateMessageStatus write races ahead.
       if (ackSenderId != null) {
         try {
           final chatNotifier = _ref.read(chatProvider(ackSenderId).notifier);
           chatNotifier.updateMessageDeliveryStatus(
               messageId, MessageStatus.delivered);
+          // Deferred reload: fires after the unawaited updateMessageStatus
+          // Future resolves so we read the definitive delivered status from Hive.
+          Future.microtask(() {
+            try {
+              final n = _ref.read(chatProvider(ackSenderId).notifier);
+              n.loadMessagesForConversation(ackSenderId);
+            } catch (_) {}
+          });
         } catch (_) {
           // Chat screen for this peer is not open — status already
           // persisted in storage and will load correctly when opened.

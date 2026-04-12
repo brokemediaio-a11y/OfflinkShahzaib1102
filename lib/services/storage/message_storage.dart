@@ -99,6 +99,12 @@ class MessageStorage {
     }
   }
 
+  // Check if a message with [messageId] already exists (O(1) Hive key lookup).
+  // Used for storage-level deduplication in the receive path.
+  static bool hasMessage(String messageId) {
+    return _messagesBox?.containsKey(messageId) ?? false;
+  }
+
   // Get message count
   static int getMessageCount() {
     return _messagesBox?.length ?? 0;

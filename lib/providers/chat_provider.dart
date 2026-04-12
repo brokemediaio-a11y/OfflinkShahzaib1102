@@ -238,10 +238,15 @@ class ChatNotifier extends StateNotifier<ChatState> {
         );
       }
 
-      // Deduplication
-      final exists = state.messages.any((m) => m.id == message.id);
-      if (exists) {
-        Logger.debug('Message already exists, skipping: ${message.id}');
+      // Deduplication — check BOTH in-memory state AND persistent storage.
+      // The in-memory check handles the common hot-path (screen is open).
+      // The storage check catches duplicates that arrive after a screen
+      // rebuild / navigation (state was reset but the message is already
+      // persisted from the previous delivery attempt).
+      final inMemory = state.messages.any((m) => m.id == message.id);
+      final inStorage = MessageStorage.hasMessage(message.id);
+      if (inMemory || inStorage) {
+        Logger.debug('Message already exists (inMemory=$inMemory, inStorage=$inStorage), skipping: ${message.id}');
         return;
       }
 

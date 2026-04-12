@@ -239,9 +239,11 @@ class WifiDirectService {
           final payload = {
             'deviceName':    (event['deviceName']    as String?) ?? 'Unknown',
             'deviceAddress': (event['deviceAddress'] as String?) ?? '',
+            'peerUuid':      (event['peerUuid']      as String?) ?? '',
           };
           Logger.info(
-              'WifiDirectService: incoming invitation from ${payload["deviceName"]}');
+              'WifiDirectService: incoming invitation from ${payload["deviceName"]} '
+              '(uuid=${payload["peerUuid"]!.isEmpty ? "unknown" : payload["peerUuid"]})');
           _invitationController.add(payload);
         }
       },

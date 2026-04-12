@@ -30,6 +30,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   // Whether the reconnecting dialog is currently on screen.
   bool _reconnectDialogOpen = false;
 
+  // True only while the user actively initiated a connection from THIS screen.
+  // Prevents the "Connecting…" label from appearing when the background
+  // auto-reconnect loop is running for a different session.
+  bool _userInitiatedConnect = false;
+
   // ── Reconnect dialog ────────────────────────────────────────────────
 
   void _showReconnectingDialog() {
@@ -52,11 +57,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   }
 
   void _dismissReconnectDialog() {
-    // Always clear the flag — regardless of whether the dialog is physically open.
-    // Removes the race condition where connected state fires before the dialog
-    // finishes opening (and the old guard caused a permanent stuck dialog).
+    // Only pop if a reconnect dialog was actually opened by this screen.
+    // Using canPop() alone is wrong — it returns true for the chat screen
+    // itself (pushed from contacts), which would pop the whole screen.
+    final wasOpen = _reconnectDialogOpen;
     _reconnectDialogOpen = false;
-    if (mounted && Navigator.of(context).canPop()) {
+    if (wasOpen && mounted && Navigator.of(context).canPop()) {
       Navigator.of(context).pop();
     }
   }
@@ -75,10 +81,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     }
 
     // Another connection attempt already in flight — don't stack requests.
-    if (connectionState.state == ConnectionStateType.connecting) {
-      Logger.info('ChatScreen: connection attempt already in progress');
+    // (This includes background auto-reconnect loops; we still allow the user
+    // to tap Connect in that case to acknowledge the intent.)
+    if (connectionState.state == ConnectionStateType.connecting &&
+        _userInitiatedConnect) {
+      Logger.info('ChatScreen: user-initiated connection attempt already in progress');
       return;
     }
+
+    setState(() => _userInitiatedConnect = true);
 
     final connectionNotifier = ref.read(connectionProvider.notifier);
     final started = await connectionNotifier.connectToDevice(widget.device);
@@ -86,18 +97,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     if (!mounted) return;
 
     if (started) {
-      // Re-read state AFTER connectToDevice() returns.
-      //
-      // connectToDevice() may re-emit ConnectionState.connected synchronously
-      // (e.g. when the peer was already connected, or when the native layer
-      // re-established the link during the await). In that case ref.listen
-      // fires BEFORE this point — there is no dialog open yet, so the dismiss
-      // call inside the listener is a no-op, and the dialog would be stuck
-      // forever if we unconditionally call _showReconnectingDialog() here.
-      //
-      // Solution: check current state immediately after the await and only
-      // show the dialog if we are still in the connecting/not-yet-connected
-      // state.
+      // Re-read state AFTER connectToDevice() returns.  If already connected
+      // (e.g. auto-reconnect completed while we awaited) skip the dialog.
       final stateAfter = ref.read(connectionProvider);
       final alreadyConnected = stateAfter.state == ConnectionStateType.connected &&
           stateAfter.connectedDevice?.id == widget.device.id;
@@ -105,6 +106,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         _showReconnectingDialog();
       }
     } else {
+      setState(() => _userInitiatedConnect = false);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
@@ -174,9 +176,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       WidgetsBinding.instance.addPostFrameCallback((_) => _dismissReconnectDialog());
     }
 
-    // Show connecting spinner only when an attempt is in flight.
-    // If connected to a DIFFERENT device, treat this chat as offline (not connecting).
-    final isConnecting = connectionState.state == ConnectionStateType.connecting;
+    // Show "Connecting…" ONLY when the user explicitly tapped Connect in this
+    // screen.  Background auto-reconnect loops must not hijack the label and
+    // leave the screen stuck at "Connecting…" indefinitely.
+    final isConnecting = _userInitiatedConnect &&
+        (connectionState.state == ConnectionStateType.connecting ||
+            connectionState.state == ConnectionStateType.connected &&
+                connectionState.connectedDevice?.id != widget.device.id);
 
     // Dismiss reconnect dialog when socket opens or attempt ends.
     ref.listen<ConnectionProviderState>(connectionProvider, (prev, next) {
@@ -187,28 +193,82 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           next.connectedDevice?.id == widget.device.id;
 
       if (nowConnectedToThis) {
+        // Only show "Connected" banner for connections the user initiated from
+        // this screen.  Background DTN auto-connects must be silent.
+        if (_userInitiatedConnect) {
+          setState(() => _userInitiatedConnect = false);
+          _dismissReconnectDialog();
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Connected to ${widget.device.name}'),
+              backgroundColor: AppColors.primary,
+              duration: const Duration(seconds: 2),
+            ),
+          );
+        } else {
+          // Still dismiss any open dialog (e.g. race where dialog opened but
+          // the user tapped something else), but silently.
+          _dismissReconnectDialog();
+        }
+      } else if (next.state == ConnectionStateType.error) {
+        // Capture BEFORE the setState clears the flag.
+        final wasUserInitiated = _userInitiatedConnect;
+        if (wasUserInitiated) setState(() => _userInitiatedConnect = false);
+        // Always attempt to close a reconnect dialog if one is open.
         _dismissReconnectDialog();
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Connected to ${widget.device.name}'),
-            backgroundColor: AppColors.primary,
-            duration: const Duration(seconds: 2),
-          ),
-        );
-      } else if (next.state == ConnectionStateType.error ||
-          (next.state == ConnectionStateType.disconnected &&
-              prev?.state == ConnectionStateType.connecting)) {
+        // Only surface the error to the user if they triggered the connection.
+        // Background DTN failures should be silent — the message remains
+        // pending and will be retried automatically.
+        if (wasUserInitiated) {
+          final errorMsg =
+              ref.read(connectionProvider.notifier).lastConnectionError ??
+              'Connection to ${widget.device.name} failed. Try again.';
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(errorMsg),
+              backgroundColor: AppColors.error,
+              duration: const Duration(seconds: 5),
+            ),
+          );
+        }
+      } else if (next.state == ConnectionStateType.disconnected &&
+          prev?.state == ConnectionStateType.connecting) {
+        // Connection attempt ended without reaching socket-connected.
+        final wasUserInitiated = _userInitiatedConnect;
+        if (wasUserInitiated) setState(() => _userInitiatedConnect = false);
         _dismissReconnectDialog();
-        final errorMsg =
-            ref.read(connectionProvider.notifier).lastConnectionError ??
-            'Connection to ${widget.device.name} failed. Try again.';
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(errorMsg),
-            backgroundColor: AppColors.error,
-            duration: const Duration(seconds: 5),
-          ),
-        );
+        if (wasUserInitiated) {
+          final errorMsg =
+              ref.read(connectionProvider.notifier).lastConnectionError ??
+              'Connection to ${widget.device.name} failed. Try again.';
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(errorMsg),
+              backgroundColor: AppColors.error,
+              duration: const Duration(seconds: 5),
+            ),
+          );
+        }
+      }
+
+      // ── Reload messages after any DTN exchange ends ─────────────────
+      // When a connection goes from connected/connecting → disconnected or
+      // error, a DTN delivery cycle just completed (or errored).  Reload
+      // from storage so the chat screen shows the latest message statuses
+      // (pending → sent/delivered) and any newly received messages without
+      // requiring the user to navigate away and back.
+      final wasActive = prev?.state == ConnectionStateType.connected ||
+          prev?.state == ConnectionStateType.connecting;
+      final nowIdle = next.state == ConnectionStateType.disconnected ||
+          next.state == ConnectionStateType.error;
+      if (wasActive && nowIdle && mounted) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) {
+            ref
+                .read(chatProvider(widget.device.id).notifier)
+                .loadMessagesForConversation(widget.device.id);
+          }
+        });
       }
     });
 
