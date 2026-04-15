@@ -7,6 +7,7 @@ import '../services/dtn_queue.dart';
 import '../utils/logger.dart';
 import 'conversations_provider.dart';
 import 'chat_provider.dart';
+import 'broadcast_provider.dart';
 import '../models/message_model.dart';
 import '../services/storage/message_storage.dart';
 import '../services/storage/device_storage.dart';
@@ -129,6 +130,12 @@ class ConnectionNotifier extends StateNotifier<ConnectionProviderState> {
       // ── Delivery ACK — intercept before parsing as MessageModel ────
       if (jsonMap['__type'] == '__delivery_ack__') {
         _handleDeliveryAck(jsonMap);
+        return;
+      }
+
+      // ── Broadcast — route to BroadcastProvider ───────────────────
+      if (jsonMap['__type'] == '__broadcast__') {
+        _handleIncomingBroadcast(jsonMap);
         return;
       }
 
@@ -267,6 +274,20 @@ class ConnectionNotifier extends StateNotifier<ConnectionProviderState> {
     }
   }
 
+  // ═══════════════════════════════════════════════════════════════════
+  // Broadcast handler
+  // ═══════════════════════════════════════════════════════════════════
+
+  /// Called when a `__broadcast__` event arrives from [MeshHandler].
+  /// Delegates to [BroadcastNotifier.addReceived] for storage + UI update.
+  void _handleIncomingBroadcast(Map<String, dynamic> json) {
+    try {
+      _ref.read(broadcastProvider.notifier).addReceived(json);
+    } catch (e, st) {
+      Logger.error('ConnectionProvider: error routing broadcast event', e, st);
+    }
+  }
+
   Map<String, dynamic>? _parseJsonString(String jsonString) {
     try {
       final cleaned = jsonString.trim();
@@ -368,6 +389,32 @@ class ConnectionNotifier extends StateNotifier<ConnectionProviderState> {
 
   bool isConnected() {
     return _connectionManager.isConnected();
+  }
+
+  // ── Multi-GO Broadcast Group ──────────────────────────────────────
+
+  /// Start this device as a Wi-Fi Direct Group Owner for simultaneous
+  /// Multi-GO broadcast delivery.
+  Future<bool> startBroadcastGroup() async {
+    try {
+      return await _connectionManager.startBroadcastGroup();
+    } catch (e) {
+      Logger.error('ConnectionProvider: startBroadcastGroup error', e);
+      return false;
+    }
+  }
+
+  /// Route a broadcast packet via the optimal path:
+  /// Multi-GO simultaneous relay (if in a group) or DTN epidemic (fallback).
+  Future<bool> routeBroadcastPacket(MessagePacket packet,
+      {String? senderUuid}) async {
+    try {
+      return await _connectionManager.routeBroadcastPacket(packet,
+          senderUuid: senderUuid);
+    } catch (e) {
+      Logger.error('ConnectionProvider: routeBroadcastPacket error', e);
+      return false;
+    }
   }
 
   /// [true] while the manager is trying to restore a lost connection.

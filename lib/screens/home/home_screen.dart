@@ -10,6 +10,7 @@ import '../../providers/connection_provider.dart';
 import '../../services/communication/connection_manager.dart';
 import '../../services/storage/known_contacts_storage.dart';
 import '../../utils/logger.dart';
+import '../broadcast/broadcast_screen.dart';
 import '../chat/chat_screen.dart';
 import '../connection/connection_status_screen.dart';
 import '../contacts/contact_book_screen.dart';
@@ -298,6 +299,15 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 final connectionManager = ConnectionManager();
                 await connectionManager.restartAdvertising();
               }
+            },
+          ),
+          IconButton(
+            icon: const Icon(Icons.campaign_outlined),
+            tooltip: 'Broadcasts',
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const BroadcastScreen()),
+              );
             },
           ),
           IconButton(

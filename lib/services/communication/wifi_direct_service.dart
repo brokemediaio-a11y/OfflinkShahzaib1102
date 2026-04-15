@@ -89,6 +89,8 @@ class WifiDirectService {
       EventChannel('com.offlink.wifi_direct/invitation');
   static const _discoveredServicesEventChannel =
       EventChannel('com.offlink.wifi_direct/discovered_services');
+  static const _groupMembersEventChannel =
+      EventChannel('com.offlink.wifi_direct/group_members');
 
   // ── Dart-side streams ─────────────────────────────────────────────
   final _messageController =
@@ -101,12 +103,15 @@ class WifiDirectService {
       StreamController<Map<String, String>>.broadcast();
   final _discoveredServicesController =
       StreamController<List<Map<String, dynamic>>>.broadcast();
+  final _groupMembersController =
+      StreamController<Map<String, dynamic>>.broadcast();
 
   StreamSubscription? _messageSubscription;
   StreamSubscription? _connectionStateSubscription;
   StreamSubscription? _peersSubscription;
   StreamSubscription? _invitationSubscription;
   StreamSubscription? _discoveredServicesSubscription;
+  StreamSubscription? _groupMembersSubscription;
 
   bool _initialized = false;
 
@@ -136,6 +141,11 @@ class WifiDirectService {
   /// Each list entry: { "uuid": String, "name": String?, "address": String }
   Stream<List<Map<String, dynamic>>> get discoveredServices =>
       _discoveredServicesController.stream;
+
+  /// Stream of Multi-GO group member join/leave events.
+  /// Each event: { "event": "joined"|"left", "uuid": String, "memberCount": int }
+  Stream<Map<String, dynamic>> get groupMemberEvents =>
+      _groupMembersController.stream;
 
   // ═════════════════════════════════════════════════════════════════
   // Initialization
@@ -269,6 +279,23 @@ class WifiDirectService {
       onError: (e) =>
           Logger.error('WifiDirectService: discovered services stream error', e),
     );
+
+    // ── Multi-GO group member join/leave events ────────────────────
+    _groupMembersSubscription?.cancel();
+    _groupMembersSubscription =
+        _groupMembersEventChannel.receiveBroadcastStream().listen(
+      (event) {
+        if (event is Map) {
+          final map = Map<String, dynamic>.from(event);
+          Logger.info(
+              'WifiDirectService: group member event '
+              '${map["event"]} uuid=${map["uuid"]}');
+          _groupMembersController.add(map);
+        }
+      },
+      onError: (e) =>
+          Logger.error('WifiDirectService: group members stream error', e),
+    );
   }
 
   /// Embed our display name in the Wi-Fi Direct DNS-SD TXT record so remote
@@ -378,6 +405,122 @@ class WifiDirectService {
   }
 
   // ═════════════════════════════════════════════════════════════════
+  // Multi-GO Group Session
+  // ═════════════════════════════════════════════════════════════════
+
+  /// Start this device as a Wi-Fi Direct Group Owner (software AP).
+  ///
+  /// Uses [WifiP2pManager.createGroup()] with GO intent = 15, so no
+  /// peer negotiation occurs — this device always wins the GO role.
+  /// The native layer opens a multi-client TCP ServerSocket after the
+  /// Android framework confirms the group is created.
+  ///
+  /// Returns `{ "success": bool }`.
+  Future<Map<String, dynamic>> startAsGroupOwner() async {
+    if (!_initialized) {
+      return {'success': false, 'error': 'Not initialized'};
+    }
+    try {
+      final result =
+          await _methodChannel.invokeMethod<Map>('startAsGroupOwner');
+      final map = result != null
+          ? Map<String, dynamic>.from(result)
+          : {'success': false, 'error': 'no result'};
+      Logger.info('WifiDirectService: startAsGroupOwner → $map');
+      return map;
+    } catch (e) {
+      Logger.error('WifiDirectService: startAsGroupOwner error', e);
+      return {'success': false, 'error': e.toString()};
+    }
+  }
+
+  /// Join an existing Multi-GO group as a client.
+  ///
+  /// Delegates to the standard UUID-based connect path but yields the GO
+  /// role (the remote device that called [startAsGroupOwner] wins).
+  ///
+  /// [targetUuid] — the Group Owner's OffLink UUID.
+  /// [targetName] — fallback display name for DNS-SD.
+  ///
+  /// Returns `{ "success": bool }`.
+  Future<Map<String, dynamic>> joinGroupAsClient({
+    required String targetUuid,
+    required String targetName,
+  }) async {
+    if (!_initialized) {
+      return {'success': false, 'error': 'Not initialized'};
+    }
+    try {
+      final result = await _methodChannel.invokeMethod<Map>(
+        'joinGroupAsClient',
+        {'targetUuid': targetUuid, 'targetName': targetName},
+      );
+      final map = result != null
+          ? Map<String, dynamic>.from(result)
+          : {'success': false, 'error': 'no result'};
+      Logger.info('WifiDirectService: joinGroupAsClient → $map');
+      return map;
+    } catch (e) {
+      Logger.error('WifiDirectService: joinGroupAsClient error', e);
+      return {'success': false, 'error': e.toString()};
+    }
+  }
+
+  /// Send [message] to ALL connected Multi-GO clients simultaneously.
+  ///
+  /// [senderUuid] — UUID of the originating device; that socket is skipped
+  ///   to prevent echo-back.  Pass null when the GO itself is the sender.
+  ///
+  /// Returns the count of client sockets that received the message.
+  /// Returns -1 if the native call fails.
+  Future<int> broadcastToAllClients(String message,
+      {String? senderUuid}) async {
+    if (!_initialized) return -1;
+    try {
+      final result = await _methodChannel.invokeMethod<int>(
+        'broadcastToAllClients',
+        {
+          'message': message,
+          if (senderUuid != null) 'senderUuid': senderUuid,
+        },
+      );
+      return result ?? 0;
+    } catch (e) {
+      Logger.error('WifiDirectService: broadcastToAllClients error', e);
+      return -1;
+    }
+  }
+
+  /// Returns true if this device is currently acting as a Multi-GO owner.
+  Future<bool> isMultiGoOwner() async {
+    try {
+      return await _methodChannel.invokeMethod<bool>('isMultiGoOwner') ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Returns the current count of connected Multi-GO clients (0 if not GO).
+  Future<int> getGroupMemberCount() async {
+    try {
+      return await _methodChannel.invokeMethod<int>('getGroupMemberCount') ?? 0;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  /// Returns the UUIDs of currently connected Multi-GO clients.
+  Future<List<String>> getGroupMemberUuids() async {
+    try {
+      final result =
+          await _methodChannel.invokeMethod<List>('getGroupMemberUuids');
+      return result?.cast<String>() ?? [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  // ═════════════════════════════════════════════════════════════════
   // Data Transport
   // ═════════════════════════════════════════════════════════════════
 
@@ -471,10 +614,14 @@ class WifiDirectService {
     _connectionStateSubscription?.cancel();
     _peersSubscription?.cancel();
     _invitationSubscription?.cancel();
+    _discoveredServicesSubscription?.cancel();
+    _groupMembersSubscription?.cancel();
     _messageController.close();
     _connectionStateController.close();
     _peersController.close();
     _invitationController.close();
+    _discoveredServicesController.close();
+    _groupMembersController.close();
     disconnect();
   }
 }

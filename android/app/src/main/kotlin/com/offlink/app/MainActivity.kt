@@ -31,6 +31,7 @@ class MainActivity : FlutterActivity() {
     private val wifiDirectPeersChannelName = "com.offlink.wifi_direct/peers"
     private val wifiDirectInvitationChannelName = "com.offlink.wifi_direct/invitation"
     private val wifiDirectDiscoveredServicesChannelName = "com.offlink.wifi_direct/discovered_services"
+    private val wifiDirectGroupMembersChannelName = "com.offlink.wifi_direct/group_members"
 
     // ── Presence Tracker channel names ────────────────────────────────
     private val presenceMethodChannelName = "com.offlink.presence"
@@ -51,6 +52,7 @@ class MainActivity : FlutterActivity() {
     private var wifiDirectPeersSink: EventChannel.EventSink? = null
     private var wifiDirectInvitationSink: EventChannel.EventSink? = null
     private var wifiDirectDiscoveredServicesSink: EventChannel.EventSink? = null
+    private var wifiDirectGroupMembersSink: EventChannel.EventSink? = null
     // ── Presence Tracker event sink ───────────────────────────────────
     private var presenceEventSink: EventChannel.EventSink? = null
 
@@ -430,6 +432,42 @@ class MainActivity : FlutterActivity() {
                         result.success(null)
                     }
 
+                    // ── Multi-GO Group Session API ────────────────────────
+                    "startAsGroupOwner" -> {
+                        Thread {
+                            val res = wifiDirectManager.startAsGroupOwner()
+                            mainHandler.post { result.success(res) }
+                        }.start()
+                    }
+
+                    "joinGroupAsClient" -> {
+                        val targetUuid = call.argument<String>("targetUuid") ?: ""
+                        val targetName = call.argument<String>("targetName") ?: ""
+                        Thread {
+                            val res = wifiDirectManager.joinGroupAsClient(targetUuid, targetName)
+                            mainHandler.post { result.success(res) }
+                        }.start()
+                    }
+
+                    "broadcastToAllClients" -> {
+                        val message    = call.argument<String>("message") ?: ""
+                        val senderUuid = call.argument<String>("senderUuid")
+                        val count = wifiDirectManager.broadcastToAllClients(message, senderUuid)
+                        result.success(count)
+                    }
+
+                    "isMultiGoOwner" -> {
+                        result.success(wifiDirectManager.isMultiGoOwner())
+                    }
+
+                    "getGroupMemberCount" -> {
+                        result.success(wifiDirectManager.getGroupMemberCount())
+                    }
+
+                    "getGroupMemberUuids" -> {
+                        result.success(wifiDirectManager.getGroupMemberUuids())
+                    }
+
                     else -> result.notImplemented()
                 }
             }
@@ -521,6 +559,41 @@ class MainActivity : FlutterActivity() {
             override fun onCancel(arguments: Any?) {
                 wifiDirectDiscoveredServicesSink = null
                 wifiDirectManager.discoveredServicesListener = null
+            }
+        })
+
+        // Wi-Fi Direct Group Members Event Channel
+        // Fires when a client joins or leaves the Multi-GO group.
+        // Each event: { "event": "joined"|"left", "uuid": String, "memberCount": Int }
+        EventChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            wifiDirectGroupMembersChannelName
+        ).setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(arguments: Any?, events: EventChannel.EventSink) {
+                wifiDirectGroupMembersSink = events
+                wifiDirectManager.groupMemberJoinedListener = { uuid ->
+                    mainHandler.post {
+                        wifiDirectGroupMembersSink?.success(mapOf(
+                            "event" to "joined",
+                            "uuid" to uuid,
+                            "memberCount" to wifiDirectManager.getGroupMemberCount()
+                        ))
+                    }
+                }
+                wifiDirectManager.groupMemberLeftListener = { uuid ->
+                    mainHandler.post {
+                        wifiDirectGroupMembersSink?.success(mapOf(
+                            "event" to "left",
+                            "uuid" to uuid,
+                            "memberCount" to wifiDirectManager.getGroupMemberCount()
+                        ))
+                    }
+                }
+            }
+            override fun onCancel(arguments: Any?) {
+                wifiDirectGroupMembersSink = null
+                wifiDirectManager.groupMemberJoinedListener = null
+                wifiDirectManager.groupMemberLeftListener  = null
             }
         })
 
