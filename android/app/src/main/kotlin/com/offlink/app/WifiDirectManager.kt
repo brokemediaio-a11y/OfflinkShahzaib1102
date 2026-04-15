@@ -97,6 +97,22 @@ class WifiDirectManager(private val context: Context) {
     private var socketWriter: BufferedWriter? = null
     private val isSocketActive = AtomicBoolean(false)
 
+    // ─── Multi-GO Group Session ────────────────────────────────────────────────
+    // When this device is a Multi-GO Group Owner it keeps one BufferedWriter per
+    // connected client.  clientSocketMap is keyed by peer UUID (from the UUID
+    // handshake) so the relay logic can skip the sender.
+    //
+    // When this device is a GROUP_OWNER in a regular (non-Multi-GO) session the
+    // map stays empty and the legacy single-socket path is used.  The flag
+    // isMultiGoGroupOwner distinguishes the two modes.
+    private val clientSocketMap = java.util.concurrent.ConcurrentHashMap<String, BufferedWriter>()
+    private val clientSockets   = java.util.concurrent.ConcurrentHashMap<String, Socket>()
+    private val isMultiGoGroupOwner = AtomicBoolean(false)
+    /** Fires when a new client UUID is accepted into the Multi-GO group. */
+    var groupMemberJoinedListener: ((String) -> Unit)? = null
+    /** Fires when a client UUID disconnects from the Multi-GO group. */
+    var groupMemberLeftListener: ((String) -> Unit)? = null
+
     // ─── Application-level heartbeat ──────────────────────────────────────────
     // Sends a lightweight PING frame every 15 s when no data is flowing.
     // Keeps the TCP connection alive through NAT/power-management and detects
@@ -657,6 +673,145 @@ class WifiDirectManager(private val context: Context) {
     fun getGroupOwnerAddress(): String? = groupOwnerAddress
     fun isP2pEnabled(): Boolean = isP2pEnabled.get()
     fun getConnectionPhase(): String = connectionPhase.get().name
+    fun isMultiGoOwner(): Boolean = isMultiGoGroupOwner.get()
+    fun getGroupMemberCount(): Int = clientSocketMap.size
+    fun getGroupMemberUuids(): List<String> = clientSocketMap.keys.toList()
+
+    // ─── Multi-GO Group Owner API ─────────────────────────────────────────────
+
+    /**
+     * Start this device as a Wi-Fi Direct Group Owner (software AP) without
+     * peer negotiation.  Uses createGroup() with the highest GO intent so this
+     * device always wins the role.
+     *
+     * After the framework confirms the group is created, [startMultiClientServer]
+     * opens a TCP ServerSocket in a loop that accepts N simultaneous clients.
+     *
+     * Call from Dart via method channel "startAsGroupOwner".
+     */
+    @SuppressLint("MissingPermission")
+    fun startAsGroupOwner(): Map<String, Any> {
+        if (!initialized) return mapOf("success" to false, "error" to "Not initialized")
+        val mgr = wifiP2pManager ?: return mapOf("success" to false, "error" to "Manager null")
+        val ch  = p2pChannel   ?: return mapOf("success" to false, "error" to "Channel null")
+
+        // Already acting as a Multi-GO owner — idempotent
+        if (isMultiGoGroupOwner.get()) {
+            Log.d(tag, "startAsGroupOwner: already Multi-GO owner — ignoring")
+            return mapOf("success" to true, "alreadyOwner" to true)
+        }
+
+        // Remove any existing group first so createGroup() starts clean
+        mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() { createMultiGoGroup(mgr, ch) }
+            override fun onFailure(@Suppress("UNUSED_PARAMETER") r: Int) {
+                // No group to remove — proceed directly
+                createMultiGoGroup(mgr, ch)
+            }
+        })
+        return mapOf("success" to true)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun createMultiGoGroup(mgr: WifiP2pManager, ch: WifiP2pManager.Channel) {
+        Log.d(tag, "Multi-GO: calling createGroup() to force GO role")
+        connectionPhase.set(ConnectionPhase.CONNECTING)
+        notifyConnectionState(connected = false, status = "forming_group")
+
+        mgr.createGroup(ch, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                Log.d(tag, "Multi-GO: createGroup() accepted — waiting for CONNECTION_CHANGED")
+                // Actual socket start happens in handleConnectionInfo() via CONNECTION_CHANGED
+            }
+            override fun onFailure(reason: Int) {
+                Log.e(tag, "Multi-GO: createGroup() failed: ${failureReason(reason)}")
+                connectionPhase.set(ConnectionPhase.FAILED)
+                notifyConnectionState(connected = false, error = "GO createGroup failed: ${failureReason(reason)}")
+            }
+        })
+    }
+
+    /**
+     * Connect to an existing Multi-GO group as a client.
+     *
+     * Behaves like [connectByUuid] but sets groupOwnerIntent = 0 so the GO
+     * role is yielded to the existing Group Owner.
+     *
+     * Call from Dart via method channel "joinGroupAsClient".
+     */
+    @SuppressLint("MissingPermission")
+    fun joinGroupAsClient(targetUuid: String, fallbackName: String): Map<String, Any> {
+        if (!initialized) return mapOf("success" to false, "error" to "Not initialized")
+        // Delegate to the standard UUID-based connect path.
+        // The GROUP_OWNER intent on the other side (= 15) guarantees it wins the election.
+        connectByUuid(targetUuid, fallbackName)
+        return mapOf("success" to true)
+    }
+
+    /**
+     * Send [message] to ALL connected clients simultaneously (GO-side relay).
+     *
+     * [senderUuid] — UUID of the device that originated the message.
+     *   Pass null to send to everyone (e.g. when the GO itself is the sender).
+     *   Pass a UUID to skip that socket (prevents echo-back to sender).
+     *
+     * Returns the count of sockets written to successfully.
+     */
+    fun broadcastToAllClients(message: String, senderUuid: String? = null): Int {
+        if (!isMultiGoGroupOwner.get()) {
+            Log.w(tag, "broadcastToAllClients: not a Multi-GO owner — use sendMessage instead")
+            return 0
+        }
+        var successCount = 0
+        val deadClients = mutableListOf<String>()
+        for ((uuid, writer) in clientSocketMap) {
+            if (uuid == senderUuid) continue // don't echo back to sender
+            try {
+                writer.write(message)
+                writer.newLine()
+                writer.flush()
+                successCount++
+            } catch (e: Exception) {
+                Log.w(tag, "Multi-GO: write to client $uuid failed: ${e.message}")
+                deadClients.add(uuid)
+            }
+        }
+        // Prune dead clients
+        for (uuid in deadClients) {
+            removeClient(uuid)
+        }
+        Log.d(tag, "Multi-GO: broadcastToAllClients → $successCount/${clientSocketMap.size + deadClients.size} sockets")
+        return successCount
+    }
+
+    /** Remove a client from the Multi-GO session and close its socket. */
+    private fun removeClient(uuid: String) {
+        clientSocketMap.remove(uuid)
+        clientSockets.remove(uuid)?.let {
+            try { it.close() } catch (_: Exception) {}
+        }
+        Log.d(tag, "Multi-GO: client $uuid removed (${clientSocketMap.size} remaining)")
+        mainHandler.post { groupMemberLeftListener?.invoke(uuid) }
+
+        // If all clients leave, notify Dart that the group is empty
+        if (clientSocketMap.isEmpty()) {
+            notifyMultiGoState()
+        }
+    }
+
+    /** Emit current Multi-GO group state to Dart. */
+    private fun notifyMultiGoState() {
+        val map = mutableMapOf<String, Any>(
+            "connected"       to true,
+            "role"            to "group_owner",
+            "socketActive"    to true,
+            "ipAddress"       to GROUP_OWNER_IP,
+            "connectionPhase" to connectionPhase.get().name,
+            "multiGoMemberCount" to clientSocketMap.size,
+            "multiGoMembers"  to clientSocketMap.keys.toList()
+        )
+        mainHandler.post { connectionStateListener?.invoke(map) }
+    }
 
     // ─── UUID-based connection via Wi-Fi Direct DNS-SD ────────────────────────
 
@@ -932,10 +1087,13 @@ class WifiDirectManager(private val context: Context) {
         val mgr = wifiP2pManager ?: return
         val ch  = p2pChannel   ?: return
         val phase = connectionPhase.get()
-        // Don't interfere with an active connection or a failed state (avoid BUSY loops)
-        if (phase == ConnectionPhase.FAILED ||
-            phase == ConnectionPhase.CONNECTING || phase == ConnectionPhase.GROUP_FORMED ||
-            phase == ConnectionPhase.SOCKET_CONNECTING || phase == ConnectionPhase.SOCKET_CONNECTED) {
+        // Don't interfere with an active connection in progress.
+        // FAILED is now retried by the passive-discovery heartbeat, so DNS-SD
+        // is also allowed to run from FAILED to keep the device visible.
+        if (phase == ConnectionPhase.CONNECTING ||
+            phase == ConnectionPhase.GROUP_FORMED ||
+            phase == ConnectionPhase.SOCKET_CONNECTING ||
+            phase == ConnectionPhase.SOCKET_CONNECTED) {
             Log.d(tag, "Background DNS-SD skipped — phase=$phase")
             return
         }
@@ -1260,6 +1418,15 @@ class WifiDirectManager(private val context: Context) {
     // ═══════════════════════════════════════════════════════════════
 
     private fun startSocketServer() {
+        if (isMultiGoGroupOwner.get()) {
+            startMultiClientServer()
+        } else {
+            startSingleClientServer()
+        }
+    }
+
+    /** Legacy single-client server — used for regular P2P unicast connections. */
+    private fun startSingleClientServer() {
         Log.d(tag, "GROUP OWNER — starting TCP ServerSocket on port $TCP_PORT")
         connectionPhase.set(ConnectionPhase.SOCKET_CONNECTING)
 
@@ -1291,6 +1458,139 @@ class WifiDirectManager(private val context: Context) {
                     Log.d(tag, "TCP server closed (expected — disconnect/reset in progress)")
                 }
             }
+        }
+    }
+
+    /**
+     * Multi-client TCP server for the Multi-GO Group Owner.
+     *
+     * Runs a persistent accept-loop.  Each accepted connection gets its own
+     * coroutine-equivalent (executor thread) running [initMultiClientStreams].
+     * The loop exits only when [serverSocket] is closed (via [closeSocket]).
+     */
+    private fun startMultiClientServer() {
+        Log.d(tag, "Multi-GO: starting multi-client TCP ServerSocket on port $TCP_PORT")
+        connectionPhase.set(ConnectionPhase.SOCKET_CONNECTED)  // GO is immediately "connected"
+        isSocketActive.set(true)
+
+        notifyConnectionState(
+            connected = true,
+            role = "group_owner",
+            ipAddress = GROUP_OWNER_IP,
+            socketActive = true
+        )
+        mainHandler.post { startHeartbeat() }
+
+        executor.execute {
+            try {
+                closeSocket()
+                val srv = ServerSocket(TCP_PORT)
+                serverSocket = srv
+                Log.d(tag, "Multi-GO: ServerSocket listening on port $TCP_PORT…")
+
+                // Accept loop — runs until the socket is closed
+                while (isSocketActive.get()) {
+                    val clientSocket = try {
+                        srv.accept()
+                    } catch (e: Exception) {
+                        if (isSocketActive.get()) {
+                            Log.e(tag, "Multi-GO: ServerSocket.accept() error", e)
+                        } else {
+                            Log.d(tag, "Multi-GO: ServerSocket closed — accept loop ending")
+                        }
+                        break
+                    }
+                    val clientIp = clientSocket.inetAddress?.hostAddress ?: "unknown"
+                    Log.d(tag, "Multi-GO: new client connected from $clientIp")
+                    // Hand each client off to its own thread
+                    executor.execute { initMultiClientStreams(clientSocket) }
+                }
+            } catch (e: Exception) {
+                if (isSocketActive.get()) {
+                    Log.e(tag, "Multi-GO: ServerSocket setup error", e)
+                    handleSocketError(e)
+                }
+            }
+        }
+    }
+
+    /**
+     * Perform UUID handshake with a freshly accepted client, then run its
+     * dedicated read-loop.  Messages from this client are relayed to ALL
+     * other clients immediately (same-iteration relay).
+     */
+    private fun initMultiClientStreams(sock: Socket) {
+        try {
+            sock.keepAlive  = true
+            sock.tcpNoDelay = true
+
+            val writer = BufferedWriter(OutputStreamWriter(sock.getOutputStream(), "UTF-8"))
+            val reader = BufferedReader(InputStreamReader(sock.getInputStream(), "UTF-8"))
+
+            // ── UUID handshake ──────────────────────────────────────────────
+            // Send our own UUID first so the client knows who the GO is.
+            val myUuid = ownUuid ?: "unknown-go"
+            val handshake = """{"__type":"__uuid_handshake__","senderUuid":"$myUuid"}"""
+            writer.write(handshake); writer.newLine(); writer.flush()
+
+            // Read the client's UUID handshake
+            val firstLine = reader.readLine() ?: run {
+                Log.w(tag, "Multi-GO: client closed without handshake")
+                try { sock.close() } catch (_: Exception) {}
+                return
+            }
+
+            var clientUuid = "unknown-${System.currentTimeMillis()}"
+            try {
+                val json = org.json.JSONObject(firstLine)
+                if (json.optString("__type") == "__uuid_handshake__") {
+                    clientUuid = json.optString("senderUuid", clientUuid)
+                } else {
+                    // Not a handshake — still deliver to Dart and treat as unknown client
+                    mainHandler.post { messageListener?.invoke(firstLine) }
+                }
+            } catch (_: Exception) {
+                // Malformed JSON — deliver raw
+                mainHandler.post { messageListener?.invoke(firstLine) }
+            }
+
+            clientSocketMap[clientUuid] = writer
+            clientSockets[clientUuid]   = sock
+            Log.d(tag, "Multi-GO: client $clientUuid joined (${clientSocketMap.size} total)")
+            mainHandler.post { groupMemberJoinedListener?.invoke(clientUuid) }
+            notifyMultiGoState()
+
+            // Acknowledge back to client so they know they are part of the group
+            val ack = """{"__type":"__group_joined__","groupOwnerUuid":"$myUuid","yourUuid":"$clientUuid"}"""
+            writer.write(ack); writer.newLine(); writer.flush()
+
+            // ── Per-client receive loop ─────────────────────────────────────
+            try {
+                while (isSocketActive.get()) {
+                    val line = reader.readLine() ?: break
+                    if (line == heartbeatPingMessage) continue
+
+                    Log.v(tag, "Multi-GO received from $clientUuid: ${line.take(80)}")
+
+                    // Relay to all OTHER clients simultaneously
+                    broadcastToAllClients(line, senderUuid = clientUuid)
+
+                    // Also deliver to GO itself (GO is a participant too)
+                    mainHandler.post { messageListener?.invoke(line) }
+                }
+            } catch (e: Exception) {
+                if (isSocketActive.get()) {
+                    Log.w(tag, "Multi-GO: read error for client $clientUuid: ${e.message}")
+                }
+            }
+
+            // Client disconnected — clean up
+            Log.d(tag, "Multi-GO: client $clientUuid disconnected")
+            removeClient(clientUuid)
+
+        } catch (e: Exception) {
+            Log.e(tag, "Multi-GO: initMultiClientStreams error", e)
+            try { sock.close() } catch (_: Exception) {}
         }
     }
 
@@ -1415,6 +1715,15 @@ class WifiDirectManager(private val context: Context) {
         socketWriter = null
         activeSocket = null
         serverSocket = null
+        // Close all Multi-GO client sockets
+        if (clientSocketMap.isNotEmpty()) {
+            Log.d(tag, "Multi-GO: closing ${clientSocketMap.size} client socket(s)")
+            for ((_, w) in clientSocketMap) { try { w.close() } catch (_: Exception) {} }
+            for ((_, s) in clientSockets)   { try { s.close() } catch (_: Exception) {} }
+            clientSocketMap.clear()
+            clientSockets.clear()
+        }
+        isMultiGoGroupOwner.set(false)
         if (wasActive) Log.d(tag, "Socket closed")
     }
 
@@ -1428,13 +1737,19 @@ class WifiDirectManager(private val context: Context) {
         cancelPassiveDiscovery()
         passiveDiscoveryRunnable = Runnable {
             val phase = connectionPhase.get()
-            if (initialized &&
+            // FAILED from discoverPeers().onFailure must be retried here — it has no
+            // other recovery path. FAILED from socket/connection errors self-heals via
+            // removeGroupAfterError() → CONNECTION_CHANGED → resetState(DISCONNECTED).
+            // Allowing FAILED in the heartbeat is safe: discoverPeers() will either
+            // recover (phase → DISCOVERING) or fail again (phase stays FAILED) and
+            // we retry on the next tick. Active-connection phases are still excluded.
+            val allowHeartbeat = initialized &&
                 !isBusyRecovering.get() &&
-                phase != ConnectionPhase.FAILED &&
                 phase != ConnectionPhase.CONNECTING &&
                 phase != ConnectionPhase.GROUP_FORMED &&
                 phase != ConnectionPhase.SOCKET_CONNECTING &&
-                phase != ConnectionPhase.SOCKET_CONNECTED) {
+                phase != ConnectionPhase.SOCKET_CONNECTED
+            if (allowHeartbeat) {
                 Log.d(tag, "Passive discovery heartbeat — restarting discoverPeers() (phase=$phase)")
                 discoverPeers()
             }
@@ -1922,7 +2237,6 @@ class WifiDirectManager(private val context: Context) {
         cancelServiceDiscoveryTimeout()
         targetUuid = null
 
-        connectionPhase.set(ConnectionPhase.GROUP_FORMED)
         isGroupOwner.set(info.isGroupOwner)
         groupOwnerAddress = info.groupOwnerAddress?.hostAddress
 
@@ -1932,6 +2246,16 @@ class WifiDirectManager(private val context: Context) {
             "role=${if (info.isGroupOwner) "GROUP_OWNER" else "CLIENT"}, " +
             "groupOwnerAddress=$groupOwnerAddress"
         )
+
+        // ── Multi-GO fast path: if we called createGroup() we skip consent ───────
+        // The Multi-GO owner initiated the group itself — no peer invitation to consent.
+        if (isMultiGoGroupOwner.get() && info.isGroupOwner) {
+            connectionPhase.set(ConnectionPhase.GROUP_FORMED)
+            onMultiGoGroupFormed(info)
+            return
+        }
+
+        connectionPhase.set(ConnectionPhase.GROUP_FORMED)
 
         // ── Consent gate A — dialog was already shown via PEERS_CHANGED ─────────
         // On some OEM builds PEERS_CHANGED fires with status=INVITED before the
@@ -1981,7 +2305,7 @@ class WifiDirectManager(private val context: Context) {
     /** Start TCP server (GO) or client (peer) based on current role. */
     private fun startSocketOrFail() {
         if (isGroupOwner.get()) {
-            startSocketServer()
+            startSocketServer()  // routes to multi-client or single-client based on isMultiGoGroupOwner
         } else {
             val goIp = groupOwnerAddress
             if (goIp != null) {
@@ -1992,5 +2316,20 @@ class WifiDirectManager(private val context: Context) {
                 notifyConnectionState(connected = false, error = "Group owner IP unavailable")
             }
         }
+    }
+
+    /** Called from handleConnectionInfo when createGroup() was used (Multi-GO path). */
+    @SuppressLint("MissingPermission")
+    private fun onMultiGoGroupFormed(info: WifiP2pInfo) {
+        if (!info.groupFormed || !info.isGroupOwner) {
+            Log.w(tag, "Multi-GO: expected to be GO after createGroup() but groupFormed=${info.groupFormed} isGroupOwner=${info.isGroupOwner}")
+            return
+        }
+        isMultiGoGroupOwner.set(true)
+        isGroupOwner.set(true)
+        groupOwnerAddress = GROUP_OWNER_IP
+        connectionPhase.set(ConnectionPhase.GROUP_FORMED)
+        Log.d(tag, "Multi-GO: group formed — starting multi-client server")
+        startMultiClientServer()
     }
 }

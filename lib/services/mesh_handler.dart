@@ -13,12 +13,15 @@ import 'database_helper.dart';
 /// Every packet received from any transport passes through [onRawReceived].
 /// Every new outbound message from the UI passes through [sendMessage].
 ///
-/// Transport-agnostic: uses an injected [_sendViaTransport] callback so
-/// [ConnectionManager] can swap the underlying radio without touching routing.
+/// Transport-agnostic: uses injected callbacks so [ConnectionManager] can
+/// swap the underlying radio without touching routing.
 ///
 /// Delivered packets are emitted on [deliveredMessages] as
 /// [MessageModel]-compatible JSON strings so the existing UI pipeline
 /// (ConnectionProvider → ChatNotifier) works unchanged.
+///
+/// Broadcast packets (type == 'broadcast', toUserId == '*') are delivered
+/// locally AND forwarded to every reachable neighbour via [broadcastViaTransport].
 ///
 /// ## Range Extension (Feature 5)
 ///
@@ -27,7 +30,8 @@ import 'database_helper.dart';
 ///   - Single-hop BLE range: ~10–30 m (real-world)
 ///   - Single-hop WiFi Direct range: ~50 m
 ///   - Effective logical range = sum of relay hops × single-hop range
-///   - With TTL=7 and mesh relay, theoretical range is 7× the single-hop distance
+///   - With TTL=5 and mesh relay, broadcasts can theoretically reach
+///     peers 5× the single-hop distance away (250+ m indoors).
 ///
 /// Each relay hop is transparent to the sender and receiver — the MeshHandler
 /// on each intermediate node decrements TTL, increments hopCount, checks
@@ -39,17 +43,24 @@ class MeshHandler {
   /// Returns true if the send succeeded.
   final Future<bool> Function(String wireData) _sendViaTransport;
 
+  /// Broadcasts serialised wire data to ALL registered neighbours.
+  /// Returns the number of successful sends (0 = no peers / all failed).
+  final Future<int> Function(String wireData) _broadcastViaTransport;
+
   // ── Output stream ─────────────────────────────────────────────────────
   final _deliveredController = StreamController<String>.broadcast();
 
-  /// Emits [MessageModel]-format JSON for messages delivered to this device.
-  /// Also emits [__delivery_ack__]-type JSON when an ACK packet arrives.
+  /// Emits [MessageModel]-format JSON for unicast messages delivered here.
+  /// Emits `__delivery_ack__` JSON when an ACK packet arrives.
+  /// Emits `__broadcast__` JSON when a broadcast packet arrives.
   Stream<String> get deliveredMessages => _deliveredController.stream;
 
   MeshHandler({
     required this.myUserId,
     required Future<bool> Function(String wireData) sendViaTransport,
-  }) : _sendViaTransport = sendViaTransport;
+    required Future<int> Function(String wireData) broadcastViaTransport,
+  })  : _sendViaTransport = sendViaTransport,
+        _broadcastViaTransport = broadcastViaTransport;
 
   // ═══════════════════════════════════════════════════════════════════════
   // Receive path
@@ -68,7 +79,13 @@ class MeshHandler {
       return;
     }
 
-    // Route adverts are processed separately — no dedup needed
+    // ── Broadcast packets ────────────────────────────────────────────
+    if (packet.type == 'broadcast') {
+      await _handleIncomingBroadcast(packet, currentPeers);
+      return;
+    }
+
+    // ── Route adverts — processed separately, no dedup needed ────────
     if (packet.type == 'route_advert') {
       await _processRouteAdvert(packet, currentPeers);
       return;
@@ -111,16 +128,80 @@ class MeshHandler {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
+  // Broadcast receive path
+  // ═══════════════════════════════════════════════════════════════════════
+
+  Future<void> _handleIncomingBroadcast(
+    MessagePacket packet,
+    Map<String, PeerInfo> currentPeers,
+  ) async {
+    // Dedup — SeenCache prevents the same broadcast looping back.
+    if (await SeenCache.hasSeen(packet.msgId)) {
+      Logger.debug('[BROADCAST][MeshHandler] Already seen ${packet.msgId} — dropping');
+      return;
+    }
+    await SeenCache.markSeen(packet.msgId);
+
+    // Deliver locally if this device didn't originate it.
+    // (We already show our own sent broadcasts in BroadcastProvider.)
+    if (packet.fromUserId != myUserId) {
+      Logger.info(
+          '[BROADCAST][MeshHandler] Delivering ${packet.msgId} locally '
+          '(from=${packet.fromUserId} hop=${packet.hopCount})');
+      await _deliverBroadcastToSelf(packet);
+    }
+
+    // TTL check before relaying.
+    if (packet.isExpired) {
+      Logger.warning(
+          '[BROADCAST][MeshHandler] ${packet.msgId} TTL exhausted — not relaying');
+      return;
+    }
+
+    // Relay to all neighbours (hop-decremented copy).
+    final hopped = packet.hop();
+    final sentCount = await _broadcastViaTransport(hopped.toWire());
+    Logger.info(
+        '[BROADCAST][MeshHandler] Relayed ${packet.msgId} to $sentCount neighbour(s) '
+        '(ttl=${hopped.ttl} hop=${hopped.hopCount})');
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
   // Send path (outbound from UI)
   // ═══════════════════════════════════════════════════════════════════════
 
   /// Route a new outbound [packet] created by this device's user.
+  ///
+  /// For **broadcast** packets ([toUserId] == '*', [type] == 'broadcast'):
+  ///   - Marks msgId in SeenCache (prevents echo-back).
+  ///   - Sends to all neighbours via [_broadcastViaTransport].
+  ///   - Queues in [DtnQueue] if no neighbours are reachable right now.
+  ///
+  /// For **unicast** packets: uses [RoutingEngine] to pick a next hop.
   ///
   /// Returns true if sent over the air now; false if queued in [DtnQueue].
   Future<bool> sendMessage({
     required MessagePacket packet,
     required Map<String, PeerInfo> currentPeers,
   }) async {
+    // ── Broadcast fast path ───────────────────────────────────────────
+    if (packet.toUserId == '*' && packet.type == 'broadcast') {
+      await SeenCache.markSeen(packet.msgId); // prevent loop-back if we receive our own
+      final sentCount = await _broadcastViaTransport(packet.toWire());
+      if (sentCount == 0) {
+        await DtnQueue.enqueue(packet);
+        Logger.info(
+            '[BROADCAST][MeshHandler] $myUserId | ${packet.msgId} | '
+            'NO_PEERS_QUEUED');
+        return false;
+      }
+      Logger.info(
+          '[BROADCAST][MeshHandler] $myUserId | ${packet.msgId} | '
+          'SENT to $sentCount peer(s)');
+      return true;
+    }
+
+    // ── Unicast path (original logic) ────────────────────────────────
     await SeenCache.markSeen(packet.msgId); // prevent loop-back
 
     final decision = await RoutingEngine.resolve(
@@ -164,6 +245,19 @@ class MeshHandler {
 
   Future<bool> _forward(
       MessagePacket packet, Map<String, PeerInfo> currentPeers) async {
+    // ── Broadcast retry path ─────────────────────────────────────────
+    if (packet.toUserId == '*' && packet.type == 'broadcast') {
+      final sentCount = await _broadcastViaTransport(packet.toWire());
+      if (sentCount == 0) {
+        await DtnQueue.enqueue(packet); // CONFLICT IGNORE — already queued
+        return false;
+      }
+      Logger.info(
+          '[BROADCAST][MeshHandler] ↗️ Retried ${packet.msgId} to $sentCount peer(s)');
+      return true;
+    }
+
+    // ── Unicast forward path (original logic) ────────────────────────
     final decision = await RoutingEngine.resolve(
       toUserId: packet.toUserId,
       connectedPeers: currentPeers,
@@ -188,7 +282,7 @@ class MeshHandler {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // Local delivery
+  // Local delivery — unicast
   // ═══════════════════════════════════════════════════════════════════════
 
   Future<void> _deliverToSelf(MessagePacket packet) async {
@@ -229,6 +323,24 @@ class MeshHandler {
       'senderPeerId': null,
     });
     _deliveredController.add(modelJson);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Local delivery — broadcast
+  // ═══════════════════════════════════════════════════════════════════════
+
+  Future<void> _deliverBroadcastToSelf(MessagePacket packet) async {
+    // Emit a special event type so ConnectionProvider can route this to
+    // BroadcastProvider without trying to parse it as a MessageModel.
+    final eventJson = jsonEncode({
+      '__type': '__broadcast__',
+      'msgId': packet.msgId,
+      'fromUserId': packet.fromUserId,
+      'payload': packet.payload, // raw JSON: { "text", "senderName", "lat"?, "lng"? }
+      'timestamp': packet.timestamp,
+      'hopCount': packet.hopCount,
+    });
+    _deliveredController.add(eventJson);
   }
 
   // ═══════════════════════════════════════════════════════════════════════

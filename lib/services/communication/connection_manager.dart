@@ -25,6 +25,7 @@ import 'transport_manager.dart';
 import 'ble_discovery_service.dart';      // ← Control Plane (discovery only)
 import 'ble_peripheral_service.dart';
 import 'wifi_direct_service.dart';        // ← Data Plane (primary transport)
+import '../group_session_manager.dart';   // ← Multi-GO group session state
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Dual-Radio Architecture
@@ -73,15 +74,26 @@ class ConnectionManager {
     _bleDiscoverySubscription =
         _bleDiscoveryService.discoveredDevices.listen((devices) {
       _bleDevices = devices;
-      _emitDiscoveredDevices();
-      // Check if any newly discovered peer has pending DTN messages
-      // and silently connect to deliver them (T2 fix).
-      unawaited(_checkAndAutoConnectForPendingMessages(devices));
+      _emitDiscoveredDevices(); // auto-connect check is inside _emitDiscoveredDevices
     });
 
     // ── Native scan results (TECNO / problematic-device fallback) ──
     _nativeScanSubscription =
         _blePeripheralService.scanResults.listen(_handleNativeScanResult);
+
+    // ── Broadcast delivery heartbeat ─────────────────────────────
+    // Fires every 30 s regardless of BLE scan state.
+    // Production logs show BLE scanning can silently fail, leaving queued
+    // broadcasts undelivered until a manual WiFi Direct connection is made.
+    // This timer is the fallback that guarantees delivery eventually fires.
+    _broadcastHeartbeatTimer = Timer.periodic(
+      const Duration(seconds: 30),
+      (_) => unawaited(_triggerBroadcastDelivery()),
+    );
+    // Also try immediately at startup (e.g. broadcasts queued in a previous
+    // session) — give the stack 4 s to initialise first.
+    Future.delayed(const Duration(seconds: 4),
+        () => unawaited(_triggerBroadcastDelivery()));
   }
 
   // ── Services ──────────────────────────────────────────────────────
@@ -98,6 +110,13 @@ class ConnectionManager {
   final PeerDiscovery _peerDiscovery = PeerDiscovery.instance;
   DtnRetryLoop? _dtnRetryLoop;
   StreamSubscription<String>? _meshDeliveredSubscription;
+
+  // ── Multi-GO group session ─────────────────────────────────────────
+  final GroupSessionManager _groupSession = GroupSessionManager();
+  StreamSubscription<Map<String, dynamic>>? _groupMembersSubscription;
+
+  /// Expose group session state to providers/UI.
+  GroupSessionManager get groupSession => _groupSession;
 
   // ── State ─────────────────────────────────────────────────────────
   ConnectionType _currentConnectionType = ConnectionType.none;
@@ -118,6 +137,30 @@ class ConnectionManager {
 
   /// Hard cap on auto-reconnect before giving up and showing an error.
   static const int _maxReconnectAttempts = 8;
+
+  // ── Broadcast sequential-delivery state ──────────────────────────────────
+  /// msgId → set of peerIds that have already received this broadcast in the
+  /// current app session.  Prevents redundant re-sends and drives the delivery
+  /// round (skip peers that already got every active broadcast).
+  final Map<String, Set<String>> _broadcastDeliveredTo = {};
+
+  /// Peers still waiting to receive the current batch of queued broadcasts.
+  /// Populated by [_checkAndAutoConnectForPendingMessages]; consumed one at a
+  /// time by [_scheduleNextBroadcastDelivery].
+  final List<DeviceModel> _broadcastDeliveryQueue = [];
+
+  /// True when the current WiFi-Direct connection was opened automatically
+  /// by the broadcast delivery system, not by the user tapping a device.
+  /// When true, [_scheduleNextBroadcastDelivery] will auto-disconnect and
+  /// move to the next queued peer after [_syncPendingMessages] completes.
+  bool _isAutoBroadcastConnection = false;
+
+  // ── Broadcast delivery heartbeat ─────────────────────────────────────────
+  /// Fires every 30 s regardless of BLE scan state.
+  /// This is the safety-net: if BLE scanning fails (as observed in production)
+  /// the app still attempts to deliver queued broadcasts to any known peers.
+  // ignore: unused_field  — singleton; timer runs for the app lifetime.
+  Timer? _broadcastHeartbeatTimer;
 
   bool get isReconnecting =>
       _reconnectTimer != null ||
@@ -212,6 +255,13 @@ class ConnectionManager {
       _meshHandler = MeshHandler(
         myUserId: myUuid,
         sendViaTransport: (wireData) => _wifiDirectService.sendMessage(wireData),
+        // Broadcasts go to EVERY neighbour registered in TransportManager.
+        // TransportManager.broadcastToAllPeers() iterates its neighbour map
+        // and calls sendToPeer() for each — returns count of successful sends.
+        broadcastViaTransport: (wireData) async {
+          final bytes = Uint8List.fromList(utf8.encode(wireData));
+          return _transportManager.broadcastToAllPeers(bytes);
+        },
       );
 
       // Delivered packets (converted to MessageModel JSON) → UI pipeline
@@ -256,10 +306,8 @@ class ConnectionManager {
         _handleIncomingMessage(message);
       });
 
-      // ── Wi-Fi Direct: connection state ───────────────────────────
-      _wifiConnectionStateSubscription?.cancel();
-      _wifiConnectionStateSubscription =
-          _wifiDirectService.connectionState.listen(_handleWifiDirectState);
+      // Wi-Fi Direct connection state is wired below together with
+      // Multi-GO group session sync (see further down in initialize()).
 
       // ── Wi-Fi Direct: incoming invitations ────────────────────────
       _wifiInvitationSubscription?.cancel();
@@ -308,6 +356,34 @@ class ConnectionManager {
           changed = true;
         }
         if (changed) _emitDiscoveredDevices();
+      });
+
+      // ── Multi-GO group member events ─────────────────────────────
+      _groupMembersSubscription?.cancel();
+      _groupMembersSubscription =
+          _wifiDirectService.groupMemberEvents.listen((event) {
+        _groupSession.handleNativeMemberEvent(event);
+        // Emit connection-state change so providers rebuild the member list
+        _connectionController
+            .add(ConnectionState.connected); // re-use existing event
+      });
+
+      // ── Wi-Fi Direct: connection state + Multi-GO group session sync ─────
+      _wifiConnectionStateSubscription?.cancel();
+      _wifiConnectionStateSubscription =
+          _wifiDirectService.connectionState.listen((state) {
+        if (state.isGroupOwner && state.socketActive) {
+          final myId = DeviceStorage.getDeviceId();
+          if (!_groupSession.isGroupOwner) {
+            _groupSession.becomeGroupOwner(
+              myId: myId,
+              groupId: '${myId}_${DateTime.now().millisecondsSinceEpoch}',
+            );
+          }
+        } else if (!state.connected && _groupSession.isInGroup) {
+          _groupSession.leaveGroup();
+        }
+        _handleWifiDirectState(state);
       });
 
       // ── Device-specific scan mode detection ──────────────────────
@@ -591,8 +667,13 @@ class ConnectionManager {
           transport: 'wifi_direct',
         ));
 
-        // Flush any pending messages for this peer
-        unawaited(_syncPendingMessages(senderUuid));
+        // Flush any pending messages for this peer, then advance the
+        // broadcast delivery queue (connects to next peer if needed).
+        _syncPendingMessages(senderUuid).then((_) {
+          _scheduleNextBroadcastDelivery(senderUuid);
+        }).catchError((Object e) {
+          Logger.error('ConnectionManager: _syncPendingMessages error', e);
+        });
       } else {
         // ── INITIATOR side: handshake reply confirms peer is ready ──
         // Also update the peer's name if the handshake carries a better one.
@@ -621,8 +702,14 @@ class ConnectionManager {
           transport: 'wifi_direct',
         ));
 
-        // Flush pending messages now that the socket is confirmed open
-        unawaited(_syncPendingMessages(_connectedPeerId!));
+        // Flush pending messages now that the socket is confirmed open,
+        // then advance the broadcast delivery queue if applicable.
+        final peerId = _connectedPeerId!;
+        _syncPendingMessages(peerId).then((_) {
+          _scheduleNextBroadcastDelivery(peerId);
+        }).catchError((Object e) {
+          Logger.error('ConnectionManager: _syncPendingMessages error', e);
+        });
       }
     } catch (e) {
       Logger.error('ConnectionManager: error handling UUID handshake', e);
@@ -1369,6 +1456,84 @@ class ConnectionManager {
       _deviceStreamController.stream;
 
   // ═══════════════════════════════════════════════════════════════════
+  // Multi-GO Broadcast Group API
+  // ═══════════════════════════════════════════════════════════════════
+
+  /// Start this device as the Multi-GO Group Owner.
+  ///
+  /// This calls [WifiDirectService.startAsGroupOwner()] which triggers
+  /// [WifiP2pManager.createGroup()] on the native side with GO intent = 15,
+  /// then opens the multi-client TCP ServerSocket.
+  ///
+  /// On success [groupSession.isGroupOwner] becomes true and subsequent
+  /// broadcast sends use [_transportManager.sendToAllClients] instead of
+  /// the sequential DTN epidemic path.
+  ///
+  /// Returns true if the native call was accepted.
+  Future<bool> startBroadcastGroup() async {
+    if (!_isInitialized) return false;
+    final result = await _wifiDirectService.startAsGroupOwner();
+    if (result['success'] == true) {
+      Logger.info('[ConnectionManager] startBroadcastGroup: GO role requested');
+      return true;
+    }
+    Logger.error('[ConnectionManager] startBroadcastGroup failed: ${result['error']}');
+    return false;
+  }
+
+  /// Join an existing Multi-GO broadcast group as a client.
+  ///
+  /// [groupOwnerDevice] — the Group Owner's [DeviceModel] (from BLE/DNS-SD discovery).
+  ///
+  /// Connects via the standard UUID-based Wi-Fi Direct path; after the
+  /// TCP socket is established the device can send to the GO via
+  /// [_transportManager.sendToGroupOwner] and receives all broadcasts
+  /// the GO relays.
+  ///
+  /// Returns true if the connection attempt was initiated.
+  Future<bool> joinBroadcastGroup(DeviceModel groupOwnerDevice) async {
+    if (!_isInitialized) return false;
+    final result = await _wifiDirectService.joinGroupAsClient(
+      targetUuid: groupOwnerDevice.id,
+      targetName: groupOwnerDevice.name,
+    );
+    if (result['success'] == true) {
+      _groupSession.joinGroup(
+        ownerId: groupOwnerDevice.id,
+        groupId: groupOwnerDevice.id,
+      );
+      Logger.info('[ConnectionManager] joinBroadcastGroup: connecting to GO ${groupOwnerDevice.id}');
+      return true;
+    }
+    Logger.error('[ConnectionManager] joinBroadcastGroup failed: ${result['error']}');
+    return false;
+  }
+
+  /// Route a broadcast packet using the best available path:
+  ///   - GO mode  → [sendToAllClients] (simultaneous, milliseconds)
+  ///   - Client   → [sendToGroupOwner] (GO relays to everyone)
+  ///   - No group → existing DTN epidemic path (kept as fallback)
+  Future<bool> routeBroadcastPacket(MessagePacket packet,
+      {String? senderUuid}) async {
+    if (_groupSession.isGroupOwner) {
+      final wireData = packet.toWire();
+      final count = await _transportManager.sendToAllClients(
+        wireData,
+        senderUuid: senderUuid,
+      );
+      Logger.info('[ConnectionManager] routeBroadcastPacket: GO → sent to $count clients');
+      return count > 0;
+    } else if (_groupSession.isInGroup) {
+      final wireData = packet.toWire();
+      final ok = await _transportManager.sendToGroupOwner(wireData);
+      Logger.info('[ConnectionManager] routeBroadcastPacket: client → sent to GO: $ok');
+      return ok;
+    }
+    // Fallback: DTN epidemic flooding (existing behaviour)
+    return routePacket(packet);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
   // Native scan result handler (TECNO / problematic-device fallback)
   // ═══════════════════════════════════════════════════════════════════
 
@@ -1595,7 +1760,32 @@ class ConnectionManager {
     for (final d in _nativeScanDevices.values) {
       combined[d.id] = d;
     }
-    _deviceStreamController.add(combined.values.toList());
+    final deviceList = combined.values.toList();
+    _deviceStreamController.add(deviceList);
+
+    // Trigger broadcast (and unicast) auto-connect whenever ANY discovery
+    // source updates the device list — BLE, WiFi Direct DNS-SD, or native scan.
+    // Previously this only fired from the BLE subscription, so WiFi Direct
+    // DNS-SD discoveries (which work even when BLE scanning fails) were ignored.
+    if (deviceList.isNotEmpty) {
+      unawaited(_checkAndAutoConnectForPendingMessages(deviceList));
+    }
+  }
+
+  /// Build the current combined device list from all discovery sources and
+  /// call [_checkAndAutoConnectForPendingMessages].
+  ///
+  /// Called by the 30-second heartbeat timer so that queued broadcasts are
+  /// delivered even when BLE scanning has silently stopped.
+  Future<void> _triggerBroadcastDelivery() async {
+    final Map<String, DeviceModel> combined = {};
+    for (final d in _wifiDirectDiscoveredDevices.values) combined[d.id] = d;
+    for (final d in _bleDevices) combined[d.id] = d;
+    for (final d in _nativeScanDevices.values) combined[d.id] = d;
+    final deviceList = combined.values.toList();
+    if (deviceList.isNotEmpty) {
+      await _checkAndAutoConnectForPendingMessages(deviceList);
+    }
   }
 
   /// Update the cached name for [uuid] across all in-memory device maps and
@@ -1801,6 +1991,53 @@ class ConnectionManager {
   Future<void> _syncPendingMessages(String connectedPeerId) async {
     // ── Primary path: DtnQueue (SQLite) ───────────────────────────
     final dtnPending = await DtnQueue.getPendingPackets();
+
+    // ── Broadcast packets (toUserId == '*') ───────────────────────
+    // Fetch with NO throttle — every peer that connects must receive all
+    // active broadcasts regardless of when another peer was last served.
+    // We do NOT delete them from the queue here; [recordBroadcastSent]
+    // only updates last_attempt so other peers can still receive them.
+    final broadcastPkts = await DtnQueue.getPendingBroadcasts();
+    if (broadcastPkts.isNotEmpty) {
+      Logger.info(
+          'ConnectionManager: flushing ${broadcastPkts.length} broadcast '
+          'packet(s) to newly connected peer $connectedPeerId');
+      int bSynced = 0;
+      for (final packet in broadcastPkts) {
+        // Skip if already delivered to this peer this session.
+        final alreadySent =
+            _broadcastDeliveredTo[packet.msgId]?.contains(connectedPeerId) ??
+                false;
+        if (alreadySent) {
+          Logger.debug(
+              'ConnectionManager: broadcast ${packet.msgId} already '
+              'delivered to $connectedPeerId — skipping');
+          continue;
+        }
+        try {
+          final sent = await _wifiDirectService.sendMessage(packet.toWire());
+          if (sent) {
+            bSynced++;
+            // Track in-memory: this peer got the broadcast.
+            _broadcastDeliveredTo
+                .putIfAbsent(packet.msgId, () => {})
+                .add(connectedPeerId);
+            // Don't delete — other peers still need this broadcast.
+            await DtnQueue.recordBroadcastSent(packet.msgId);
+            Logger.debug(
+                'ConnectionManager: broadcast ${packet.msgId} → $connectedPeerId');
+          }
+        } catch (e) {
+          Logger.error(
+              'ConnectionManager: error sending broadcast ${packet.msgId}', e);
+        }
+      }
+      Logger.info(
+          'ConnectionManager: broadcast flush — $bSynced/${broadcastPkts.length} '
+          'sent to $connectedPeerId');
+    }
+
+    // ── Unicast packets destined specifically for this peer ────────
     final relevant = dtnPending.where((pkt) =>
         pkt.toUserId == connectedPeerId).toList();
 
@@ -1886,6 +2123,37 @@ class ConnectionManager {
       final pending = await DtnQueue.getPendingPackets();
       if (pending.isEmpty) return;
 
+      // ── Broadcast packets: deliver to ALL visible peers ──────────
+      // Broadcasts use toUserId == '*' which never matches a device UUID.
+      // We queue EVERY visible BLE peer that hasn't yet received each
+      // active broadcast, then connect to them one by one.
+      final hasBroadcasts = pending.any((p) => p.toUserId == '*');
+      if (hasBroadcasts) {
+        final broadcasts = await DtnQueue.getPendingBroadcasts();
+        if (broadcasts.isNotEmpty) {
+          _broadcastDeliveryQueue.clear();
+          for (final device in discoveredDevices) {
+            final allDelivered = broadcasts.every((pkt) =>
+                _broadcastDeliveredTo[pkt.msgId]?.contains(device.id) ??
+                false);
+            if (!allDelivered) {
+              _broadcastDeliveryQueue.add(device);
+            }
+          }
+          if (_broadcastDeliveryQueue.isNotEmpty) {
+            final target = _broadcastDeliveryQueue.removeAt(0);
+            _isAutoBroadcastConnection = true;
+            Logger.info(
+                '[BROADCAST] Starting delivery round — '
+                '${_broadcastDeliveryQueue.length + 1} peer(s) queued; '
+                'connecting to ${target.name} first');
+            unawaited(connectToDevice(target));
+            return;
+          }
+        }
+      }
+
+      // ── Unicast packets: connect only to the specific target peer ─
       // Build a set of peer UUIDs that have pending outbound messages.
       final pendingTargets = pending.map((p) => p.toUserId).toSet();
 
@@ -1904,6 +2172,72 @@ class ConnectionManager {
     } catch (e) {
       Logger.error('[DTN] Error in auto-connect check', e);
     }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Broadcast sequential-delivery: auto-disconnect and connect to next
+  // ═══════════════════════════════════════════════════════════════════
+
+  /// Called after [_syncPendingMessages] finishes for a peer.
+  ///
+  /// If this connection was opened automatically by the broadcast-delivery
+  /// system ([_isAutoBroadcastConnection] == true) AND there are more peers
+  /// queued in [_broadcastDeliveryQueue], this method:
+  ///   1. Gracefully disconnects from the current peer
+  ///   2. Waits 600 ms for the P2P stack to settle
+  ///   3. Connects to the next peer in the queue
+  ///
+  /// If there are no more peers (delivery round complete) or the current
+  /// connection was user-initiated, this is a no-op.
+  void _scheduleNextBroadcastDelivery(String deliveredToPeerId) {
+    if (!_isAutoBroadcastConnection) return;
+
+    if (_broadcastDeliveryQueue.isEmpty) {
+      Logger.info(
+          '[BROADCAST] Delivery round complete — '
+          'all queued peers reached. Clearing auto-connect flag.');
+      _isAutoBroadcastConnection = false;
+      return;
+    }
+
+    final remaining = _broadcastDeliveryQueue.length;
+    Logger.info(
+        '[BROADCAST] Delivered to $deliveredToPeerId — '
+        '$remaining peer(s) still queued. Auto-disconnecting…');
+
+    // Nullify _lastConnectedDevice so the disconnect callback does NOT
+    // trigger the normal auto-reconnect loop.  We manage reconnection
+    // ourselves by connecting to the next queued peer.
+    _lastConnectedDevice = null;
+
+    _sendGracefulDisconnect().then((_) async {
+      await _wifiDirectService.disconnect();
+
+      if (_connectedPeerId != null) {
+        _transportManager.removeNeighbor(_connectedPeerId!);
+        _peerDiscovery.removePeer(_connectedPeerId!);
+      }
+      _currentConnectionType = ConnectionType.none;
+      _connectedDevice = null;
+      _connectedPeerId = null;
+
+      // Short pause so the Wi-Fi Direct P2P stack fully releases the group.
+      await Future.delayed(const Duration(milliseconds: 600));
+
+      if (_broadcastDeliveryQueue.isEmpty) {
+        _isAutoBroadcastConnection = false;
+        return;
+      }
+
+      final next = _broadcastDeliveryQueue.removeAt(0);
+      Logger.info('[BROADCAST] Connecting to next peer: ${next.name}');
+      _isAutoBroadcastConnection = true; // still in delivery round
+      unawaited(connectToDevice(next));
+    }).catchError((Object e) {
+      Logger.error(
+          '[BROADCAST] Error during auto-disconnect for delivery round', e);
+      _isAutoBroadcastConnection = false;
+    });
   }
 
   // ═══════════════════════════════════════════════════════════════════

@@ -140,6 +140,37 @@ class TransportManager {
     }
   }
 
+  // ═══════════════════════════════════════════════════════════════
+  // Multi-GO send paths
+  // ═══════════════════════════════════════════════════════════════
+
+  /// Send [wireData] to ALL connected Multi-GO clients via the native
+  /// [WifiDirectManager.broadcastToAllClients()] call.
+  ///
+  /// This is the GO-side send path: one native call writes to every client
+  /// socket in the same loop iteration — true simultaneity.
+  ///
+  /// [senderUuid] is forwarded to the native layer to prevent echo-back
+  /// to the device that originated the packet.
+  ///
+  /// Returns the count of clients that received the message, or -1 on error.
+  Future<int> sendToAllClients(String wireData, {String? senderUuid}) async {
+    return _wifiDirectService.broadcastToAllClients(
+      wireData,
+      senderUuid: senderUuid,
+    );
+  }
+
+  /// Send [wireData] to the Group Owner via the existing single TCP socket.
+  ///
+  /// This is the client-side send path.  The GO's relay loop forwards it
+  /// to all other clients immediately.
+  ///
+  /// Returns true if the message was handed to the native send queue.
+  Future<bool> sendToGroupOwner(String wireData) async {
+    return _wifiDirectService.sendMessage(wireData);
+  }
+
   /// Broadcast raw bytes to all registered neighbors.
   ///
   /// Returns the count of successful sends.
