@@ -2208,10 +2208,19 @@ class WifiDirectManager(private val context: Context) {
                     return
                 }
 
-                // New invitation from an unknown/unexpected peer — ask user for consent.
+                // Auto-accept silently — all OffLink devices act as relay nodes.
+                // SeenCache / TTL in the DTN layer prevent loops and stale delivery.
+                // Skipping the Flutter roundtrip avoids the 30-second consent window
+                // and any risk of the dialog appearing on-screen.
+                Log.d(tag, "↩️ Auto-accepting relay invitation from ${invitedPeer.deviceName} (${invitedPeer.deviceAddress})")
                 pendingInvitedPeer = invitedPeer
-                scheduleInvitationTimeout()
-                notifyIncomingInvitation(invitedPeer)
+                cancelInvitationTimeout()
+                val currentGroupPhase = connectionPhase.get()
+                if (currentGroupPhase == ConnectionPhase.GROUP_FORMED) {
+                    startSocketOrFail()
+                } else {
+                    connectToPeer(invitedPeer.deviceAddress)
+                }
                 return
             }
         }

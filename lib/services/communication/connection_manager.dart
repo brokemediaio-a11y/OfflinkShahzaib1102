@@ -145,6 +145,15 @@ class ConnectionManager {
   Timer? _reconnectTimer;
   int _reconnectAttempt = 0;
 
+  /// True when the current Wi-Fi Direct connection was auto-accepted as an
+  /// incoming relay pass (not initiated by the user or our own DTN logic).
+  /// Used to skip chat navigation and suppress auto-reconnect back to sender.
+  bool _isIncomingRelaySession = false;
+
+  /// Debounced timer that fires ~1.5 s after the last incoming DTN packet to
+  /// trigger a relay check without waiting for the 30-second heartbeat.
+  Timer? _immediateRelayTimer;
+
   /// Hard cap on auto-reconnect before giving up and showing an error.
   static const int _maxReconnectAttempts = 8;
 
@@ -175,6 +184,11 @@ class ConnectionManager {
   bool get isReconnecting =>
       _reconnectTimer != null ||
       (_lastConnectedDevice != null && _reconnectAttempt > 0);
+
+  /// True when the active connection is a background relay or broadcast
+  /// delivery pass — UI layers use this to skip chat navigation.
+  bool get isRelaySession =>
+      _isIncomingRelaySession || _isAutoBroadcastConnection;
 
   // ── Connection timeout ────────────────────────────────────────────
   /// Fires if the TCP socket has not opened within [_connectionTimeoutSeconds].
@@ -320,12 +334,18 @@ class ConnectionManager {
       // Multi-GO group session sync (see further down in initialize()).
 
       // ── Wi-Fi Direct: incoming invitations ────────────────────────
+      // All invitations are auto-accepted so this device acts as a silent
+      // relay node.  No consent dialog is ever shown to the user; the DTN
+      // SeenCache / TTL layer prevents loops and stale-packet delivery.
       _wifiInvitationSubscription?.cancel();
       _wifiInvitationSubscription =
           _wifiDirectService.incomingInvitations.listen((payload) {
         Logger.info(
-            'ConnectionManager: incoming invitation from ${payload["deviceName"]}');
-        _invitationController.add(payload);
+            'ConnectionManager: [${Logger.conn}] incoming relay invitation from '
+            '${payload["deviceName"]} — auto-accepting silently',
+            Logger.conn);
+        _isIncomingRelaySession = true;
+        unawaited(_wifiDirectService.acceptInvitation());
       });
 
       // ── Wi-Fi Direct: background DNS-SD discovered services ───────
@@ -553,7 +573,25 @@ class ConnectionManager {
           _connectedDevice = null;
           _connectedPeerId = null;
 
-          if (_userInitiatedDisconnect) {
+          if (_isAutoBroadcastConnection) {
+            // ── Broadcast delivery round in progress — don't reconnect ────
+            // The broadcast delivery system manages connections itself via
+            // _scheduleNextBroadcastDelivery.  Suppressing the reconnect here
+            // prevents the race where _checkAndAutoConnectForPendingMessages
+            // fires during the inter-peer gap and starts a duplicate round.
+            _connectionController.add(ConnectionState.disconnected);
+            return;
+          } else if (_isIncomingRelaySession) {
+            // ── Relay session ended — look for next hop immediately ───────
+            // Don't reconnect to the sender; instead trigger a relay-delivery
+            // check so packets we just received get forwarded onward quickly.
+            _isIncomingRelaySession = false;
+            _connectionController.add(ConnectionState.disconnected);
+            Logger.info('ConnectionManager: [${Logger.hopping}] relay session ended — '
+                'scheduling immediate relay check for forward hop',
+                Logger.hopping);
+            _scheduleImmediateRelayCheck();
+          } else if (_userInitiatedDisconnect) {
             // ── User tapped Disconnect — no auto-reconnect ──────────────
             _userInitiatedDisconnect = false;
             _connectionController.add(ConnectionState.disconnected);
@@ -660,14 +698,18 @@ class ConnectionManager {
 
         _connectedDevice = device;
         _currentConnectionType = ConnectionType.wifiDirect;
-        // Successful session (receiver side) — save for auto-reconnect.
-        _lastConnectedDevice = device;
+        // Incoming relay sessions are short-lived relay passes — do NOT save
+        // _lastConnectedDevice so we don't auto-reconnect back to the relay
+        // sender after they disconnect.  The initiator side manages reconnects.
+        if (!_isIncomingRelaySession) {
+          _lastConnectedDevice = device;
+        }
         _cancelReconnect();
         _connectionController.add(ConnectionState.connected);
 
         Logger.info(
             'ConnectionManager: ✅ peer UUID resolved from handshake — '
-            'peerId=$senderUuid, name=$peerName');
+            'peerId=$senderUuid, name=$peerName, relay=$_isIncomingRelaySession');
 
         // Save as a known contact so they appear in the contacts list
         unawaited(KnownContactsStorage.saveContact(
@@ -1422,6 +1464,11 @@ class ConnectionManager {
         } catch (e, st) {
           Logger.error('ConnectionManager: MeshHandler.onRawReceived failed', e, st);
         }
+        // After processing a relay/broadcast packet, schedule an immediate
+        // relay check.  MeshHandler may have just stored a packet in DtnQueue
+        // that needs forwarding.  This short-circuits the 30-second heartbeat
+        // so the next hop fires within ~1.5 s of receiving this packet.
+        _scheduleImmediateRelayCheck();
         return;
       }
 
@@ -1857,6 +1904,25 @@ class ConnectionManager {
     }
   }
 
+  /// Debounced relay check — fires ~1.5 s after the last incoming DTN packet.
+  ///
+  /// Short-circuits the 30-second heartbeat so newly received relay/broadcast
+  /// packets are forwarded to the next hop almost immediately.
+  /// Only triggers when not currently connected (no point searching while busy).
+  void _scheduleImmediateRelayCheck() {
+    _immediateRelayTimer?.cancel();
+    _immediateRelayTimer = Timer(const Duration(milliseconds: 1500), () {
+      _immediateRelayTimer = null;
+      if (!isConnected() && _currentConnectionType == ConnectionType.none) {
+        Logger.info(
+            'ConnectionManager: [${Logger.hopping}] immediate relay check — '
+            'checking for peers to forward queued packets',
+            Logger.hopping);
+        unawaited(_triggerBroadcastDelivery());
+      }
+    });
+  }
+
   /// Build the current combined device list from all discovery sources and
   /// call [_checkAndAutoConnectForPendingMessages].
   ///
@@ -2014,6 +2080,7 @@ class ConnectionManager {
 
   void dispose() {
     _dtnRetryLoop?.stop();
+    _immediateRelayTimer?.cancel();
     _meshDeliveredSubscription?.cancel();
     _meshHandler?.dispose();
     _bleDiscoveryService.dispose();
@@ -2136,6 +2203,49 @@ class ConnectionManager {
       Logger.info(
           'ConnectionManager: broadcast flush — $bSynced/${broadcastPkts.length} '
           'sent to $connectedPeerId');
+    }
+
+    // ── Relay carry: forward packets destined for OTHER peers ─────────────
+    // Epidemic DTN: every connected device is an opportunistic carrier.
+    // We forward any unicast packet whose destination is NOT the current peer
+    // and not a broadcast, so the peer can carry it one hop closer.
+    // SeenCache in MeshHandler prevents the packet being re-processed if it
+    // circles back.  Per-session deduplication via _broadcastDeliveredTo
+    // prevents re-sending to the same relay carrier in this session.
+    final relayCarryPkts = dtnPending.where((pkt) =>
+        pkt.toUserId != connectedPeerId &&
+        pkt.toUserId != '*').toList();
+    if (relayCarryPkts.isNotEmpty) {
+      Logger.info(
+          'ConnectionManager: [${Logger.hopping}] forwarding '
+          '${relayCarryPkts.length} relay-carry packet(s) through $connectedPeerId',
+          Logger.hopping);
+      int relaySynced = 0;
+      for (final packet in relayCarryPkts) {
+        // Skip if we already handed this packet to this carrier this session.
+        final alreadyForwarded =
+            _broadcastDeliveredTo[packet.msgId]?.contains(connectedPeerId) ??
+                false;
+        if (alreadyForwarded) continue;
+        try {
+          final sent = await _wifiDirectService.sendMessage(packet.toWire());
+          if (sent) {
+            relaySynced++;
+            _broadcastDeliveredTo
+                .putIfAbsent(packet.msgId, () => {})
+                .add(connectedPeerId);
+            Logger.debug(
+                'ConnectionManager: relay-carry ${packet.msgId} '
+                '(dest=${packet.toUserId}) → carrier $connectedPeerId');
+          }
+        } catch (e) {
+          Logger.error(
+              'ConnectionManager: error relay-carrying ${packet.msgId}', e);
+        }
+      }
+      Logger.info(
+          'ConnectionManager: relay-carry flush — $relaySynced/${relayCarryPkts.length} '
+          'packets forwarded through carrier $connectedPeerId');
     }
 
     // ── Unicast packets destined specifically for this peer ────────
@@ -2288,20 +2398,46 @@ class ConnectionManager {
         }
       }
 
-      // ── Unicast packets: connect only to the specific target peer ─
-      // Build a set of peer UUIDs that have pending outbound messages.
-      final pendingTargets = pending.map((p) => p.toUserId).toSet();
+      // ── Unicast relay: epidemic delivery to any visible device ───────────
+      // DTN epidemic flooding: any visible OffLink device can carry the
+      // packet toward its destination.  We prefer the direct destination
+      // if it happens to be visible; otherwise connect to any visible peer
+      // as an opportunistic carrier — that peer will carry it one hop closer.
+      final pendingTargets = pending
+          .where((p) => p.toUserId != '*') // exclude broadcasts (handled above)
+          .map((p) => p.toUserId)
+          .toSet();
 
-      // Check if any currently visible BLE device is a pending target.
-      for (final device in discoveredDevices) {
-        if (pendingTargets.contains(device.id)) {
+      if (pendingTargets.isNotEmpty) {
+        // Prefer direct destination first.
+        DeviceModel? directTarget;
+        for (final device in discoveredDevices) {
+          if (pendingTargets.contains(device.id)) {
+            directTarget = device;
+            break;
+          }
+        }
+
+        if (directTarget != null) {
           Logger.info(
-              '[DTN] BLE rediscovered ${device.name} (${device.id}) '
-              'with ${pending.where((p) => p.toUserId == device.id).length} '
-              'pending message(s) — auto-connecting to deliver');
+              '[${Logger.dtn}] Direct target ${directTarget.name} visible — '
+              'auto-connecting for direct delivery',
+              Logger.dtn);
           _isDtnAutoConnection = true;
-          unawaited(connectToDevice(device, forDtnDelivery: true));
-          return; // only connect to one peer at a time
+          unawaited(connectToDevice(directTarget, forDtnDelivery: true));
+          return;
+        }
+
+        // Destination not visible — connect to any OffLink peer as carrier.
+        final anyRelay = discoveredDevices.isNotEmpty ? discoveredDevices.first : null;
+        if (anyRelay != null) {
+          Logger.info(
+              '[${Logger.hopping}] Destination not visible — using ${anyRelay.name} '
+              'as epidemic relay carrier for ${pendingTargets.length} pending packet(s)',
+              Logger.hopping);
+          _isDtnAutoConnection = true;
+          unawaited(connectToDevice(anyRelay, forDtnDelivery: true));
+          return;
         }
       }
     } catch (e) {
@@ -2327,22 +2463,21 @@ class ConnectionManager {
   void _scheduleNextBroadcastDelivery(String deliveredToPeerId) {
     if (!_isAutoBroadcastConnection) return;
 
-    if (_broadcastDeliveryQueue.isEmpty) {
+    final isLastPeer = _broadcastDeliveryQueue.isEmpty;
+
+    if (isLastPeer) {
       Logger.info(
-          '[BROADCAST] Delivery round complete — '
-          'all queued peers reached. Clearing auto-connect flag.');
-      _isAutoBroadcastConnection = false;
-      return;
+          '[BROADCAST] Delivered to last peer $deliveredToPeerId — '
+          'auto-disconnecting and completing delivery round.');
+    } else {
+      Logger.info(
+          '[BROADCAST] Delivered to $deliveredToPeerId — '
+          '${_broadcastDeliveryQueue.length} peer(s) still queued. Auto-disconnecting…');
     }
 
-    final remaining = _broadcastDeliveryQueue.length;
-    Logger.info(
-        '[BROADCAST] Delivered to $deliveredToPeerId — '
-        '$remaining peer(s) still queued. Auto-disconnecting…');
-
     // Nullify _lastConnectedDevice so the disconnect callback does NOT
-    // trigger the normal auto-reconnect loop.  We manage reconnection
-    // ourselves by connecting to the next queued peer.
+    // trigger the normal auto-reconnect loop.  We manage the session lifetime
+    // ourselves: connecting to the next peer OR ending the round cleanly.
     _lastConnectedDevice = null;
 
     _sendGracefulDisconnect().then((_) async {
@@ -2356,11 +2491,26 @@ class ConnectionManager {
       _connectedDevice = null;
       _connectedPeerId = null;
 
-      // Short pause so the Wi-Fi Direct P2P stack fully releases the group.
-      await Future.delayed(const Duration(milliseconds: 600));
+      if (isLastPeer) {
+        // ── Delivery round fully complete ─────────────────────────────
+        // All peers reached.  Clear the flag and emit disconnected so the
+        // UI banner disappears cleanly.  No next connection needed.
+        _isAutoBroadcastConnection = false;
+        _connectionController.add(ConnectionState.disconnected);
+        Logger.info('[BROADCAST] ✅ Broadcast delivery round complete — '
+            'disconnected from last peer. Stack cooling down.');
+        return;
+      }
 
+      // ── More peers remain — wait for P2P stack to settle ─────────
+      // 2500 ms gives the framework time to complete removeGroup() and fire
+      // CONNECTION_CHANGED before we start the next connection.
+      await Future.delayed(const Duration(milliseconds: 2500));
+
+      // Re-check after delay: queue may have been cleared externally.
       if (_broadcastDeliveryQueue.isEmpty) {
         _isAutoBroadcastConnection = false;
+        _connectionController.add(ConnectionState.disconnected);
         return;
       }
 

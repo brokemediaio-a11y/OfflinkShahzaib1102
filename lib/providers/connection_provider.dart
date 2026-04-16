@@ -19,12 +19,17 @@ class ConnectionProviderState {
   final DeviceModel? connectedDevice;
   final ConnectionType connectionType;
   final String? error;
+  /// True when the current connection was automatically accepted as a relay
+  /// pass (incoming invitation from a relay sender) or is a broadcast delivery
+  /// round.  The UI should NOT navigate to the chat screen for relay sessions.
+  final bool isRelaySession;
 
   ConnectionProviderState({
     this.state = ConnectionStateType.disconnected,
     this.connectedDevice,
     this.connectionType = ConnectionType.none,
     this.error,
+    this.isRelaySession = false,
   });
 
   ConnectionProviderState copyWith({
@@ -32,12 +37,14 @@ class ConnectionProviderState {
     DeviceModel? connectedDevice,
     ConnectionType? connectionType,
     String? error,
+    bool? isRelaySession,
   }) {
     return ConnectionProviderState(
       state: state ?? this.state,
       connectedDevice: connectedDevice ?? this.connectedDevice,
       connectionType: connectionType ?? this.connectionType,
       error: error ?? this.error,
+      isRelaySession: isRelaySession ?? this.isRelaySession,
     );
   }
 }
@@ -75,6 +82,7 @@ class ConnectionNotifier extends StateNotifier<ConnectionProviderState> {
               connectedDevice: _connectionManager.connectedDevice,
               connectionType: _connectionManager.currentConnectionType,
               error: null,
+              isRelaySession: _connectionManager.isRelaySession,
             );
             break;
           case ConnectionState.disconnected:
@@ -83,6 +91,7 @@ class ConnectionNotifier extends StateNotifier<ConnectionProviderState> {
               connectedDevice: null,
               connectionType: ConnectionType.none,
               error: null,
+              isRelaySession: false,
             );
             break;
           case ConnectionState.connecting:
