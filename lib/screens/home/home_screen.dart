@@ -230,6 +230,13 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         // ── Socket confirmed open ────────────────────────────────────
         _dismissConnectingDialog();
 
+        // Don't open chat for background relay or broadcast delivery sessions.
+        // The connection was auto-accepted for DTN relay; no chat intent exists.
+        if (next.isRelaySession) {
+          _pendingConnectionDevice = null;
+          return;
+        }
+
         final chatDevice = _pendingConnectionDevice ?? next.connectedDevice;
         _pendingConnectionDevice = null;
 

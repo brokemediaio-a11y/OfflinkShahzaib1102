@@ -135,6 +135,16 @@ class ConnectionManager {
   Timer? _reconnectTimer;
   int _reconnectAttempt = 0;
 
+  /// True when the current Wi-Fi Direct connection was initiated by the remote
+  /// side (we auto-accepted their invitation).  These sessions are short-lived
+  /// relay passes — we do NOT save [_lastConnectedDevice] so we won't try to
+  /// auto-reconnect back to that relay sender after they disconnect.
+  bool _isIncomingRelaySession = false;
+
+  /// Debounced timer that fires a relay-delivery check shortly after we finish
+  /// processing an incoming packet, short-circuiting the 30-second heartbeat.
+  Timer? _immediateRelayTimer;
+
   /// Hard cap on auto-reconnect before giving up and showing an error.
   static const int _maxReconnectAttempts = 8;
 
@@ -155,12 +165,55 @@ class ConnectionManager {
   /// move to the next queued peer after [_syncPendingMessages] completes.
   bool _isAutoBroadcastConnection = false;
 
+  // ── Multi-GO broadcast group dissolution timer ───────────────────────────
+  /// After the Multi-GO broadcast delivery finishes (all clients joined and
+  /// received their packets), this timer dissolves the group after a short
+  /// window so the device returns to normal discovery mode.
+  Timer? _broadcastGroupDissolutionTimer;
+
   // ── Broadcast delivery heartbeat ─────────────────────────────────────────
   /// Fires every 30 s regardless of BLE scan state.
   /// This is the safety-net: if BLE scanning fails (as observed in production)
   /// the app still attempts to deliver queued broadcasts to any known peers.
   // ignore: unused_field  — singleton; timer runs for the app lifetime.
   Timer? _broadcastHeartbeatTimer;
+
+  // ── Relay cooldown after graceful disconnect ──────────────────────────────
+  /// Device ID of the peer that most recently sent __graceful_disconnect__.
+  /// Excluded from epidemic-relay fallback for [_relayCooldownTimer]'s duration
+  /// so the device doesn't immediately reconnect to the same peer.
+  String? _relayCooldownPeerId;
+  Timer? _relayCooldownTimer;
+
+  // ── Broadcast delivery check semaphore ───────────────────────────────────
+  /// Guards [_checkAndAutoConnectForPendingMessages] against concurrent re-entry.
+  ///
+  /// The method is async and hits several `await` points before setting
+  /// [_isAutoBroadcastConnection].  Without this flag, two rapid BLE-scan /
+  /// DNS-SD callbacks both pass the [_isAutoBroadcastConnection] guard and each
+  /// call [startBroadcastGroup()], producing a duplicate native `createGroup()`
+  /// call.  The second call fails "Busy" and its `onFailure` rolls back
+  /// `isMultiGoGroupOwner`, making the group start a single-client server
+  /// instead of the Multi-GO server — so no client ever connects.
+  bool _broadcastCheckInProgress = false;
+
+  // ── Broadcast priority window ─────────────────────────────────────────────
+  /// When true, unicast DTN epidemic relay auto-connect is suppressed so that
+  /// the Wi-Fi Direct P2P stack is free to accept incoming Multi-GO broadcast
+  /// invitations from the current broadcast sender (Group Owner).
+  ///
+  /// Set when:
+  ///   • This device is the broadcast sender (_isAutoBroadcastConnection).
+  ///   • This device has just received/relayed a broadcast packet (receiver path).
+  ///     In either case a [_broadcastWindowTimer] runs for [_broadcastWindowDuration];
+  ///     unicast relay resumes automatically after the timer fires.
+  bool _broadcastWindowActive = false;
+  Timer? _broadcastWindowTimer;
+
+  /// How long to suppress unicast auto-connect after a broadcast delivery event.
+  /// 45 seconds gives Multi-GO invitation + socket exchange enough time to
+  /// complete on slow devices, while keeping DTN unicast delay acceptable.
+  static const Duration _broadcastWindowDuration = Duration(seconds: 45);
 
   bool get isReconnecting =>
       _reconnectTimer != null ||
@@ -228,6 +281,11 @@ class ConnectionManager {
   // ── Public getters ────────────────────────────────────────────────
   ConnectionType get currentConnectionType => _currentConnectionType;
   DeviceModel? get connectedDevice => _connectedDevice;
+
+  /// True when the active connection was auto-accepted as a relay pass.
+  /// UI layers use this to skip chat navigation for background relay sessions.
+  bool get isRelaySession =>
+      _isIncomingRelaySession || _isAutoBroadcastConnection;
 
   // ═══════════════════════════════════════════════════════════════════
   // Initialization
@@ -310,12 +368,17 @@ class ConnectionManager {
       // Multi-GO group session sync (see further down in initialize()).
 
       // ── Wi-Fi Direct: incoming invitations ────────────────────────
+      // All invitations are auto-accepted so this device acts as a silent
+      // relay node.  No consent dialog is ever shown to the user; the DTN
+      // SeenCache / TTL layer prevents loops and stale-packet delivery.
       _wifiInvitationSubscription?.cancel();
       _wifiInvitationSubscription =
           _wifiDirectService.incomingInvitations.listen((payload) {
         Logger.info(
-            'ConnectionManager: incoming invitation from ${payload["deviceName"]}');
-        _invitationController.add(payload);
+            'ConnectionManager: ↩️ auto-accepting relay invitation '
+            'from ${payload["deviceName"]}');
+        _isIncomingRelaySession = true;
+        unawaited(acceptInvitation());
       });
 
       // ── Wi-Fi Direct: background DNS-SD discovered services ───────
@@ -366,6 +429,15 @@ class ConnectionManager {
         // Emit connection-state change so providers rebuild the member list
         _connectionController
             .add(ConnectionState.connected); // re-use existing event
+
+        // When a new client joins the Multi-GO group during a broadcast
+        // delivery round, push all pending broadcasts to all connected clients.
+        if (_isAutoBroadcastConnection &&
+            (event['event'] as String?) == 'joined') {
+          final joinedUuid = event['uuid'] as String?;
+          Logger.info('📡 [BROADCAST-GO] Client ${joinedUuid ?? "?"} joined (${_groupSession.memberCount} total) — syncing');
+          unawaited(_syncBroadcastsToGroupOwnerClients());
+        }
       });
 
       // ── Wi-Fi Direct: connection state + Multi-GO group session sync ─────
@@ -379,6 +451,13 @@ class ConnectionManager {
               myId: myId,
               groupId: '${myId}_${DateTime.now().millisecondsSinceEpoch}',
             );
+            // If this GO was started for a broadcast delivery round,
+            // immediately invite all queued devices to join the group.
+            if (_isAutoBroadcastConnection &&
+                _broadcastDeliveryQueue.isNotEmpty) {
+              Logger.info('📡 [BROADCAST-GO] GO ready — inviting ${_broadcastDeliveryQueue.length} peer(s)');
+              _invitePendingGroupPeers();
+            }
           }
         } else if (!state.connected && _groupSession.isInGroup) {
           _groupSession.leaveGroup();
@@ -465,9 +544,7 @@ class ConnectionManager {
           _cancelReconnect();
           _connectionController.add(ConnectionState.connected);
 
-          Logger.info(
-              'ConnectionManager: ✅ Wi-Fi Direct fully connected (initiator) — '
-              'peerId=${_connectedPeerId!}, role=${role.name}, ip=${state.ipAddress}');
+          Logger.info('✅ WiFi-Direct connected [initiator] peer=${_connectedPeerId!} role=${role.name} ip=${state.ipAddress}');
         } else {
           // ── RECEIVING side: peer UUID unknown until handshake ─────
           // Register a placeholder so the transport layer is ready to
@@ -497,15 +574,13 @@ class ConnectionManager {
           // Stay in "connecting" state — will flip to "connected" in
           // _handleUuidHandshake() once the peer's UUID is received.
           _connectionController.add(ConnectionState.connecting);
-          Logger.info(
-              'ConnectionManager: Wi-Fi Direct socket open (receiver) — '
-              'awaiting UUID handshake from initiator…');
+          Logger.info('🔗 WiFi-Direct socket open [receiver] — awaiting UUID handshake…');
         }
 
       } else if (state.connected && !state.socketActive) {
         // P2P group formed but socket not yet open
         _connectionController.add(ConnectionState.connecting);
-        Logger.info('ConnectionManager: Wi-Fi Direct group formed, awaiting socket…');
+        Logger.info('📡 WiFi-Direct group formed — awaiting socket…');
 
       } else if (!state.connected) {
         if (state.status == 'connecting') {
@@ -515,13 +590,11 @@ class ConnectionManager {
           // _connectedPeerId — the initiator side needs it when the socket
           // opens.  The UI should stay in "connecting" state.
           _connectionController.add(ConnectionState.connecting);
-          Logger.info(
-              'ConnectionManager: Wi-Fi Direct connect() accepted — '
-              'awaiting group formation…');
+          Logger.info('🔄 WiFi-Direct connect() accepted — forming group…');
         } else {
           // ── Actual disconnect or failure ─────────────────────────────
           final reason = state.error ?? 'disconnected';
-          Logger.info('ConnectionManager: Wi-Fi Direct disconnected — $reason');
+          Logger.info('🔴 WiFi-Direct disconnected — $reason');
 
           final idToRemove = _connectedPeerId ?? '__uuid_pending__';
           _transportManager.removeNeighbor(idToRemove);
@@ -537,7 +610,18 @@ class ConnectionManager {
           _connectedDevice = null;
           _connectedPeerId = null;
 
-          if (_userInitiatedDisconnect) {
+          if (_isIncomingRelaySession) {
+            // ── Relay session ended — look for next hop immediately ───────
+            // Don't reconnect to the sender; instead trigger a relay-delivery
+            // check so packets we just received get forwarded onward quickly.
+            _isIncomingRelaySession = false;
+            _connectionController.add(ConnectionState.disconnected);
+            Logger.info(
+                'ConnectionManager: relay session ended — scheduling '
+                'immediate relay check');
+            Future.delayed(const Duration(milliseconds: 800),
+                () => unawaited(_triggerBroadcastDelivery()));
+          } else if (_userInitiatedDisconnect) {
             // ── User tapped Disconnect — no auto-reconnect ──────────────
             _userInitiatedDisconnect = false;
             _connectionController.add(ConnectionState.disconnected);
@@ -644,8 +728,13 @@ class ConnectionManager {
 
         _connectedDevice = device;
         _currentConnectionType = ConnectionType.wifiDirect;
-        // Successful session (receiver side) — save for auto-reconnect.
-        _lastConnectedDevice = device;
+        // Incoming relay sessions (auto-accepted invitations) are short-lived
+        // relay passes.  We do NOT save _lastConnectedDevice because we don't
+        // want to auto-reconnect back to the relay sender after they disconnect.
+        // The initiator side is responsible for managing reconnects during chat.
+        if (!_isIncomingRelaySession) {
+          _lastConnectedDevice = device;
+        }
         _cancelReconnect();
         _connectionController.add(ConnectionState.connected);
 
@@ -1345,7 +1434,7 @@ class ConnectionManager {
 
   Future<void> _handleIncomingMessage(String message) async {
     try {
-      Logger.info('ConnectionManager: handling incoming message');
+      Logger.info('📨 Incoming WiFi-Direct message');
 
       final jsonMap = _tryParseJson(message);
       if (jsonMap == null) {
@@ -1365,10 +1454,27 @@ class ConnectionManager {
       // ── Graceful disconnect — peer is intentionally closing ───────
       // Suppress auto-reconnect so we don't keep pestering the peer.
       if (jsonMap['__type'] == '__graceful_disconnect__') {
-        Logger.info('ConnectionManager: peer sent graceful disconnect — suppressing auto-reconnect');
+        Logger.info('👋 Peer sent graceful disconnect — suppressing reconnect');
         _userInitiatedDisconnect = true;
         _lastConnectedDevice = null;
         _cancelReconnect();
+        // Also cancel the immediate relay timer so that any unicast relay packets
+        // received in this session don't immediately trigger a reconnect back to
+        // the same peer (who just said goodbye).  The 30-second DTN heartbeat will
+        // still retry after sufficient cooldown.
+        _immediateRelayTimer?.cancel();
+        _immediateRelayTimer = null;
+        // Start a 60-second cooldown: exclude this peer from epidemic-relay
+        // fallback selection so DTN doesn't keep re-connecting to them right away.
+        final cooldownId = _connectedPeerId;
+        if (cooldownId != null) {
+          _relayCooldownPeerId = cooldownId;
+          _relayCooldownTimer?.cancel();
+          _relayCooldownTimer = Timer(const Duration(seconds: 60), () {
+            _relayCooldownPeerId = null;
+            _relayCooldownTimer = null;
+          });
+        }
         return;
       }
 
@@ -1386,6 +1492,21 @@ class ConnectionManager {
             message,
             currentPeers: _peerDiscovery.currentPeers,
           );
+          // Schedule an immediate relay check for UNICAST packets only.
+          // Broadcast packets (toUserId == '*') are delivered by the original
+          // sender via Multi-GO — having receivers also schedule relays causes
+          // all three devices to simultaneously attempt to become Group Owners,
+          // creating a P2P deadlock where nobody acts as a client.
+          final toUserId = jsonMap['toUserId'] as String?;
+          if (toUserId == '*') {
+            // Activate the broadcast priority window on this receiver so that
+            // unicast epidemic relay is suppressed while the Multi-GO sender
+            // is still active.  This frees the P2P stack to remain a client
+            // of the broadcast group rather than starting its own connection.
+            _activateBroadcastWindow();
+          } else if (toUserId != null) {
+            _scheduleImmediateRelayCheck();
+          }
         } catch (e, st) {
           Logger.error('ConnectionManager: MeshHandler.onRawReceived failed', e, st);
         }
@@ -1474,10 +1595,10 @@ class ConnectionManager {
     if (!_isInitialized) return false;
     final result = await _wifiDirectService.startAsGroupOwner();
     if (result['success'] == true) {
-      Logger.info('[ConnectionManager] startBroadcastGroup: GO role requested');
+      Logger.info('📡 [BROADCAST] GO role requested ✅');
       return true;
     }
-    Logger.error('[ConnectionManager] startBroadcastGroup failed: ${result['error']}');
+    Logger.error('❌ [BROADCAST] startBroadcastGroup failed: ${result['error']}');
     return false;
   }
 
@@ -1502,7 +1623,7 @@ class ConnectionManager {
         ownerId: groupOwnerDevice.id,
         groupId: groupOwnerDevice.id,
       );
-      Logger.info('[ConnectionManager] joinBroadcastGroup: connecting to GO ${groupOwnerDevice.id}');
+      Logger.info('📡 [BROADCAST] Joining GO ${groupOwnerDevice.id}…');
       return true;
     }
     Logger.error('[ConnectionManager] joinBroadcastGroup failed: ${result['error']}');
@@ -1521,12 +1642,12 @@ class ConnectionManager {
         wireData,
         senderUuid: senderUuid,
       );
-      Logger.info('[ConnectionManager] routeBroadcastPacket: GO → sent to $count clients');
+      Logger.info('📢 [BROADCAST] GO → relayed to $count clients');
       return count > 0;
     } else if (_groupSession.isInGroup) {
       final wireData = packet.toWire();
       final ok = await _transportManager.sendToGroupOwner(wireData);
-      Logger.info('[ConnectionManager] routeBroadcastPacket: client → sent to GO: $ok');
+      Logger.info('📢 [BROADCAST] Client → forwarded to GO: $ok');
       return ok;
     }
     // Fallback: DTN epidemic flooding (existing behaviour)
@@ -1772,6 +1893,23 @@ class ConnectionManager {
     }
   }
 
+  /// Debounced relay check — fires ~1.5 s after the last incoming DTN packet.
+  ///
+  /// Short-circuits the 30-second heartbeat so newly received relay/broadcast
+  /// packets are forwarded to the next hop almost immediately.  Only triggers
+  /// when not currently connected (no point searching while already busy).
+  void _scheduleImmediateRelayCheck() {
+    _immediateRelayTimer?.cancel();
+    _immediateRelayTimer = Timer(const Duration(milliseconds: 1500), () {
+      _immediateRelayTimer = null;
+      if (!isConnected()) {
+        Logger.debug(
+            'ConnectionManager: ⚡ immediate relay check after packet receive');
+        unawaited(_triggerBroadcastDelivery());
+      }
+    });
+  }
+
   /// Build the current combined device list from all discovery sources and
   /// call [_checkAndAutoConnectForPendingMessages].
   ///
@@ -1929,6 +2067,10 @@ class ConnectionManager {
 
   void dispose() {
     _dtnRetryLoop?.stop();
+    _immediateRelayTimer?.cancel();
+    _broadcastGroupDissolutionTimer?.cancel();
+    _relayCooldownTimer?.cancel();
+    _broadcastWindowTimer?.cancel();
     _meshDeliveredSubscription?.cancel();
     _meshHandler?.dispose();
     _bleDiscoveryService.dispose();
@@ -1999,9 +2141,7 @@ class ConnectionManager {
     // only updates last_attempt so other peers can still receive them.
     final broadcastPkts = await DtnQueue.getPendingBroadcasts();
     if (broadcastPkts.isNotEmpty) {
-      Logger.info(
-          'ConnectionManager: flushing ${broadcastPkts.length} broadcast '
-          'packet(s) to newly connected peer $connectedPeerId');
+      Logger.info('📢 Flushing ${broadcastPkts.length} broadcast(s) to $connectedPeerId');
       int bSynced = 0;
       for (final packet in broadcastPkts) {
         // Skip if already delivered to this peer this session.
@@ -2035,6 +2175,57 @@ class ConnectionManager {
       Logger.info(
           'ConnectionManager: broadcast flush — $bSynced/${broadcastPkts.length} '
           'sent to $connectedPeerId');
+    }
+
+    // ── Relay carry: forward packets not destined for this peer ───
+    // Epidemic DTN: every connected device is an opportunistic carrier.
+    // We forward any packet whose destination is NOT the current peer so
+    // that peer can carry it onward.  SeenCache in MeshHandler prevents
+    // the packet from being re-processed if it circles back.
+    // We do NOT increment the DtnQueue attempt counter here — we track
+    // per-relay-node delivery in _broadcastDeliveredTo (same map used for
+    // broadcasts) to avoid re-sending to the same carrier this session.
+    final relayCarryPackets = dtnPending.where((pkt) =>
+        pkt.toUserId != '*' &&              // broadcasts handled above
+        pkt.toUserId != connectedPeerId &&  // direct delivery handled below
+        pkt.fromUserId != connectedPeerId   // don't relay back to sender
+    ).toList();
+    if (relayCarryPackets.isNotEmpty) {
+      Logger.info(
+          'ConnectionManager: forwarding ${relayCarryPackets.length} relay '
+          'packet(s) via $connectedPeerId as opportunistic carrier');
+      int relaySynced = 0;
+      for (final packet in relayCarryPackets) {
+        // Skip if already forwarded to this relay node this session.
+        final alreadyRelayed =
+            _broadcastDeliveredTo[packet.msgId]?.contains(connectedPeerId) ??
+                false;
+        if (alreadyRelayed) {
+          Logger.debug(
+              'ConnectionManager: relay packet ${packet.msgId} already '
+              'forwarded to $connectedPeerId — skipping');
+          continue;
+        }
+        try {
+          final sent = await _wifiDirectService.sendMessage(packet.toWire());
+          if (sent) {
+            relaySynced++;
+            // Track in-memory so we don't re-send to this carrier.
+            _broadcastDeliveredTo
+                .putIfAbsent(packet.msgId, () => {})
+                .add(connectedPeerId);
+            Logger.debug(
+                'ConnectionManager: relay forwarded ${packet.msgId} '
+                'via $connectedPeerId → dest=${packet.toUserId}');
+          }
+        } catch (e) {
+          Logger.error(
+              'ConnectionManager: error relay-forwarding ${packet.msgId}', e);
+        }
+      }
+      Logger.info(
+          'ConnectionManager: relay carry complete — '
+          '$relaySynced/${relayCarryPackets.length} forwarded via $connectedPeerId');
     }
 
     // ── Unicast packets destined specifically for this peer ────────
@@ -2118,15 +2309,27 @@ class ConnectionManager {
     if (isConnected() || _currentConnectionType != ConnectionType.none) return;
     // Don't auto-connect if user explicitly cancelled / disconnected recently.
     if (_userInitiatedDisconnect) return;
+    // Don't start a new delivery round while an automated delivery round is
+    // already in progress (even during the inter-peer gap with none state).
+    if (_isAutoBroadcastConnection) return;
+    // Semaphore: prevent re-entry before the first await completes.
+    // Two rapid BLE/DNS-SD callbacks would both pass the check above (since
+    // _isAutoBroadcastConnection is only set after the await), resulting in
+    // duplicate createGroup() calls and a Busy failure that rolls back the
+    // Multi-GO flag and starts the wrong (single-client) server.
+    if (_broadcastCheckInProgress) return;
+    _broadcastCheckInProgress = true;
 
     try {
       final pending = await DtnQueue.getPendingPackets();
       if (pending.isEmpty) return;
 
-      // ── Broadcast packets: deliver to ALL visible peers ──────────
-      // Broadcasts use toUserId == '*' which never matches a device UUID.
-      // We queue EVERY visible BLE peer that hasn't yet received each
-      // active broadcast, then connect to them one by one.
+      // ── Broadcast packets: Multi-GO simultaneous delivery ─────────
+      // Instead of connecting to each device one-by-one (sequential),
+      // start a Wi-Fi Direct Group Owner (Multi-GO).  All visible peers
+      // are invited simultaneously; they connect as clients and receive
+      // the broadcast in a single pass — much faster and avoids the
+      // deadlock where multiple devices all try to become GOs at once.
       final hasBroadcasts = pending.any((p) => p.toUserId == '*');
       if (hasBroadcasts) {
         final broadcasts = await DtnQueue.getPendingBroadcasts();
@@ -2141,37 +2344,174 @@ class ConnectionManager {
             }
           }
           if (_broadcastDeliveryQueue.isNotEmpty) {
-            final target = _broadcastDeliveryQueue.removeAt(0);
             _isAutoBroadcastConnection = true;
-            Logger.info(
-                '[BROADCAST] Starting delivery round — '
-                '${_broadcastDeliveryQueue.length + 1} peer(s) queued; '
-                'connecting to ${target.name} first');
-            unawaited(connectToDevice(target));
+            // Activate the broadcast priority window on the sender so that if
+            // the GO role is lost and re-attempted, unicast relay stays idle.
+            _activateBroadcastWindow();
+            if (_groupSession.isGroupOwner) {
+              // Already Multi-GO — invite any new devices immediately.
+              Logger.info('📡 [BROADCAST-GO] Already GO — inviting ${_broadcastDeliveryQueue.length} peer(s)');
+              _invitePendingGroupPeers();
+            } else {
+              // Start Multi-GO group; peers will be invited once GO is
+              // confirmed via the connection-state listener.
+              Logger.info('📡 [BROADCAST-GO] Starting Multi-GO for ${_broadcastDeliveryQueue.length} peer(s)');
+              unawaited(startBroadcastGroup());
+            }
             return;
           }
         }
       }
 
-      // ── Unicast packets: connect only to the specific target peer ─
-      // Build a set of peer UUIDs that have pending outbound messages.
-      final pendingTargets = pending.map((p) => p.toUserId).toSet();
+      // ── Unicast relay: epidemic delivery to any visible device ───
+      // DTN epidemic flooding: any visible OffLink device can carry the
+      // packet toward its destination.  We prefer the direct destination
+      // if it happens to be visible; otherwise connect to any device as
+      // an opportunistic relay carrier (they will carry it further).
+      //
+      // BROADCAST PRIORITY: suppress unicast epidemic relay during any active
+      // broadcast window.  This keeps the P2P stack available to accept
+      // incoming Multi-GO group invitations from a nearby broadcast sender,
+      // preventing races where non-GO devices form their own peer-to-peer
+      // connections before the GO can invite them.
+      if (_broadcastWindowActive) {
+        Logger.debug(
+            '[DTN] Unicast relay suppressed — broadcast priority window active');
+        return;
+      }
 
-      // Check if any currently visible BLE device is a pending target.
-      for (final device in discoveredDevices) {
-        if (pendingTargets.contains(device.id)) {
-          Logger.info(
-              '[DTN] BLE rediscovered ${device.name} (${device.id}) '
-              'with ${pending.where((p) => p.toUserId == device.id).length} '
-              'pending message(s) — auto-connecting to deliver');
-          // connectToDevice is safe to call: it guards against double-invocation.
-          unawaited(connectToDevice(device));
-          return; // only connect to one peer at a time
+      final relayPending =
+          pending.where((p) => p.toUserId != '*').toList();
+      if (relayPending.isNotEmpty && discoveredDevices.isNotEmpty) {
+        final pendingTargets =
+            relayPending.map((p) => p.toUserId).toSet();
+
+        // Prefer direct destination first (best-case: no intermediate hop).
+        DeviceModel? target;
+        for (final device in discoveredDevices) {
+          if (pendingTargets.contains(device.id)) {
+            target = device;
+            break;
+          }
         }
+
+        // Fallback: connect to any visible OffLink device as relay carrier.
+        // Exclude any device in the relay cooldown window (peer that just sent
+        // __graceful_disconnect__) to avoid immediately reconnecting to the same
+        // device that deliberately ended the session.
+        if (target == null) {
+          target = discoveredDevices
+              .where((d) => d.id != _relayCooldownPeerId)
+              .firstOrNull;
+        }
+        if (target == null) return; // all visible peers are in cooldown
+
+        final isDirect = pendingTargets.contains(target.id);
+        Logger.info(
+            '[DTN] ${isDirect ? "Direct" : "Epidemic relay via"} '
+            '${target.name} — ${relayPending.length} packet(s) pending');
+        unawaited(connectToDevice(target));
+        return;
       }
     } catch (e) {
       Logger.error('[DTN] Error in auto-connect check', e);
+    } finally {
+      _broadcastCheckInProgress = false;
     }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Multi-GO broadcast delivery helpers
+  // ═══════════════════════════════════════════════════════════════════
+
+  /// Invite all devices currently in [_broadcastDeliveryQueue] to join the
+  /// Multi-GO group by calling [connectToDevice] for each.
+  ///
+  /// Because `connectToPeer()` now bypasses the phase guard when the device
+  /// is a Multi-GO owner, these calls go straight through to the P2P layer
+  /// and each target receives a Wi-Fi Direct INVITED notification.  The
+  /// auto-accept code on the target device handles the rest.
+  void _invitePendingGroupPeers() {
+    final toInvite = List<DeviceModel>.from(_broadcastDeliveryQueue);
+    _broadcastDeliveryQueue.clear();
+    for (final device in toInvite) {
+      Logger.info('📡 [BROADCAST-GO] Inviting ${device.name} to group…');
+      unawaited(connectToDevice(device));
+    }
+  }
+
+  /// Send all pending broadcast packets to every client currently connected
+  /// to the Multi-GO group.
+  ///
+  /// Called when a new member joins (so they receive broadcasts they may have
+  /// missed) and also directly when the GO wants to push to all.
+  /// Receiver-side deduplication via [DtnQueue] prevents double-processing.
+  Future<void> _syncBroadcastsToGroupOwnerClients() async {
+    if (!_groupSession.isGroupOwner) return;
+    try {
+      final broadcasts = await DtnQueue.getPendingBroadcasts();
+      if (broadcasts.isEmpty) return;
+      final myUuid = DeviceStorage.getDeviceId();
+      int totalSent = 0;
+      for (final pkt in broadcasts) {
+        final wireData = pkt.toWire();
+        final count =
+            await _transportManager.sendToAllClients(wireData, senderUuid: myUuid);
+        if (count > 0) {
+          totalSent += count;
+          // Mark all current group members as delivered for this packet.
+          for (final memberId in _groupSession.members) {
+            (_broadcastDeliveredTo[pkt.msgId] ??= {}).add(memberId);
+          }
+          Logger.info('📢 [BROADCAST-GO] Sent ${pkt.msgId} → $count client(s)');
+        }
+      }
+      if (totalSent > 0) {
+        _scheduleBroadcastGroupDissolution();
+      }
+    } catch (e) {
+      Logger.error('[BROADCAST-GO] Error syncing broadcasts to group clients', e);
+    }
+  }
+
+  /// Activates the broadcast priority window on this device.
+  ///
+  /// During the window [_broadcastWindowActive] == true and unicast epidemic
+  /// auto-connect is suppressed so the P2P stack stays free to accept incoming
+  /// Multi-GO group invitations from the broadcast sender (Group Owner).
+  ///
+  /// Calling this again while the window is already open simply resets the
+  /// timer (extending the window), which is the right behaviour when multiple
+  /// broadcast packets arrive in quick succession.
+  void _activateBroadcastWindow() {
+    if (!_broadcastWindowActive) {
+      Logger.info('🔇 [BROADCAST] Priority window OPEN — unicast suppressed for ${_broadcastWindowDuration.inSeconds}s');
+      _broadcastWindowActive = true;
+    }
+    _broadcastWindowTimer?.cancel();
+    _broadcastWindowTimer = Timer(_broadcastWindowDuration, () {
+      _broadcastWindowActive = false;
+      _broadcastWindowTimer = null;
+      Logger.info('🔊 [BROADCAST] Priority window CLOSED — unicast resumed');
+    });
+  }
+
+  /// Schedule dissolving the Multi-GO group 8 seconds after the last
+  /// successful delivery, giving late-joining clients a chance to connect.
+  void _scheduleBroadcastGroupDissolution() {
+    _broadcastGroupDissolutionTimer?.cancel();
+    _broadcastGroupDissolutionTimer = Timer(const Duration(seconds: 8), () {
+      if (_groupSession.isGroupOwner && _isAutoBroadcastConnection) {
+        Logger.info('[BROADCAST-GO] Dissolving Multi-GO group after delivery window');
+        _isAutoBroadcastConnection = false;
+        _broadcastDeliveryQueue.clear();
+        // Close the broadcast window on the sender so unicast relay resumes
+        // now that the group has been dissolved.
+        _broadcastWindowTimer?.cancel();
+        _broadcastWindowActive = false;
+        unawaited(disconnect());
+      }
+    });
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -2221,8 +2561,14 @@ class ConnectionManager {
       _connectedDevice = null;
       _connectedPeerId = null;
 
-      // Short pause so the Wi-Fi Direct P2P stack fully releases the group.
-      await Future.delayed(const Duration(milliseconds: 600));
+      // Wait for the Wi-Fi Direct P2P stack to fully release the group before
+      // connecting to the next peer.  600 ms was too short on some devices
+      // (Samsung A52/A06) — P2P BUSY errors surfaced on the 2nd and 3rd
+      // broadcast attempts.  2500 ms gives the framework time to:
+      //   1. Complete removeGroup() and fire CONNECTION_CHANGED
+      //   2. Run resetState() and restart passive discovery
+      //   3. Return to IDLE before the next connect() is issued
+      await Future.delayed(const Duration(milliseconds: 2500));
 
       if (_broadcastDeliveryQueue.isEmpty) {
         _isAutoBroadcastConnection = false;
