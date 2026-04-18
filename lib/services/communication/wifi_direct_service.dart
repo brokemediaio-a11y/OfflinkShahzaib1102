@@ -434,6 +434,88 @@ class WifiDirectService {
     }
   }
 
+  // ═════════════════════════════════════════════════════════════════
+  // Passive GO mode — dialog-free relay connections
+  // ═════════════════════════════════════════════════════════════════
+
+  /// Put this device into "Passive Group Owner" mode using credentials
+  /// derived from [ownUuid].
+  ///
+  /// Any peer that knows our UUID can connect without a consent dialog by
+  /// calling [connectToGroupByUuid] with our UUID.
+  ///
+  /// Call once during app startup (after [initialize]) and again after every
+  /// relay disconnect via [restorePassiveGoMode].
+  Future<Map<String, dynamic>> startPassiveGoMode(String ownUuid) async {
+    if (!_initialized) return {'success': false, 'error': 'Not initialized'};
+    try {
+      final result = await _methodChannel.invokeMethod<Map>(
+        'startPassiveGoMode',
+        {'uuid': ownUuid},
+      );
+      final map = result != null
+          ? Map<String, dynamic>.from(result)
+          : {'success': false, 'error': 'no result'};
+      Logger.info('WifiDirectService: startPassiveGoMode → $map');
+      return map;
+    } catch (e) {
+      Logger.error('WifiDirectService: startPassiveGoMode error', e);
+      return {'success': false, 'error': e.toString()};
+    }
+  }
+
+  /// Restore passive GO mode after a relay connection completes.
+  ///
+  /// This recreates the passive group so the device is ready to accept the
+  /// next relay connection without a dialog.
+  Future<Map<String, dynamic>> restorePassiveGoMode() async {
+    if (!_initialized) return {'success': false, 'error': 'Not initialized'};
+    try {
+      final result =
+          await _methodChannel.invokeMethod<Map>('restorePassiveGoMode');
+      final map = result != null
+          ? Map<String, dynamic>.from(result)
+          : {'success': false, 'error': 'no result'};
+      Logger.info('WifiDirectService: restorePassiveGoMode → $map');
+      return map;
+    } catch (e) {
+      Logger.error('WifiDirectService: restorePassiveGoMode error', e);
+      return {'success': false, 'error': e.toString()};
+    }
+  }
+
+  /// Connect to a relay peer's passive GO group using derived credentials.
+  ///
+  /// On Android 10+ this is completely dialog-free — credentials are derived
+  /// from [targetUuid] and supplied directly via [WifiP2pConfig.Builder].
+  ///
+  /// On Android 9 the API is unavailable; the native layer falls back to the
+  /// standard DNS-SD → WPS-PBC path (dialog may appear on relay device).
+  ///
+  /// Use this instead of [initiateConnection] for all relay/DTN hops.
+  Future<Map<String, dynamic>> connectToGroupByUuid({
+    required String targetUuid,
+    required String targetName,
+  }) async {
+    if (!_initialized) return {'success': false, 'error': 'Not initialized'};
+    try {
+      Logger.info(
+          'WifiDirectService: connectToGroupByUuid "$targetName" (UUID=$targetUuid)');
+      final result = await _methodChannel.invokeMethod<Map>(
+        'connectToGroupByUuid',
+        {'targetUuid': targetUuid, 'targetName': targetName},
+      );
+      final map = result != null
+          ? Map<String, dynamic>.from(result)
+          : {'success': false, 'error': 'no result'};
+      Logger.info('WifiDirectService: connectToGroupByUuid → $map');
+      return map;
+    } catch (e) {
+      Logger.error('WifiDirectService: connectToGroupByUuid error', e);
+      return {'success': false, 'error': e.toString()};
+    }
+  }
+
   /// Join an existing Multi-GO group as a client.
   ///
   /// Delegates to the standard UUID-based connect path but yields the GO

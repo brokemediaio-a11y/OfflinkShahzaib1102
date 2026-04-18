@@ -46,6 +46,12 @@ class MessageModel extends HiveObject {
   final String? senderPeerId; // The immediate peer that sent/forwarded this message to us
                                // Used to avoid echoing messages back to the sender
 
+  // ── Derived indicator — no Hive storage needed ────────────────────
+  /// True when this RECEIVED message arrived via at least one relay hop.
+  /// Shown in the chat bubble as a small "↪ Forwarded" label.
+  /// Always false for sent messages (hopCount is 0 at creation time).
+  bool get isForwarded => !isSent && hopCount > 0;
+
   MessageModel({
     required this.id,
     required this.content,

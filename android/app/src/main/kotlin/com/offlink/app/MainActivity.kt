@@ -468,6 +468,37 @@ class MainActivity : FlutterActivity() {
                         result.success(wifiDirectManager.getGroupMemberUuids())
                     }
 
+                    // ── Passive GO mode — dialog-free relay connections ───────
+                    "startPassiveGoMode" -> {
+                        val uuid = call.argument<String>("uuid") ?: run {
+                            result.success(mapOf("success" to false, "error" to "uuid missing"))
+                            return@setMethodCallHandler
+                        }
+                        Thread {
+                            val res = wifiDirectManager.startPassiveGoMode(uuid)
+                            mainHandler.post { result.success(res) }
+                        }.start()
+                    }
+
+                    "restorePassiveGoMode" -> {
+                        Thread {
+                            val res = wifiDirectManager.restorePassiveGoMode()
+                            mainHandler.post { result.success(res) }
+                        }.start()
+                    }
+
+                    "connectToGroupByUuid" -> {
+                        val targetUuid = call.argument<String>("targetUuid") ?: run {
+                            result.success(mapOf("success" to false, "error" to "targetUuid missing"))
+                            return@setMethodCallHandler
+                        }
+                        val targetName = call.argument<String>("targetName") ?: ""
+                        Thread {
+                            val res = wifiDirectManager.connectToGroupByUuid(targetUuid, targetName)
+                            mainHandler.post { result.success(res) }
+                        }.start()
+                    }
+
                     else -> result.notImplemented()
                 }
             }

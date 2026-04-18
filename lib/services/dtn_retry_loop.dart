@@ -21,14 +21,14 @@ class DtnRetryLoop {
   void start() {
     _timer?.cancel();
     _timer = Timer.periodic(const Duration(seconds: 30), (_) => _tick());
-    Logger.info('[DtnRetryLoop] Started (30 s interval)');
+    Logger.dtnLog('⏱ RetryLoop started — 30 s interval');
   }
 
   /// Stop the retry loop.
   void stop() {
     _timer?.cancel();
     _timer = null;
-    Logger.info('[DtnRetryLoop] Stopped');
+    Logger.dtnLog('⏹ RetryLoop stopped');
   }
 
   Future<void> _tick() async {
@@ -45,16 +45,15 @@ class DtnRetryLoop {
       final pending = await DtnQueue.getPendingPackets();
       if (pending.isEmpty) return;
 
-      Logger.info(
-          '[DtnRetryLoop] Retrying ${pending.length} buffered packet(s) '
-          'with ${peers.length} peer(s) in range');
+      Logger.dtnLog(
+          'RETRY | ${pending.length} packet(s) queued | ${peers.length} peer(s) visible');
 
       for (final packet in pending) {
         final sent = await meshHandler.forward(packet, peers);
         await DtnQueue.recordAttempt(packet.msgId, delivered: sent);
       }
     } catch (e) {
-      Logger.error('[DtnRetryLoop] Error during tick', e);
+      Logger.error('RetryLoop tick error', e, null, Logger.dtn);
     }
   }
 }

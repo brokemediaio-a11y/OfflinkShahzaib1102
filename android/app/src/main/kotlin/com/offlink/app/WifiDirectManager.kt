@@ -215,6 +215,27 @@ class WifiDirectManager(private val context: Context) {
     companion object {
         const val TCP_PORT = 8988
         const val GROUP_OWNER_IP = "192.168.49.1"
+
+        // ── Credential derivation ─────────────────────────────────────────────
+        // Each OffLink device creates a WiFi Direct group whose credentials are
+        // deterministically derived from its UUID.  Any peer that knows your UUID
+        // can compute the SSID/passphrase and connect WITHOUT a consent dialog.
+        //
+        // SSID rules (Android): must start with "DIRECT-" and be 1–32 chars.
+        // Passphrase rules: 8–63 printable ASCII chars.
+
+        fun deriveGroupSsid(uuid: String): String =
+            "DIRECT-OL-${uuid.replace("-", "").take(8).uppercase()}"
+
+        fun deriveGroupPassphrase(uuid: String): String = try {
+            java.security.MessageDigest.getInstance("SHA-256")
+                .digest(uuid.toByteArray(Charsets.UTF_8))
+                .take(8)
+                .joinToString("") { "%02x".format(it) }
+        } catch (e: Exception) {
+            // Fallback: uuid chars + suffix (always 8+ chars, always ASCII)
+            uuid.replace("-", "").take(8).lowercase() + "offlink"
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -782,6 +803,210 @@ class WifiDirectManager(private val context: Context) {
         // The GROUP_OWNER intent on the other side (= 15) guarantees it wins the election.
         connectByUuid(targetUuid, fallbackName)
         return mapOf("success" to true)
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Passive GO mode — dialog-free relay connections
+    // ═══════════════════════════════════════════════════════════════
+
+    /**
+     * Put this device into "Passive Group Owner" mode.
+     *
+     * Creates a WiFi Direct group whose SSID and passphrase are derived
+     * deterministically from [uuid].  Any peer that knows our UUID can
+     * connect using [connectToGroupByUuid] without triggering a consent
+     * dialog, because they supply the correct credentials up-front instead
+     * of sending a WPS-PBC invitation.
+     *
+     * This is the relay-receive side of the dialog-free relay protocol.
+     * Call on app startup after initialize() returns true.
+     */
+    @SuppressLint("MissingPermission")
+    fun startPassiveGoMode(uuid: String): Map<String, Any> {
+        ownUuid = uuid
+        val mgr = wifiP2pManager ?: return mapOf("success" to false, "error" to "Manager null")
+        val ch  = p2pChannel   ?: return mapOf("success" to false, "error" to "Channel null")
+
+        Log.d(tag, "startPassiveGoMode: creating passive GO group for UUID=$uuid")
+
+        // Remove any existing group first so createGroup() starts clean.
+        mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
+            override fun onSuccess()                 { createPassiveGoGroup(mgr, ch, uuid) }
+            override fun onFailure(@Suppress("UNUSED_PARAMETER") r: Int) { createPassiveGoGroup(mgr, ch, uuid) }
+        })
+        return mapOf("success" to true)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun createPassiveGoGroup(mgr: WifiP2pManager, ch: WifiP2pManager.Channel, uuid: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // Android 10+: use Builder with explicit credentials so clients can
+            // connect without a dialog.
+            try {
+                val config = WifiP2pConfig.Builder()
+                    .setNetworkName(deriveGroupSsid(uuid))
+                    .setPassphrase(deriveGroupPassphrase(uuid))
+                    .build()
+                mgr.createGroup(ch, config, object : WifiP2pManager.ActionListener {
+                    override fun onSuccess() {
+                        Log.d(tag, "Passive GO group created (API 29+): SSID=${deriveGroupSsid(uuid)}")
+                    }
+                    override fun onFailure(reason: Int) {
+                        Log.w(tag, "createGroup (Builder) failed: ${failureReason(reason)} — falling back to legacy createGroup()")
+                        mgr.createGroup(ch, object : WifiP2pManager.ActionListener {
+                            override fun onSuccess() { Log.d(tag, "Legacy passive GO group created") }
+                            override fun onFailure(r: Int) { Log.e(tag, "Legacy createGroup also failed: ${failureReason(r)}") }
+                        })
+                    }
+                })
+                return
+            } catch (e: Exception) {
+                Log.w(tag, "WifiP2pConfig.Builder failed: ${e.message} — using legacy createGroup()")
+            }
+        }
+        // Android 9 or Builder exception: create group without explicit credentials.
+        // Clients on older Android will need to go through the PBC path anyway.
+        mgr.createGroup(ch, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() { Log.d(tag, "Legacy passive GO group created (pre-API29)") }
+            override fun onFailure(reason: Int) { Log.e(tag, "Legacy createGroup failed: ${failureReason(reason)}") }
+        })
+    }
+
+    /**
+     * Restore passive GO mode after a relay connection completes.
+     *
+     * Call this after every DTN relay disconnect so this device is ready to
+     * accept the next relay connection without a dialog.
+     */
+    @SuppressLint("MissingPermission")
+    fun restorePassiveGoMode(): Map<String, Any> {
+        val uuid = ownUuid ?: return mapOf("success" to false, "error" to "ownUuid not set")
+        Log.d(tag, "restorePassiveGoMode: recreating passive GO group for UUID=$uuid")
+        return startPassiveGoMode(uuid)
+    }
+
+    /**
+     * Connect to a remote device's passive GO group using derived credentials.
+     *
+     * On Android 10+ (API 29): supplies SSID + passphrase derived from
+     * [targetUuid] so the GO auto-accepts without showing a consent dialog.
+     *
+     * On Android 9 (API < 29): the Builder API is unavailable; falls back to
+     * the existing DNS-SD → MAC → WPS-PBC path ([connectByUuid]).  The dialog
+     * may appear on the relay device on those older OS versions, but the
+     * connection still works.
+     *
+     * [targetUuid]    — OffLink UUID of the relay peer to connect to.
+     * [fallbackName]  — display name used if we need the DNS-SD fallback path.
+     */
+    @SuppressLint("MissingPermission")
+    fun connectToGroupByUuid(targetUuid: String, fallbackName: String): Map<String, Any> {
+        if (!initialized) return mapOf("success" to false, "error" to "Not initialized")
+
+        // Atomic transition IDLE → CONNECTING.  Multiple Dart threads spawned by
+        // BLE scan bursts all arrive here simultaneously; compareAndSet ensures
+        // exactly ONE wins and the rest bail out without a race window.
+        val nonActivePhases = setOf(
+            ConnectionPhase.IDLE, ConnectionPhase.DISCONNECTED, ConnectionPhase.FAILED
+        )
+        val currentPhase = connectionPhase.get()
+        if (currentPhase !in nonActivePhases) {
+            Log.d(tag, "connectToGroupByUuid: already in $currentPhase — ignoring")
+            return mapOf("success" to true, "duplicate" to true)
+        }
+        // compareAndSet: only the FIRST thread transitions IDLE→CONNECTING.
+        // All others see a non-IDLE phase after this point.
+        if (!connectionPhase.compareAndSet(currentPhase, ConnectionPhase.CONNECTING)) {
+            val racePhase = connectionPhase.get()
+            Log.d(tag, "connectToGroupByUuid: lost CAS race (now $racePhase) — ignoring")
+            return mapOf("success" to true, "duplicate" to true)
+        }
+
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            // API < 29: Builder unavailable — use existing DNS-SD path
+            Log.d(tag, "connectToGroupByUuid: API < 29 — using connectByUuid fallback")
+            connectionPhase.set(ConnectionPhase.IDLE) // let connectByUuid manage phase
+            connectByUuid(targetUuid, fallbackName)
+            return mapOf("success" to true, "path" to "legacy_dns_sd")
+        }
+
+        val mgr = wifiP2pManager ?: run {
+            connectionPhase.set(ConnectionPhase.IDLE)
+            return mapOf("success" to false, "error" to "Manager null")
+        }
+        val ch  = p2pChannel   ?: run {
+            connectionPhase.set(ConnectionPhase.IDLE)
+            return mapOf("success" to false, "error" to "Channel null")
+        }
+
+        val ssid       = deriveGroupSsid(targetUuid)
+        val passphrase = deriveGroupPassphrase(targetUuid)
+        Log.d(tag, "connectToGroupByUuid: SSID=$ssid target=$fallbackName (API 29+)")
+
+        this.targetDeviceName = fallbackName
+        this.targetUuid       = null  // Not needed — credentials are pre-computed
+        notifyConnectionState(connected = false, status = "connecting")
+
+        try {
+            val config = WifiP2pConfig.Builder()
+                .setNetworkName(ssid)
+                .setPassphrase(passphrase)
+                .build()
+
+            // Remove our own group before joining the remote one so the P2P
+            // stack doesn't conflict between GO and client roles.
+            mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
+                override fun onSuccess()                 { doGroupConnect(mgr, ch, config, targetUuid ?: "", fallbackName) }
+                override fun onFailure(@Suppress("UNUSED_PARAMETER") r: Int) { doGroupConnect(mgr, ch, config, targetUuid ?: "", fallbackName) }
+            })
+        } catch (e: Exception) {
+            Log.w(tag, "connectToGroupByUuid: Builder failed (${e.message}) — resetting to IDLE for DTN retry")
+            connectionPhase.set(ConnectionPhase.IDLE)
+            targetDeviceName = null
+            notifyConnectionState(connected = false, error = "builder_failed")
+        }
+
+        return mapOf("success" to true, "path" to "builder_credentials")
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun doGroupConnect(
+        mgr: WifiP2pManager,
+        ch: WifiP2pManager.Channel,
+        config: WifiP2pConfig,
+        @Suppress("UNUSED_PARAMETER") uuid: String,
+        fallbackName: String
+    ) {
+        mgr.connect(ch, config, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                Log.d(tag, "doGroupConnect: connect() accepted (dialog-free) for $fallbackName")
+                // Phase was already set to CONNECTING before we called removeGroup();
+                // it stays CONNECTING until CONNECTION_CHANGED fires.
+                connectRetryCount.set(0)
+
+                // Safety timeout: if no GROUP_FORMED arrives within 25 s, reset
+                // to IDLE so the Dart DTN retry loop can try again on the next
+                // 30-second cycle.  Do NOT fall back to connectByUuid here —
+                // that would send a WPS-PBC invitation which conflicts with the
+                // still-running Builder connect() and causes duplicate connection
+                // attempts that prevent the socket from completing.
+                connectingTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+                connectingTimeoutRunnable = Runnable {
+                    if (connectionPhase.get() != ConnectionPhase.CONNECTING) return@Runnable
+                    Log.w(tag, "doGroupConnect: CONNECTING timeout (25 s) — resetting to IDLE for DTN retry")
+                    connectionPhase.set(ConnectionPhase.IDLE)
+                    targetDeviceName = null
+                    notifyConnectionState(connected = false, error = "connection_timeout")
+                }
+                mainHandler.postDelayed(connectingTimeoutRunnable!!, 25_000)
+            }
+            override fun onFailure(reason: Int) {
+                Log.w(tag, "doGroupConnect: connect() failed (${failureReason(reason)}) — resetting to IDLE for DTN retry")
+                connectionPhase.set(ConnectionPhase.IDLE)
+                targetDeviceName = null
+                notifyConnectionState(connected = false, error = "connect_failed_${failureReason(reason)}")
+            }
+        })
     }
 
     /**

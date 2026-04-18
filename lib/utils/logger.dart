@@ -91,4 +91,53 @@ class Logger {
       level: 800,
     );
   }
+
+  // ── Specialised emoji logs for hop/relay/DTN events ───────────────────────
+  // Use these instead of info() for mesh events so they stand out visually
+  // in the debug console and can be filtered with a single keyword search.
+
+  /// 🔁  Relay hop event — packet forwarded to next peer.
+  static void hop(String message) {
+    developer.log(
+      '[${_ts()}] 🔁 $message',
+      name: hopping,
+      level: 800,
+    );
+  }
+
+  /// 📬  Local delivery — packet arrived at its final destination on this device.
+  static void deliver(String message) {
+    developer.log(
+      '[${_ts()}] 📬 $message',
+      name: mesh,
+      level: 800,
+    );
+  }
+
+  /// 📦  DTN store-and-forward event — packet queued or retried.
+  static void dtnLog(String message) {
+    developer.log(
+      '[${_ts()}] 📦 $message',
+      name: dtn,
+      level: 800,
+    );
+  }
+
+  /// ✅  Successful DTN delivery — packet confirmed received after relay.
+  static void dtnDelivered(String message) {
+    developer.log(
+      '[${_ts()}] ✅ $message',
+      name: dtn,
+      level: 800,
+    );
+  }
+
+  /// 🔗  Connection event for relay/DTN (connect, disconnect, restore GO).
+  static void relay(String message) {
+    developer.log(
+      '[${_ts()}] 🔗 $message',
+      name: conn,
+      level: 800,
+    );
+  }
 }

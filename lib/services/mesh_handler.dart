@@ -100,9 +100,10 @@ class MeshHandler {
 
     // Step 2: Am I the destination?
     if (packet.toUserId == myUserId) {
-      Logger.info(
-          '[HOP][MeshHandler] $myUserId | ${packet.msgId} | DELIVER_LOCAL | '
-          'from=${packet.fromUserId} hop=${packet.hopCount} ttl=${packet.ttl}');
+      final via = packet.hopCount == 0 ? 'direct' : '${packet.hopCount}-hop relay';
+      Logger.deliver(
+          'ARRIVED  | ${packet.msgId.substring(0, 8)} | from=${packet.fromUserId.substring(0, 8)} '
+          '| $via | ttl=${packet.ttl}');
       await _deliverToSelf(packet);
       // Never ACK an ACK — that ping-pongs forever (msgId becomes _ack_ack_…).
       if (packet.type != 'ack') {
@@ -114,15 +115,17 @@ class MeshHandler {
     // Step 3: TTL check
     if (packet.isExpired) {
       Logger.warning(
-          '[HOP][MeshHandler] $myUserId | ${packet.msgId} | TTL_EXHAUSTED | '
-          'from=${packet.fromUserId} to=${packet.toUserId} hop=${packet.hopCount}');
+          '⏱️ TTL_EXHAUSTED | ${packet.msgId.substring(0, 8)} | hop=${packet.hopCount} '
+          '| ${packet.fromUserId.substring(0, 8)} → ${packet.toUserId.substring(0, 8)}');
       return;
     }
 
     // Step 4: Forward
-    Logger.info(
-        '[HOP][MeshHandler] $myUserId | ${packet.msgId} | RELAY_FORWARD | '
-        'from=${packet.fromUserId} to=${packet.toUserId} hop=${packet.hopCount} ttl=${packet.ttl}');
+    Logger.hop(
+        'RELAY  | hop ${packet.hopCount} → ${packet.hopCount + 1} '
+        '| ${packet.msgId.substring(0, 8)} '
+        '| ${packet.fromUserId.substring(0, 8)} → ${packet.toUserId.substring(0, 8)} '
+        '| ttl=${packet.ttl}');
     final hopped = packet.hop();
     await _forward(hopped, currentPeers);
   }
@@ -215,20 +218,20 @@ class MeshHandler {
         final sent = await _sendViaTransport(packet.toWire());
         if (!sent) {
           await DtnQueue.enqueue(packet);
-          Logger.info(
-              '[DTN][MeshHandler] $myUserId | ${packet.msgId} | SEND_FAILED_QUEUED | '
-              'to=${packet.toUserId} route=${decision.type.name}');
+          Logger.dtnLog(
+              'QUEUED (send failed) | ${packet.msgId.substring(0, 8)} '
+              '| to=${packet.toUserId.substring(0, 8)} | route=${decision.type.name}');
           return false;
         }
-        Logger.info(
-            '[HOP][MeshHandler] $myUserId | ${packet.msgId} | SENT | '
-            'to=${packet.toUserId} route=${decision.type.name} hop=${packet.hopCount}');
+        Logger.hop(
+            'SENT  | ${packet.msgId.substring(0, 8)} '
+            '| to=${packet.toUserId.substring(0, 8)} | route=${decision.type.name}');
         return true;
 
       case RouteType.store:
-        Logger.info(
-            '[DTN][MeshHandler] $myUserId | ${packet.msgId} | NO_ROUTE_BUFFERED | '
-            'to=${packet.toUserId}');
+        Logger.dtnLog(
+            'QUEUED (no route) | ${packet.msgId.substring(0, 8)} '
+            '| to=${packet.toUserId.substring(0, 8)}');
         await DtnQueue.enqueue(packet);
         return false;
     }
@@ -271,11 +274,13 @@ class MeshHandler {
           await DtnQueue.enqueue(packet);
           return false;
         }
-        Logger.info(
-            '[MeshHandler] ↗️ Forwarded ${packet.msgId} hop=${packet.hopCount}');
+        Logger.hop(
+            'FORWARDED | ${packet.msgId.substring(0, 8)} | hop=${packet.hopCount}');
         return true;
 
       case RouteType.store:
+        Logger.dtnLog(
+            'QUEUED (forward, no route) | ${packet.msgId.substring(0, 8)}');
         await DtnQueue.enqueue(packet);
         return false;
     }
@@ -286,8 +291,13 @@ class MeshHandler {
   // ═══════════════════════════════════════════════════════════════════════
 
   Future<void> _deliverToSelf(MessagePacket packet) async {
-    Logger.info(
-        '[MeshHandler] 📨 Delivering ${packet.msgId} from ${packet.fromUserId}');
+    if (packet.type != 'ack') {
+      final via = packet.hopCount == 0
+          ? 'direct'
+          : '${packet.hopCount}-hop relay';
+      Logger.deliver(
+          'DELIVER | ${packet.msgId.substring(0, 8)} | from=${packet.fromUserId.substring(0, 8)} | $via');
+    }
 
     if (packet.type == 'ack') {
       // Emit as __delivery_ack__ so ConnectionProvider updates status

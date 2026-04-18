@@ -137,6 +137,9 @@ class ConnectionManager {
   /// flush queued DTN messages.  After delivery the manager disconnects
   /// gracefully so the auto-reconnect loop never fires for a pure delivery run.
   bool _isDtnAutoConnection = false;
+  /// Timestamp of last DTN auto-connect attempt.  Used to enforce a 30-second
+  /// cooldown so BLE scan bursts don't spam connectToGroupByUuid.
+  DateTime? _lastDtnConnectAttemptTime;
   /// Guard against concurrent _syncPendingMessages invocations.
   /// Two back-to-back connections (e.g. initiator + immediate receiver)
   /// can both trigger a sync before the first one finishes, sending the
@@ -435,6 +438,19 @@ class ConnectionManager {
         if (bleInitialized) {
           unawaited(_ensurePeripheralStarted());
         }
+
+        // ── Passive GO mode ───────────────────────────────────────────
+        // Create a persistent WiFi Direct group with credentials derived from
+        // our UUID.  Relay peers can then connect without triggering a consent
+        // dialog on this device (Android 10+) by supplying the correct SSID
+        // and passphrase, which they derive from our advertised UUID.
+        if (wifiInitialized) {
+          final myUuidForGo = DeviceStorage.getDeviceId();
+          unawaited(_wifiDirectService.startPassiveGoMode(myUuidForGo).then((res) {
+            Logger.relay('🟢 Passive GO started → $res');
+          }));
+        }
+
         // Start presence tracking for saved contacts (Feature 4)
         unawaited(_startPresenceTracking());
       }
@@ -1094,16 +1110,29 @@ class ConnectionManager {
       // UUID is the ONLY identity used here. The native layer resolves
       // UUID → MAC internally via DNS-SD service discovery.
       // MAC addresses NEVER appear in the Dart layer.
-      Logger.info(
-          'ConnectionManager: initiating Wi-Fi Direct to '
-          '"${device.name}" (UUID=${device.id})');
-      final result = await _wifiDirectService.initiateConnection(
-          targetUuid: device.id, targetName: device.name);
+      //
+      // DTN/relay connections use connectToGroupByUuid() which supplies
+      // credentials derived from the peer's UUID so the target device's
+      // passive GO group auto-accepts without showing a consent dialog
+      // (Android 10+). User-initiated chat connections use the standard
+      // initiateConnection() path which may show the system invitation UI.
+      if (forDtnDelivery) {
+        Logger.relay('🔌 CONNECT | "${device.name}" (UUID=${device.id.substring(0, 8)}) relay=true');
+      } else {
+        Logger.info('ConnectionManager: initiating Wi-Fi Direct to "${device.name}" (UUID=${device.id})');
+      }
+      final result = forDtnDelivery
+          ? await _wifiDirectService.connectToGroupByUuid(
+              targetUuid: device.id, targetName: device.name)
+          : await _wifiDirectService.initiateConnection(
+              targetUuid: device.id, targetName: device.name);
 
       if (result['success'] == true) {
-        Logger.info(
-            'ConnectionManager: Wi-Fi Direct negotiation started — '
-            'awaiting connection state events…');
+        if (forDtnDelivery) {
+          Logger.relay('⏳ NEGOTIATING | "${device.name}" — awaiting socket…');
+        } else {
+          Logger.info('ConnectionManager: Wi-Fi Direct negotiation started — awaiting connection state events…');
+        }
         // The actual PeerConnection is registered in _handleWifiDirectState
         // once the socket is established (socketActive == true).
         unawaited(_scanLogStorage.logEvent(
@@ -2333,19 +2362,22 @@ class ConnectionManager {
         final stillPending =
             remaining.where((p) => p.toUserId == connectedPeerId).isNotEmpty;
         if (!stillPending) {
-          Logger.info(
-              'ConnectionManager: DTN delivery to $connectedPeerId complete '
-              '— disconnecting gracefully to prevent reconnect loop');
+          Logger.relay('DTN COMPLETE | delivered to $connectedPeerId — disconnecting gracefully');
           // Small grace period so ACKs can arrive before we tear down.
           await Future.delayed(const Duration(seconds: 2));
           // Guard: user might have opened the chat and cleared the flag.
           if (_isDtnAutoConnection) {
             _isDtnAutoConnection = false;
             await disconnect();
+            // Restore passive GO mode so we're ready to accept the next
+            // relay connection without a dialog.
+            unawaited(_wifiDirectService.restorePassiveGoMode().then((res) {
+              Logger.relay('🟢 Passive GO restored after DTN relay → $res');
+            }));
           }
         }
       } catch (e) {
-        Logger.error('ConnectionManager: error in DTN auto-disconnect', e);
+        Logger.error('DTN auto-disconnect error', e, null, Logger.conn);
       }
     }
   }
@@ -2363,6 +2395,20 @@ class ConnectionManager {
     if (isConnected() || _currentConnectionType != ConnectionType.none) return;
     // Don't auto-connect if user explicitly cancelled / disconnected recently.
     if (_userInitiatedDisconnect) return;
+    // Don't start a new DTN connection attempt while one is already in flight.
+    // BLE scan batches fire every 1–2 s; without this guard each batch spawns
+    // a new connectToGroupByUuid call while the previous one is still in the
+    // CONNECTING phase, flooding the WiFi Direct stack with hundreds of threads.
+    if (_isDtnAutoConnection) return;
+    // Enforce a minimum 30-second gap between successive DTN connect attempts.
+    // Even after _isDtnAutoConnection is cleared (connection failed/reset), we
+    // don't want to retry until the P2P stack has had time to settle.
+    final now = DateTime.now();
+    if (_lastDtnConnectAttemptTime != null &&
+        now.difference(_lastDtnConnectAttemptTime!) <
+            const Duration(seconds: 30)) {
+      return;
+    }
 
     try {
       final pending = await DtnQueue.getPendingPackets();
@@ -2388,6 +2434,7 @@ class ConnectionManager {
           if (_broadcastDeliveryQueue.isNotEmpty) {
             final target = _broadcastDeliveryQueue.removeAt(0);
             _isAutoBroadcastConnection = true;
+            _lastDtnConnectAttemptTime = DateTime.now();
             Logger.info(
                 '[BROADCAST] Starting delivery round — '
                 '${_broadcastDeliveryQueue.length + 1} peer(s) queued; '
@@ -2409,33 +2456,47 @@ class ConnectionManager {
           .toSet();
 
       if (pendingTargets.isNotEmpty) {
-        // Prefer direct destination first.
+        // Sort visible peers by signal strength (strongest first) so the relay
+        // carrier selection always picks the nearest reachable device.
+        final sortedDevices = List<DeviceModel>.from(discoveredDevices)
+          ..sort((a, b) => b.rssi.compareTo(a.rssi));
+
+        // Prefer direct destination if it is within reliable WiFi Direct range.
+        // BLE advertisements reach ~80 m but WiFi Direct TCP reliably works only
+        // up to ~50 m.  If the destination's RSSI is below -75 dBm the device is
+        // likely too far for a successful WiFi Direct group formation; fall through
+        // to epidemic relay via a closer intermediate peer instead.
+        const bleRssiWifiDirectThreshold = -75; // dBm
         DeviceModel? directTarget;
-        for (final device in discoveredDevices) {
+        for (final device in sortedDevices) {
           if (pendingTargets.contains(device.id)) {
             directTarget = device;
             break;
           }
         }
 
-        if (directTarget != null) {
-          Logger.info(
-              '[${Logger.dtn}] Direct target ${directTarget.name} visible — '
-              'auto-connecting for direct delivery',
-              Logger.dtn);
+        if (directTarget != null &&
+            directTarget.rssi >= bleRssiWifiDirectThreshold) {
+          Logger.relay('DTN DIRECT | ${directTarget.name} RSSI=${directTarget.rssi} dBm — connecting');
           _isDtnAutoConnection = true;
+          _lastDtnConnectAttemptTime = DateTime.now();
           unawaited(connectToDevice(directTarget, forDtnDelivery: true));
           return;
         }
 
-        // Destination not visible — connect to any OffLink peer as carrier.
-        final anyRelay = discoveredDevices.isNotEmpty ? discoveredDevices.first : null;
+        if (directTarget != null &&
+            directTarget.rssi < bleRssiWifiDirectThreshold) {
+          Logger.hop('⚠️ WEAK SIGNAL | ${directTarget.name} RSSI=${directTarget.rssi} dBm — skipping direct, using relay');
+        }
+
+        // Destination not visible OR too far for direct WiFi Direct:
+        // connect to the closest available peer as an epidemic relay carrier.
+        // That peer's MeshHandler will forward the packet one hop closer.
+        final anyRelay = sortedDevices.isNotEmpty ? sortedDevices.first : null;
         if (anyRelay != null) {
-          Logger.info(
-              '[${Logger.hopping}] Destination not visible — using ${anyRelay.name} '
-              'as epidemic relay carrier for ${pendingTargets.length} pending packet(s)',
-              Logger.hopping);
+          Logger.hop('RELAY CARRIER | ${anyRelay.name} RSSI=${anyRelay.rssi} dBm | forwarding ${pendingTargets.length} packet(s)');
           _isDtnAutoConnection = true;
+          _lastDtnConnectAttemptTime = DateTime.now();
           unawaited(connectToDevice(anyRelay, forDtnDelivery: true));
           return;
         }
@@ -2499,6 +2560,10 @@ class ConnectionManager {
         _connectionController.add(ConnectionState.disconnected);
         Logger.info('[BROADCAST] ✅ Broadcast delivery round complete — '
             'disconnected from last peer. Stack cooling down.');
+        // Restore passive GO mode so we're ready for the next relay connection.
+        unawaited(_wifiDirectService.restorePassiveGoMode().then((res) {
+          Logger.relay('🟢 Passive GO restored after broadcast round → $res');
+        }));
         return;
       }
 

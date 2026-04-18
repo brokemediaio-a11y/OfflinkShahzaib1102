@@ -607,6 +607,10 @@ class _MessageBubble extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            // ── Forwarded indicator ──────────────────────────────────
+            // Shown only on received messages that arrived via relay hop(s).
+            // Never shown on sent messages and never on broadcast messages.
+            if (message.isForwarded) _ForwardedLabel(message.hopCount, isSent),
             Text(
               message.content,
               style: TextStyle(
@@ -647,6 +651,32 @@ class _MessageBubble extends StatelessWidget {
     return '$h:$m';
   }
 
+  /// Small "↪ Forwarded · N hop(s)" row shown at the top of received relay bubbles.
+  Widget _ForwardedLabel(int hopCount, bool isSent) {
+    final textColor = isSent
+        ? AppColors.messageTextSent.withOpacity(0.65)
+        : AppColors.messageTextReceived.withOpacity(0.65);
+    final label = hopCount == 1 ? '1 hop' : '$hopCount hops';
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.reply_all, size: 11, color: textColor),
+          const SizedBox(width: 3),
+          Text(
+            'Forwarded · $label',
+            style: TextStyle(
+              fontSize: 10,
+              fontStyle: FontStyle.italic,
+              color: textColor,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _MessageStatusIcon(MessageStatus status) {
     IconData icon;
     Color color;
@@ -662,19 +692,19 @@ class _MessageBubble extends StatelessWidget {
       case MessageStatus.pending:
         icon = Icons.schedule_send;
         color = Colors.orange.shade300;
-        tooltip = 'Pending — will send when in range';
+        tooltip = 'Queued — will relay when a peer is in range';
         break;
 
       case MessageStatus.sent:
         icon = Icons.check;
         color = AppColors.messageTextSent.withOpacity(0.7);
-        tooltip = 'Sent';
+        tooltip = 'Sent to relay peer';
         break;
 
       case MessageStatus.relayed:
-        icon = Icons.sync_alt;
-        color = Colors.blue.shade300;
-        tooltip = 'Relayed via mesh';
+        icon = Icons.mediation;
+        color = Colors.orange.shade400;
+        tooltip = 'Relayed via mesh — en route to destination';
         break;
 
       case MessageStatus.delivered:
