@@ -93,7 +93,13 @@ class MeshHandler {
 
     // Step 1: Dedup
     if (await SeenCache.hasSeen(packet.msgId)) {
-      Logger.debug('[MeshHandler] Already seen ${packet.msgId} — dropping');
+      if (packet.toUserId == myUserId && packet.type != 'ack') {
+        Logger.debug(
+            '[MeshHandler] Already delivered ${packet.msgId} - resending ACK');
+        await _sendAck(packet, currentPeers);
+      } else {
+        Logger.debug('[MeshHandler] Already seen ${packet.msgId} - dropping');
+      }
       return;
     }
     await SeenCache.markSeen(packet.msgId);
@@ -120,14 +126,23 @@ class MeshHandler {
       return;
     }
 
-    // Step 4: Forward
+    // Step 4: Store for the relay orchestrator.
+    //
+    // Important: at receive time the active socket is the previous hop
+    // (for example A -> B). Sending immediately here writes back to that same
+    // socket instead of connecting to the real destination (B -> C). Queue the
+    // hopped packet so ConnectionManager can disconnect from the sender, choose
+    // the destination/next carrier by UUID, then flush it over the next socket.
     Logger.hop(
         'RELAY  | hop ${packet.hopCount} → ${packet.hopCount + 1} '
         '| ${packet.msgId.substring(0, 8)} '
         '| ${packet.fromUserId.substring(0, 8)} → ${packet.toUserId.substring(0, 8)} '
         '| ttl=${packet.ttl}');
     final hopped = packet.hop();
-    await _forward(hopped, currentPeers);
+    await DtnQueue.enqueue(hopped);
+    Logger.dtnLog(
+        'QUEUED (relay carry) | ${hopped.msgId.substring(0, 8)} '
+        '| to=${hopped.toUserId.substring(0, 8)} | hop=${hopped.hopCount}');
   }
 
   // ═══════════════════════════════════════════════════════════════════════

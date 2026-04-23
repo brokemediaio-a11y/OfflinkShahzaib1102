@@ -22,6 +22,7 @@ import java.io.BufferedReader
 import java.io.BufferedWriter
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
+import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.ExecutorService
@@ -91,10 +92,35 @@ class WifiDirectManager(private val context: Context) {
     private var groupOwnerAddress: String? = null
     private var targetDeviceName: String? = null
 
+    // ── Passive GO mode flag ──────────────────────────────────────────────────
+    // True while this device has created a passive relay group via
+    // startPassiveGoMode().  Prevents handleConnectionInfo() from advancing
+    // the main connection state machine when the group first forms (which would
+    // start a ServerSocket and set phase=SOCKET_CONNECTING, blocking all
+    // outbound user-initiated connections).  The flag stays true until:
+    //   • A relay client actually joins the group (detected via requestPeers),
+    //     at which point socket setup proceeds normally.
+    //   • initiateConnection() or connectToGroupByUuid() is called — the passive
+    //     group is removed first so the device can act as a client.
+    //   • resetState() clears all state.
+    private val isPassiveGoMode = AtomicBoolean(false)
+
+    // ── Passive GO creation in-flight guard ───────────────────────────────────
+    // Set to true BEFORE removeGroup() is called in startPassiveGoMode() and
+    // cleared only when handleConnectionInfo() processes the new passive group,
+    // createGroup() fails, or the user initiates an outbound connection.
+    //
+    // This flag allows resetState() to preserve isPassiveGoMode across the
+    // spurious DISCONNECTED broadcasts that the Android framework fires during
+    // the removeGroup() → createGroup() transition, which is the root cause of
+    // the "phase=SOCKET_CONNECTING immediately after passive GO creation" bug.
+    private val pendingPassiveGoCreation = AtomicBoolean(false)
+
     // Socket handles
     private var serverSocket: ServerSocket? = null
     private var activeSocket: Socket? = null
     private var socketWriter: BufferedWriter? = null
+    private val socketWriteLock = Any()
     private val isSocketActive = AtomicBoolean(false)
 
     // ─── Multi-GO Group Session ────────────────────────────────────────────────
@@ -107,6 +133,7 @@ class WifiDirectManager(private val context: Context) {
     // isMultiGoGroupOwner distinguishes the two modes.
     private val clientSocketMap = java.util.concurrent.ConcurrentHashMap<String, BufferedWriter>()
     private val clientSockets   = java.util.concurrent.ConcurrentHashMap<String, Socket>()
+    private val clientWriteLocks = java.util.concurrent.ConcurrentHashMap<String, Any>()
     private val isMultiGoGroupOwner = AtomicBoolean(false)
     /** Fires when a new client UUID is accepted into the Multi-GO group. */
     var groupMemberJoinedListener: ((String) -> Unit)? = null
@@ -129,11 +156,19 @@ class WifiDirectManager(private val context: Context) {
     private val discoveryRetryCount = AtomicInteger(0)
     private val maxDiscoveryRetries = 6
 
+    // Consecutive non-BUSY discovery failure counter.
+    // After this many back-to-back failures (e.g. "Internal error") we escalate
+    // to hardRecoverP2pSlot() which resets the WiFi Direct hardware stack.
+    private val discoveryErrorCount = AtomicInteger(0)
+    private val maxDiscoveryErrors  = 2
+
     // Set to true while a hard BUSY recovery is in progress to suppress
     // concurrent discoverPeers() calls from the passive-discovery heartbeat.
     private val isBusyRecovering = AtomicBoolean(false)
 
-    // Safety timeout: reset if we stay CONNECTING with no response for 15 s
+    // Safety timeout: reset if we stay CONNECTING with no response.
+    // DTN weak-link relay attempts are intentionally patient so links around
+    // -89 dBm get enough time to form before we retry.
     private var connectingTimeoutRunnable: Runnable? = null
 
     // Auto-retry counter — resets on a fresh user-initiated connect or disconnect
@@ -425,6 +460,7 @@ class WifiDirectManager(private val context: Context) {
             override fun onSuccess() {
                 Log.d(tag, "Peer discovery initiated successfully")
                 discoveryRetryCount.set(0)
+                discoveryErrorCount.set(0) // reset non-BUSY error counter on successful start
                 // Only advance to DISCOVERING if we are not already further along
                 val phase = connectionPhase.get()
                 if (phase == ConnectionPhase.IDLE || phase == ConnectionPhase.DISCONNECTED ||
@@ -484,9 +520,28 @@ class WifiDirectManager(private val context: Context) {
                     }
                     else -> {
                         discoveryRetryCount.set(0)
-                        val errorMsg = "Peer discovery failed: ${failureReason(reason)}"
+                        val errorMsg = "Peer discovery failed: ${failureReason(reason)}, phase=${connectionPhase.get()}"
                         connectionPhase.set(ConnectionPhase.FAILED)
                         notifyConnectionState(connected = false, error = errorMsg)
+                        // Non-BUSY stack error (e.g. "Internal error" / ERROR=0).
+                        // The passive heartbeat retries every 30 s but if the WiFi Direct
+                        // hardware stack is crashed those retries also fail.
+                        // After maxDiscoveryErrors consecutive failures escalate to
+                        // hardRecoverP2pSlot() which resets the P2P hardware state.
+                        val errorCount = discoveryErrorCount.incrementAndGet()
+                        if (errorCount >= maxDiscoveryErrors) {
+                            discoveryErrorCount.set(0)
+                            Log.w(tag, "Peer discovery FAILED $errorCount times — hard-recovering P2P stack")
+                            isBusyRecovering.set(true)
+                            hardRecoverP2pSlot(8_000L) {
+                                isBusyRecovering.set(false)
+                                if (connectionPhase.get() == ConnectionPhase.IDLE ||
+                                    connectionPhase.get() == ConnectionPhase.DISCONNECTED ||
+                                    connectionPhase.get() == ConnectionPhase.FAILED) {
+                                    discoverPeers()
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -505,6 +560,28 @@ class WifiDirectManager(private val context: Context) {
     @SuppressLint("MissingPermission")
     fun initiateConnection(targetName: String): Map<String, Any> {
         if (!initialized) return mapOf("success" to false, "error" to "Not initialized")
+
+        // If we are currently in passive GO mode (group created for relay standby),
+        // we must remove the group before acting as a client, because the Android
+        // P2P stack cannot simultaneously be a GO and initiate an outbound connect.
+        if (isPassiveGoMode.getAndSet(false)) {
+            pendingPassiveGoCreation.set(false) // user is taking over — passive creation cancelled
+            Log.d(tag, "initiateConnection: leaving passive GO mode to connect to '$targetName'")
+            val mgr2 = wifiP2pManager ?: return mapOf("success" to false, "error" to "Manager null")
+            val ch2  = p2pChannel   ?: return mapOf("success" to false, "error" to "Channel null")
+            val saved = targetName
+            mgr2.removeGroup(ch2, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {
+                    Log.d(tag, "Passive GO removed — retrying initiateConnection '$saved'")
+                    mainHandler.postDelayed({ initiateConnection(saved) }, 500)
+                }
+                override fun onFailure(r: Int) {
+                    Log.w(tag, "removeGroup before initiateConnection failed ($r) — retrying anyway")
+                    mainHandler.postDelayed({ initiateConnection(saved) }, 500)
+                }
+            })
+            return mapOf("success" to true, "waiting" to true)
+        }
 
         targetDeviceName = targetName
         discoveryRetryCount.set(0)
@@ -583,7 +660,7 @@ class WifiDirectManager(private val context: Context) {
                 connectionPhase.set(ConnectionPhase.CONNECTING)
                 notifyConnectionState(connected = false, status = "connecting")
 
-                // Safety net: if no GROUP_FORMED within 15 s, auto-retry with
+                // Safety net: if no GROUP_FORMED within 45 s, auto-retry with
                 // exponential back-off to break the scan-scan collision where both
                 // devices are simultaneously scanning and neither is listening.
                 // After maxConnectRetries failures we give up and report an error.
@@ -654,7 +731,7 @@ class WifiDirectManager(private val context: Context) {
                         Log.d(tag, "Auto-retrying Wi-Fi Direct discovery in ${delayMs}ms…")
                         mainHandler.postDelayed({ discoverPeers() }, delayMs)
                     }
-                }.also { mainHandler.postDelayed(it, 25_000) }
+                }.also { mainHandler.postDelayed(it, 45_000) }
             }
             override fun onFailure(reason: Int) {
                 Log.e(tag, "Wi-Fi Direct connect() to $deviceAddress failed: ${failureReason(reason)}")
@@ -680,7 +757,7 @@ class WifiDirectManager(private val context: Context) {
                                 notifyConnectionState(connected = false, error = "Connection timed out")
                             }
                         }
-                    }.also { mainHandler.postDelayed(it, 20_000) }
+                    }.also { mainHandler.postDelayed(it, 35_000) }
                     return
                 }
 
@@ -710,9 +787,7 @@ class WifiDirectManager(private val context: Context) {
         }
         executor.execute {
             try {
-                w.write(message)
-                w.newLine()
-                w.flush()
+                writeFrame(w, message, socketWriteLock)
                 Log.v(tag, "Message sent via Wi-Fi Direct socket (${message.length} chars)")
             } catch (e: Exception) {
                 Log.e(tag, "Error writing to socket", e)
@@ -720,6 +795,14 @@ class WifiDirectManager(private val context: Context) {
             }
         }
         return true
+    }
+
+    private fun writeFrame(writer: BufferedWriter, message: String, lock: Any) {
+        synchronized(lock) {
+            writer.write(message)
+            writer.newLine()
+            writer.flush()
+        }
     }
 
     /** True only when a TCP socket is confirmed open. */
@@ -829,6 +912,11 @@ class WifiDirectManager(private val context: Context) {
 
         Log.d(tag, "startPassiveGoMode: creating passive GO group for UUID=$uuid")
 
+        // Guard must be set BEFORE removeGroup() fires so that the spurious
+        // DISCONNECTED broadcast dispatched by removeGroup() does NOT clear
+        // isPassiveGoMode inside resetState() before handleConnectionInfo() runs.
+        pendingPassiveGoCreation.set(true)
+
         // Remove any existing group first so createGroup() starts clean.
         mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
             override fun onSuccess()                 { createPassiveGoGroup(mgr, ch, uuid) }
@@ -839,6 +927,10 @@ class WifiDirectManager(private val context: Context) {
 
     @SuppressLint("MissingPermission")
     private fun createPassiveGoGroup(mgr: WifiP2pManager, ch: WifiP2pManager.Channel, uuid: String) {
+        isPassiveGoMode.set(true) // flag checked in handleConnectionInfo
+        // pendingPassiveGoCreation was set in startPassiveGoMode() and stays true
+        // until handleConnectionInfo() processes the new group.  On failure paths
+        // we clear it here so resetState() resumes normal isPassiveGoMode cleanup.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             // Android 10+: use Builder with explicit credentials so clients can
             // connect without a dialog.
@@ -850,12 +942,22 @@ class WifiDirectManager(private val context: Context) {
                 mgr.createGroup(ch, config, object : WifiP2pManager.ActionListener {
                     override fun onSuccess() {
                         Log.d(tag, "Passive GO group created (API 29+): SSID=${deriveGroupSsid(uuid)}")
+                        // pendingPassiveGoCreation stays true — cleared in handleConnectionInfo()
                     }
                     override fun onFailure(reason: Int) {
                         Log.w(tag, "createGroup (Builder) failed: ${failureReason(reason)} — falling back to legacy createGroup()")
                         mgr.createGroup(ch, object : WifiP2pManager.ActionListener {
-                            override fun onSuccess() { Log.d(tag, "Legacy passive GO group created") }
-                            override fun onFailure(r: Int) { Log.e(tag, "Legacy createGroup also failed: ${failureReason(r)}") }
+                            override fun onSuccess() {
+                                Log.d(tag, "Legacy passive GO group created")
+                                // pendingPassiveGoCreation stays true — cleared in handleConnectionInfo()
+                            }
+                            override fun onFailure(r: Int) {
+                                Log.e(tag, "Legacy createGroup also failed: ${failureReason(r)}")
+                                // Both createGroup() paths failed — clear flag so resetState()
+                                // can clean up isPassiveGoMode normally.
+                                pendingPassiveGoCreation.set(false)
+                                isPassiveGoMode.set(false)
+                            }
                         })
                     }
                 })
@@ -867,8 +969,16 @@ class WifiDirectManager(private val context: Context) {
         // Android 9 or Builder exception: create group without explicit credentials.
         // Clients on older Android will need to go through the PBC path anyway.
         mgr.createGroup(ch, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() { Log.d(tag, "Legacy passive GO group created (pre-API29)") }
-            override fun onFailure(reason: Int) { Log.e(tag, "Legacy createGroup failed: ${failureReason(reason)}") }
+            override fun onSuccess() {
+                Log.d(tag, "Legacy passive GO group created (pre-API29)")
+                // pendingPassiveGoCreation stays true — cleared in handleConnectionInfo()
+            }
+            override fun onFailure(reason: Int) {
+                Log.e(tag, "Legacy createGroup failed: ${failureReason(reason)}")
+                // createGroup() failed — clear flag so resetState() can clean up normally.
+                pendingPassiveGoCreation.set(false)
+                isPassiveGoMode.set(false)
+            }
         })
     }
 
@@ -903,23 +1013,31 @@ class WifiDirectManager(private val context: Context) {
     fun connectToGroupByUuid(targetUuid: String, fallbackName: String): Map<String, Any> {
         if (!initialized) return mapOf("success" to false, "error" to "Not initialized")
 
+        // We are about to become a client — passive GO mode ends here.
+        // removeGroup() below will dissolve the passive group before we connect.
+        isPassiveGoMode.set(false)
+        pendingPassiveGoCreation.set(false) // user is taking over — passive creation cancelled
+
         // Atomic transition IDLE → CONNECTING.  Multiple Dart threads spawned by
         // BLE scan bursts all arrive here simultaneously; compareAndSet ensures
         // exactly ONE wins and the rest bail out without a race window.
         val nonActivePhases = setOf(
-            ConnectionPhase.IDLE, ConnectionPhase.DISCONNECTED, ConnectionPhase.FAILED
+            ConnectionPhase.IDLE,
+            ConnectionPhase.DISCOVERING,
+            ConnectionPhase.DISCONNECTED,
+            ConnectionPhase.FAILED
         )
         val currentPhase = connectionPhase.get()
         if (currentPhase !in nonActivePhases) {
             Log.d(tag, "connectToGroupByUuid: already in $currentPhase — ignoring")
-            return mapOf("success" to true, "duplicate" to true)
+            return mapOf("success" to false, "duplicate" to true, "phase" to currentPhase.name)
         }
         // compareAndSet: only the FIRST thread transitions IDLE→CONNECTING.
         // All others see a non-IDLE phase after this point.
         if (!connectionPhase.compareAndSet(currentPhase, ConnectionPhase.CONNECTING)) {
             val racePhase = connectionPhase.get()
             Log.d(tag, "connectToGroupByUuid: lost CAS race (now $racePhase) — ignoring")
-            return mapOf("success" to true, "duplicate" to true)
+            return mapOf("success" to false, "duplicate" to true, "phase" to racePhase.name)
         }
 
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
@@ -944,7 +1062,11 @@ class WifiDirectManager(private val context: Context) {
         Log.d(tag, "connectToGroupByUuid: SSID=$ssid target=$fallbackName (API 29+)")
 
         this.targetDeviceName = fallbackName
-        this.targetUuid       = null  // Not needed — credentials are pre-computed
+        val capturedTargetUuid = targetUuid  // capture before nulling — needed for WPS-PBC fallback
+        this.targetUuid       = null         // credentials are pre-computed; UUID no longer needed for the Builder path
+        cancelServiceDiscoveryTimeout()
+        connectingTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        connectingTimeoutRunnable = null
         notifyConnectionState(connected = false, status = "connecting")
 
         try {
@@ -953,11 +1075,39 @@ class WifiDirectManager(private val context: Context) {
                 .setPassphrase(passphrase)
                 .build()
 
-            // Remove our own group before joining the remote one so the P2P
-            // stack doesn't conflict between GO and client roles.
-            mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
-                override fun onSuccess()                 { doGroupConnect(mgr, ch, config, targetUuid ?: "", fallbackName) }
-                override fun onFailure(@Suppress("UNUSED_PARAMETER") r: Int) { doGroupConnect(mgr, ch, config, targetUuid ?: "", fallbackName) }
+            val startConnect = {
+                // Remove our own group before joining the remote one so the P2P
+                // stack doesn't conflict between GO and client roles.
+                mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
+                    override fun onSuccess() {
+                        doGroupConnect(mgr, ch, config, capturedTargetUuid ?: "", fallbackName)
+                    }
+
+                    override fun onFailure(@Suppress("UNUSED_PARAMETER") r: Int) {
+                        doGroupConnect(mgr, ch, config, capturedTargetUuid ?: "", fallbackName)
+                    }
+                })
+            }
+
+            val clearServicesThenConnect = {
+                mgr.clearServiceRequests(ch, object : WifiP2pManager.ActionListener {
+                    override fun onSuccess() = startConnect()
+                    override fun onFailure(@Suppress("UNUSED_PARAMETER") r: Int) = startConnect()
+                })
+            }
+
+            // DTN relay connection is the foreground action now; stop discovery
+            // first so DISCOVERING cannot occupy the P2P slot and turn this into
+            // a no-op duplicate.
+            mgr.stopPeerDiscovery(ch, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {
+                    Log.d(tag, "connectToGroupByUuid: stopped discovery before DTN relay connect")
+                    clearServicesThenConnect()
+                }
+
+                override fun onFailure(@Suppress("UNUSED_PARAMETER") r: Int) {
+                    clearServicesThenConnect()
+                }
             })
         } catch (e: Exception) {
             Log.w(tag, "connectToGroupByUuid: Builder failed (${e.message}) — resetting to IDLE for DTN retry")
@@ -974,7 +1124,7 @@ class WifiDirectManager(private val context: Context) {
         mgr: WifiP2pManager,
         ch: WifiP2pManager.Channel,
         config: WifiP2pConfig,
-        @Suppress("UNUSED_PARAMETER") uuid: String,
+        uuid: String,       // target UUID — used in WPS-PBC fallback
         fallbackName: String
     ) {
         mgr.connect(ch, config, object : WifiP2pManager.ActionListener {
@@ -984,7 +1134,7 @@ class WifiDirectManager(private val context: Context) {
                 // it stays CONNECTING until CONNECTION_CHANGED fires.
                 connectRetryCount.set(0)
 
-                // Safety timeout: if no GROUP_FORMED arrives within 25 s, reset
+                // Safety timeout: if no GROUP_FORMED arrives within 60 s, reset
                 // to IDLE so the Dart DTN retry loop can try again on the next
                 // 30-second cycle.  Do NOT fall back to connectByUuid here —
                 // that would send a WPS-PBC invitation which conflicts with the
@@ -993,18 +1143,33 @@ class WifiDirectManager(private val context: Context) {
                 connectingTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
                 connectingTimeoutRunnable = Runnable {
                     if (connectionPhase.get() != ConnectionPhase.CONNECTING) return@Runnable
-                    Log.w(tag, "doGroupConnect: CONNECTING timeout (25 s) — resetting to IDLE for DTN retry")
+                    Log.w(tag, "doGroupConnect: CONNECTING timeout (60 s) — resetting to IDLE for DTN retry")
                     connectionPhase.set(ConnectionPhase.IDLE)
                     targetDeviceName = null
                     notifyConnectionState(connected = false, error = "connection_timeout")
                 }
-                mainHandler.postDelayed(connectingTimeoutRunnable!!, 25_000)
+                mainHandler.postDelayed(connectingTimeoutRunnable!!, 60_000)
             }
             override fun onFailure(reason: Int) {
-                Log.w(tag, "doGroupConnect: connect() failed (${failureReason(reason)}) — resetting to IDLE for DTN retry")
+                // Credential-based connect failed (target likely has no passive GO group).
+                // Fall back to standard DNS-SD + WPS-PBC so the message can still be
+                // delivered — a dialog will appear on the target device, which is
+                // acceptable for direct nearby delivery.
+                //
+                // NOTE: this fallback is ONLY triggered on immediate failure (onFailure),
+                // NOT on timeout.  The previous session's bug (PBC invitation conflicting
+                // with an in-progress Builder connect) is avoided because onFailure means
+                // the Builder connect already terminated before we start WPS-PBC.
+                Log.w(tag, "doGroupConnect: connect() failed (${failureReason(reason)}) — falling back to DNS-SD / WPS-PBC")
                 connectionPhase.set(ConnectionPhase.IDLE)
-                targetDeviceName = null
-                notifyConnectionState(connected = false, error = "connect_failed_${failureReason(reason)}")
+                targetDeviceName = fallbackName  // restore for connectByUuid auto-connect
+                if (uuid.isNotBlank()) {
+                    connectByUuid(uuid, fallbackName)
+                } else {
+                    // UUID unknown — give up and let DTN retry
+                    targetDeviceName = null
+                    notifyConnectionState(connected = false, error = "connect_failed_no_uuid")
+                }
             }
         })
     }
@@ -1028,9 +1193,8 @@ class WifiDirectManager(private val context: Context) {
         for ((uuid, writer) in clientSocketMap) {
             if (uuid == senderUuid) continue // don't echo back to sender
             try {
-                writer.write(message)
-                writer.newLine()
-                writer.flush()
+                val lock = clientWriteLocks[uuid] ?: Any().also { clientWriteLocks[uuid] = it }
+                writeFrame(writer, message, lock)
                 successCount++
             } catch (e: Exception) {
                 Log.w(tag, "Multi-GO: write to client $uuid failed: ${e.message}")
@@ -1048,6 +1212,7 @@ class WifiDirectManager(private val context: Context) {
     /** Remove a client from the Multi-GO session and close its socket. */
     private fun removeClient(uuid: String) {
         clientSocketMap.remove(uuid)
+        clientWriteLocks.remove(uuid)
         clientSockets.remove(uuid)?.let {
             try { it.close() } catch (_: Exception) {}
         }
@@ -1187,6 +1352,31 @@ class WifiDirectManager(private val context: Context) {
         }
         val mgr = wifiP2pManager ?: return
         val ch  = p2pChannel   ?: return
+
+        if (isPassiveGoMode.get()) {
+            val savedUuid = targetUuid
+            val savedName = fallbackName
+            Log.d(tag, "connectByUuid: removing passive GO before outgoing connect")
+            isPassiveGoMode.set(false)
+            pendingPassiveGoCreation.set(false)
+            connectionPhase.set(ConnectionPhase.DISCONNECTED)
+            mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {
+                    mainHandler.postDelayed({
+                        connectByUuid(savedUuid, savedName)
+                    }, 500)
+                }
+
+                override fun onFailure(reason: Int) {
+                    Log.w(tag, "connectByUuid: remove passive GO failed " +
+                        "(${failureReason(reason)}) - retrying anyway")
+                    mainHandler.postDelayed({
+                        connectByUuid(savedUuid, savedName)
+                    }, 500)
+                }
+            })
+            return
+        }
 
         Log.d(tag, "connectByUuid: UUID=$targetUuid, fallback='$fallbackName'")
 
@@ -1827,13 +2017,15 @@ class WifiDirectManager(private val context: Context) {
 
             clientSocketMap[clientUuid] = writer
             clientSockets[clientUuid]   = sock
+            val clientWriteLock = Any()
+            clientWriteLocks[clientUuid] = clientWriteLock
             Log.d(tag, "Multi-GO: client $clientUuid joined (${clientSocketMap.size} total)")
             mainHandler.post { groupMemberJoinedListener?.invoke(clientUuid) }
             notifyMultiGoState()
 
             // Acknowledge back to client so they know they are part of the group
             val ack = """{"__type":"__group_joined__","groupOwnerUuid":"$myUuid","yourUuid":"$clientUuid"}"""
-            writer.write(ack); writer.newLine(); writer.flush()
+            writeFrame(writer, ack, clientWriteLock)
 
             // ── Per-client receive loop ─────────────────────────────────────
             try {
@@ -1877,7 +2069,7 @@ class WifiDirectManager(private val context: Context) {
         )
 
         executor.execute {
-            val maxAttempts = 12
+            val maxAttempts = 18
             var attempt = 0
             while (attempt < maxAttempts &&
                    !isSocketActive.get() &&
@@ -1885,8 +2077,9 @@ class WifiDirectManager(private val context: Context) {
                 attempt++
                 try {
                     Log.d(tag, "TCP connect attempt $attempt/$maxAttempts to $goIp:$TCP_PORT…")
-                    Thread.sleep(1000)
-                    val sock = Socket(goIp, TCP_PORT)
+                    Thread.sleep(1500)
+                    val sock = Socket()
+                    sock.connect(InetSocketAddress(goIp, TCP_PORT), 5000)
                     activeSocket = sock
                     Log.d(tag, "TCP socket connected to GO at $goIp:$TCP_PORT (attempt $attempt)")
                     initSocketStreams(sock)
@@ -2055,6 +2248,20 @@ class WifiDirectManager(private val context: Context) {
         isGroupOwner.set(false)
         groupOwnerAddress = null
         isSocketActive.set(false)
+        // Preserve isPassiveGoMode when a passive GO creation is actively in flight.
+        // The DISCONNECTED broadcast fired by removeGroup() (step 1 of startPassiveGoMode)
+        // reaches resetState() AFTER createPassiveGoGroup() has already set
+        // isPassiveGoMode=true.  Clearing the flag here causes handleConnectionInfo()
+        // to miss the passive GO guard and start a ServerSocket immediately, setting
+        // phase=SOCKET_CONNECTING and blocking all subsequent outbound connections.
+        // pendingPassiveGoCreation is cleared by handleConnectionInfo() or on failure.
+        if (!pendingPassiveGoCreation.get()) {
+            isPassiveGoMode.set(false)
+        } else {
+            Log.d(tag, "State reset — preserving isPassiveGoMode (passive GO creation in flight)")
+        }
+        discoveryRetryCount.set(0)
+        discoveryErrorCount.set(0)
         // Always clear the pending target so stale connection intent from a
         // previous session (e.g. hot-reload) doesn't keep looping forever.
         // Callers that want to preserve the target for a retry must save it
@@ -2134,13 +2341,11 @@ class WifiDirectManager(private val context: Context) {
                 connectionPhase.get() == ConnectionPhase.SOCKET_CONNECTED) {
                 executor.execute {
                     try {
-                        val w = socketWriter
-                        if (w != null) {
-                            w.write(heartbeatPingMessage)
-                            w.newLine()
-                            w.flush()
-                            Log.v(tag, "Heartbeat PING sent")
-                        }
+                    val w = socketWriter
+                    if (w != null) {
+                        writeFrame(w, heartbeatPingMessage, socketWriteLock)
+                        Log.v(tag, "Heartbeat PING sent")
+                    }
                     } catch (e: Exception) {
                         Log.w(tag, "Heartbeat PING failed — connection lost: ${e.message}")
                         handleSocketError(e)
@@ -2233,8 +2438,9 @@ class WifiDirectManager(private val context: Context) {
                     isP2pEnabled.set(state == WifiP2pManager.WIFI_P2P_STATE_ENABLED)
                     Log.d(tag, "Wi-Fi P2P state: ${if (isP2pEnabled.get()) "ENABLED" else "DISABLED"}")
                     if (!isP2pEnabled.get()) {
-                        // Wi-Fi Direct was turned off — full reset
+                        // Wi-Fi Direct was turned off — full reset (clear all passive GO flags)
                         Log.w(tag, "Wi-Fi Direct DISABLED — resetting state machine")
+                        pendingPassiveGoCreation.set(false)
                         closeSocket()
                         resetState()
                         notifyConnectionState(connected = false, error = "Wi-Fi Direct disabled")
@@ -2508,6 +2714,39 @@ class WifiDirectManager(private val context: Context) {
         if (phase == ConnectionPhase.SOCKET_CONNECTING ||
             phase == ConnectionPhase.SOCKET_CONNECTED) {
             Log.d(tag, "handleConnectionInfo: already in $phase — ignoring duplicate callback")
+            return
+        }
+
+        // ── Passive GO mode guard ─────────────────────────────────────────────
+        // If we created this group ourselves via startPassiveGoMode(), we must NOT
+        // advance the state machine or start a ServerSocket here — that would set
+        // phase=SOCKET_CONNECTING and block all outbound user-initiated connections.
+        //
+        // Instead, keep phase=IDLE and check the peer list:
+        //   • Empty → initial group formation, no client yet → stay IDLE.
+        //   • Has CONNECTED peer → relay client just joined → proceed with socket.
+        if (isPassiveGoMode.get() && info.isGroupOwner) {
+            // The passive group has formed — creation is no longer pending.
+            // Clear the guard so subsequent resetState() calls clean up normally.
+            pendingPassiveGoCreation.set(false)
+            isGroupOwner.set(true)
+            groupOwnerAddress = info.groupOwnerAddress?.hostAddress
+            connectingTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+            connectingTimeoutRunnable = null
+            wifiP2pManager?.requestPeers(p2pChannel) { peers ->
+                val relayClientJoined = peers.deviceList.any {
+                    it.status == WifiP2pDevice.CONNECTED || it.status == WifiP2pDevice.INVITED
+                }
+                if (relayClientJoined) {
+                    Log.d(tag, "🔁 Passive GO: relay client joined — starting socket (phase → GROUP_FORMED)")
+                    isPassiveGoMode.set(false) // active connection now owns the state machine
+                    connectionPhase.set(ConnectionPhase.GROUP_FORMED)
+                    startSocketOrFail()
+                } else {
+                    Log.d(tag, "📡 Passive GO group ready (no client yet) — phase stays IDLE")
+                    connectionPhase.set(ConnectionPhase.IDLE)
+                }
+            } ?: connectionPhase.set(ConnectionPhase.IDLE)
             return
         }
 

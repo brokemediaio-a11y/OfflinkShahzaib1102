@@ -37,4 +37,19 @@ class SeenCache {
     final cutoff = DateTime.now().millisecondsSinceEpoch - _ttlMs;
     await db.delete('seen_messages', where: 'seen_at < ?', whereArgs: [cutoff]);
   }
+
+  // ── Debug helpers (hop-test branch only) ─────────────────────────────────
+
+  /// Returns count of entries currently in the seen cache.
+  static Future<int> debugGetCount() async {
+    final db = await DatabaseHelper.database;
+    final r = await db.rawQuery('SELECT COUNT(*) as cnt FROM seen_messages');
+    return (r.first['cnt'] as int?) ?? 0;
+  }
+
+  /// Wipes the seen cache. Test-only — allows re-delivering the same message.
+  static Future<void> debugClearAll() async {
+    final db = await DatabaseHelper.database;
+    await db.delete('seen_messages');
+  }
 }

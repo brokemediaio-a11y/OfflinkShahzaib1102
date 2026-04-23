@@ -16,6 +16,7 @@ import '../connection/connection_status_screen.dart';
 import '../contacts/contact_book_screen.dart';
 import '../messages/messages_screen.dart';
 import '../settings/edit_name_dialog.dart';
+import '../debug/relay_debug_screen.dart'; // hop-test branch only
 
 class HomeScreen extends ConsumerStatefulWidget {
   const HomeScreen({super.key});
@@ -351,6 +352,15 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 );
               },
             ),
+          // ── hop-test only ──────────────────────────────────────────
+          IconButton(
+            icon: const Icon(Icons.bug_report_outlined),
+            tooltip: 'Relay Debug Panel',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const RelayDebugScreen()),
+            ),
+          ),
+          // ───────────────────────────────────────────────────────────
           PopupMenuButton<String>(
             icon: const Icon(Icons.more_vert),
             onSelected: (value) {

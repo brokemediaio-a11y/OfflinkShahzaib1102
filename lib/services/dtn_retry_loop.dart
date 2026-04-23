@@ -31,6 +31,9 @@ class DtnRetryLoop {
     Logger.dtnLog('⏹ RetryLoop stopped');
   }
 
+  /// Public for debug panel — normally called by the internal timer only.
+  Future<void> tick() => _tick();
+
   Future<void> _tick() async {
     try {
       // ── Housekeeping runs ALWAYS, regardless of peer presence ──
@@ -50,7 +53,22 @@ class DtnRetryLoop {
 
       for (final packet in pending) {
         final sent = await meshHandler.forward(packet, peers);
-        await DtnQueue.recordAttempt(packet.msgId, delivered: sent);
+        if (packet.toUserId == '*' && packet.type == 'broadcast') {
+          if (sent) {
+            await DtnQueue.recordBroadcastSent(packet.msgId);
+          } else {
+            await DtnQueue.recordAttempt(packet.msgId, delivered: false);
+          }
+          continue;
+        }
+
+        // A unicast relay handoff is not final delivery. Keep the packet in
+        // the queue until the destination ACK removes it.
+        if (sent) {
+          await DtnQueue.recordHandoff(packet.msgId);
+        } else {
+          await DtnQueue.recordAttempt(packet.msgId, delivered: false);
+        }
       }
     } catch (e) {
       Logger.error('RetryLoop tick error', e, null, Logger.dtn);

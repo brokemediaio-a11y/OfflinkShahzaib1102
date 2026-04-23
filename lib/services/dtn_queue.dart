@@ -47,6 +47,31 @@ class DtnQueue {
         .toList();
   }
 
+  /// Get pending unicast packets for the DTN relay orchestrator.
+  ///
+  /// The pending-unicast loop uses [ignoreRetryThrottle] so a target coming
+  /// back into range can be selected immediately by UUID. The actual socket
+  /// connection is still guarded by ConnectionManager's DTN connection cooldown.
+  static Future<List<MessagePacket>> getPendingUnicastPackets({
+    bool ignoreRetryThrottle = false,
+  }) async {
+    final db = await DatabaseHelper.database;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final throttleWhere =
+        ignoreRetryThrottle ? '' : 'AND (last_attempt IS NULL OR last_attempt < ?)';
+    final rows = await db.query(
+      'outbound_queue',
+      where:
+          "status = ? AND attempts < ? AND to_user_id != '*' $throttleWhere",
+      whereArgs: ignoreRetryThrottle
+          ? ['pending', _maxAttempts]
+          : ['pending', _maxAttempts, now - _retryIntervalMs],
+    );
+    return rows
+        .map((r) => MessagePacket.fromWire(r['payload'] as String))
+        .toList();
+  }
+
   /// Record the result of a delivery attempt.
   ///
   /// If [delivered] is true, the row is deleted (delivery confirmed).
@@ -67,6 +92,18 @@ class DtnQueue {
         WHERE msg_id = ?
       ''', [DateTime.now().millisecondsSinceEpoch, _maxAttempts, msgId]);
     }
+  }
+
+  /// Record that a unicast packet was handed to a peer/relay, but not yet
+  /// confirmed by the final destination. The ACK path is responsible for
+  /// deleting the row when delivery is actually confirmed.
+  static Future<void> recordHandoff(String msgId) async {
+    final db = await DatabaseHelper.database;
+    await db.rawUpdate('''
+      UPDATE outbound_queue
+      SET last_attempt = ?
+      WHERE msg_id = ? AND to_user_id != '*'
+    ''', [DateTime.now().millisecondsSinceEpoch, msgId]);
   }
 
   /// Remove expired / delivered rows older than 7 days.
@@ -139,5 +176,19 @@ class DtnQueue {
     final result = await db.rawQuery(
         "SELECT COUNT(*) as cnt FROM outbound_queue WHERE status = 'pending'");
     return (result.first['cnt'] as int?) ?? 0;
+  }
+
+  // ── Debug helpers (hop-test branch only) ─────────────────────────────────
+
+  /// Returns every row in the outbound queue (all statuses) for the debug panel.
+  static Future<List<Map<String, dynamic>>> debugGetAllRows() async {
+    final db = await DatabaseHelper.database;
+    return db.query('outbound_queue', orderBy: 'created_at DESC');
+  }
+
+  /// Wipes the entire outbound queue. Test-only — use to reset between test runs.
+  static Future<void> debugClearAll() async {
+    final db = await DatabaseHelper.database;
+    await db.delete('outbound_queue');
   }
 }

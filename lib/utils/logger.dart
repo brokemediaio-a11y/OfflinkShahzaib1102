@@ -1,4 +1,5 @@
 import 'dart:developer' as developer;
+import 'file_logger.dart';
 
 /// Structured logger with:
 ///   • HH:mm:ss.SSS timestamp on every line
@@ -6,6 +7,9 @@ import 'dart:developer' as developer;
 ///   • Per-message throttle — identical (tag + message) pairs are suppressed
 ///     for [_throttleMs] milliseconds so rapid poll loops don't flood the log
 ///   • Four severity levels: debug / info / warning / error
+///   • File sink (hop-test branch) — every call is also written to a .log file
+///     on device storage via [FileLogger]. Pull with:
+///       adb pull /sdcard/Android/data/com.offlink.app/files/logs/
 class Logger {
   // ── Subsystem tag constants ────────────────────────────────────────────────
   static const String ble       = 'BLE';
@@ -43,41 +47,44 @@ class Logger {
     return true;
   }
 
+  // ── File sink helper ───────────────────────────────────────────────────────
+  static void _toFile(String level, String tag, String message) {
+    FileLogger.instance.log(level, tag, message);
+  }
+
+  // ── Log methods ───────────────────────────────────────────────────────────
+
   static void debug(String message, [String? tag, bool throttle = true]) {
     final subsystem = tag ?? 'OFFLINK';
     final key = '$subsystem|$message';
     if (!_shouldEmit(key, throttle: throttle)) return;
-    developer.log(
-      '[${_ts()}] $message',
-      name: subsystem,
-      level: 700,
-    );
+    developer.log('[${_ts()}] $message', name: subsystem, level: 700);
+    _toFile('DBG', subsystem, message);
   }
 
   static void info(String message, [String? tag]) {
-    developer.log(
-      '[${_ts()}] $message',
-      name: tag ?? 'OFFLINK',
-      level: 800,
-    );
+    final subsystem = tag ?? 'OFFLINK';
+    developer.log('[${_ts()}] $message', name: subsystem, level: 800);
+    _toFile('INF', subsystem, message);
   }
 
   static void warning(String message, [String? tag]) {
-    developer.log(
-      '[${_ts()}] ⚠️ $message',
-      name: tag ?? 'OFFLINK',
-      level: 900,
-    );
+    final subsystem = tag ?? 'OFFLINK';
+    developer.log('[${_ts()}] ⚠️ $message', name: subsystem, level: 900);
+    _toFile('WRN', subsystem, message);
   }
 
   static void error(String message, [Object? error, StackTrace? stackTrace, String? tag]) {
+    final subsystem = tag ?? 'OFFLINK';
     developer.log(
       '[${_ts()}] ❌ $message',
-      name: tag ?? 'OFFLINK',
+      name: subsystem,
       level: 1000,
       error: error,
       stackTrace: stackTrace,
     );
+    final errStr = error != null ? ' | error=$error' : '';
+    _toFile('ERR', subsystem, '$message$errStr');
   }
 
   /// Throttled info — emits at info level but suppresses duplicates within [_throttleMs].
@@ -85,59 +92,39 @@ class Logger {
     final subsystem = tag ?? 'OFFLINK';
     final key = '$subsystem|$message';
     if (!_shouldEmit(key, throttle: true)) return;
-    developer.log(
-      '[${_ts()}] $message',
-      name: subsystem,
-      level: 800,
-    );
+    developer.log('[${_ts()}] $message', name: subsystem, level: 800);
+    _toFile('INF', subsystem, message);
   }
 
   // ── Specialised emoji logs for hop/relay/DTN events ───────────────────────
-  // Use these instead of info() for mesh events so they stand out visually
-  // in the debug console and can be filtered with a single keyword search.
 
   /// 🔁  Relay hop event — packet forwarded to next peer.
   static void hop(String message) {
-    developer.log(
-      '[${_ts()}] 🔁 $message',
-      name: hopping,
-      level: 800,
-    );
+    developer.log('[${_ts()}] 🔁 $message', name: hopping, level: 800);
+    _toFile('HOP', hopping, message);
   }
 
   /// 📬  Local delivery — packet arrived at its final destination on this device.
   static void deliver(String message) {
-    developer.log(
-      '[${_ts()}] 📬 $message',
-      name: mesh,
-      level: 800,
-    );
+    developer.log('[${_ts()}] 📬 $message', name: mesh, level: 800);
+    _toFile('DLV', mesh, message);
   }
 
   /// 📦  DTN store-and-forward event — packet queued or retried.
   static void dtnLog(String message) {
-    developer.log(
-      '[${_ts()}] 📦 $message',
-      name: dtn,
-      level: 800,
-    );
+    developer.log('[${_ts()}] 📦 $message', name: dtn, level: 800);
+    _toFile('DTN', dtn, message);
   }
 
   /// ✅  Successful DTN delivery — packet confirmed received after relay.
   static void dtnDelivered(String message) {
-    developer.log(
-      '[${_ts()}] ✅ $message',
-      name: dtn,
-      level: 800,
-    );
+    developer.log('[${_ts()}] ✅ $message', name: dtn, level: 800);
+    _toFile('ACK', dtn, message);
   }
 
   /// 🔗  Connection event for relay/DTN (connect, disconnect, restore GO).
   static void relay(String message) {
-    developer.log(
-      '[${_ts()}] 🔗 $message',
-      name: conn,
-      level: 800,
-    );
+    developer.log('[${_ts()}] 🔗 $message', name: conn, level: 800);
+    _toFile('RLY', conn, message);
   }
 }

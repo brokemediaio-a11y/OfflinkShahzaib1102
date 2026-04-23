@@ -16,7 +16,7 @@ allprojects {
         google()
         mavenCentral()
     }
-    
+
     // Fix for record package missing namespace
     afterEvaluate { project ->
         if (project.name == 'record' && project.plugins.hasPlugin('com.android.library')) {
@@ -38,7 +38,3 @@ subprojects {
 tasks.register("clean", Delete) {
     delete rootProject.buildDir
 }
-
-
-
-

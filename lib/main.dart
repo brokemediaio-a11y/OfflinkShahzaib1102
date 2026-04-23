@@ -16,6 +16,7 @@ import 'services/storage/pending_message_storage.dart';
 import 'services/database_helper.dart';
 import 'services/dtn_queue.dart';
 import 'utils/logger.dart';
+import 'utils/file_logger.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -49,6 +50,17 @@ void main() async {
 
   // ── Initialize SQLite (DTN routing / seen cache / outbound queue) ────
   await DatabaseHelper.database;
+
+  // ── Initialize file logger (hop-test branch) ──────────────────────────
+  // Names the log file after the device's display name (set it to A / B / C
+  // in Settings before each test run so files are easy to identify).
+  final _logDeviceName = DeviceStorage.getDisplayName() ?? 'unknown';
+  final _logDeviceId   = DeviceStorage.getDeviceId();
+  await FileLogger.instance.init(
+    deviceName: _logDeviceName,
+    deviceId:   _logDeviceId,
+  );
+  Logger.info('FileLogger ready — device=$_logDeviceName  file=${FileLogger.instance.filePath}');
 
   // Expire any broadcast packets left over from a previous session that are
   // now older than the 15-minute delivery window.

@@ -110,4 +110,18 @@ class RoutingEngine {
     await db.delete('routing_table',
         where: 'last_seen < ?', whereArgs: [cutoff]);
   }
+
+  // ── Debug helpers (hop-test branch only) ─────────────────────────────────
+
+  /// Returns every row in the routing table for the debug panel.
+  static Future<List<Map<String, dynamic>>> debugGetAllRoutes() async {
+    final db = await DatabaseHelper.database;
+    return db.query('routing_table', orderBy: 'hop_distance ASC');
+  }
+
+  /// Wipes the routing table. Test-only.
+  static Future<void> debugClearAll() async {
+    final db = await DatabaseHelper.database;
+    await db.delete('routing_table');
+  }
 }
