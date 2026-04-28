@@ -9,6 +9,8 @@ import '../../services/routing_engine.dart';
 import '../../services/seen_cache.dart';
 import '../../services/peer_discovery.dart';
 import '../../services/storage/device_storage.dart';
+import '../../services/hop_simulator.dart';
+import '../../models/device_model.dart';
 import '../../utils/file_logger.dart';
 
 /// ──────────────────────────────────────────────────────────────────────────
@@ -55,6 +57,10 @@ class _RelayDebugScreenState extends State<RelayDebugScreen> {
 
   bool _loading = false;
 
+  // Hop simulation state
+  bool _hopSimEnabled = false;
+  String _hopTopology = '';
+
   @override
   void initState() {
     super.initState();
@@ -91,6 +97,18 @@ class _RelayDebugScreenState extends State<RelayDebugScreen> {
     final connDev   = cm.connectedDevice?.name ?? '—';
     final wState    = connType == 'none' ? 'Idle' : '$connType → $connDev';
 
+    // Build hop sim topology description from current BLE peer list
+    final hopSimEnabled = HopSimulator.isEnabled;
+    final hopTopology = HopSimulator.topologyDescription(
+      id,
+      ble.map((d) => DeviceModel(
+        id: d['id'] as String,
+        name: d['name'] as String? ?? '',
+        type: DeviceType.ble,
+        rssi: d['rssi'] as int? ?? 0,
+      )).toList(),
+    );
+
     if (!mounted) return;
     setState(() {
       _myId       = id;
@@ -104,6 +122,8 @@ class _RelayDebugScreenState extends State<RelayDebugScreen> {
       _bleDevices = ble;
       _isDtnActive = dtnActive;
       _wifiState  = wState;
+      _hopSimEnabled = hopSimEnabled;
+      _hopTopology   = hopTopology;
     });
   }
 
@@ -184,6 +204,8 @@ class _RelayDebugScreenState extends State<RelayDebugScreen> {
       body: ListView(
         padding: const EdgeInsets.all(12),
         children: [
+          _buildHopSimCard(),
+          const SizedBox(height: 10),
           _buildIdentityCard(),
           const SizedBox(height: 10),
           _buildActionsCard(),
@@ -206,6 +228,111 @@ class _RelayDebugScreenState extends State<RelayDebugScreen> {
   }
 
   // ── Cards ─────────────────────────────────────────────────────────────────
+
+  Widget _buildHopSimCard() {
+    return Container(
+      decoration: BoxDecoration(
+        color: _hopSimEnabled
+            ? const Color(0xFF1A2A1A)
+            : const Color(0xFF161B22),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: _hopSimEnabled
+              ? Colors.greenAccent.withOpacity(0.6)
+              : const Color(0xFF30363D),
+          width: _hopSimEnabled ? 1.5 : 1,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // ── Header row with toggle ───────────────────────────────────
+          Padding(
+            padding: const EdgeInsets.fromLTRB(14, 10, 8, 8),
+            child: Row(
+              children: [
+                const Text('🧪 Desk-Test: Hop Simulation',
+                    style: TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 13,
+                        letterSpacing: 0.3)),
+                const Spacer(),
+                Switch(
+                  value: _hopSimEnabled,
+                  activeColor: Colors.greenAccent,
+                  onChanged: (v) async {
+                    await HopSimulator.setEnabled(v);
+                    FileLogger.instance.separator(
+                        'HOP SIM ${v ? "ENABLED" : "DISABLED"}');
+                    await _refresh();
+                  },
+                ),
+              ],
+            ),
+          ),
+          const Divider(height: 1, color: Color(0xFF30363D)),
+          Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // ── Mode description ───────────────────────────────────
+                Text(
+                  _hopSimEnabled
+                      ? '🟢 ON — RSSI overrides active. Physical distance ignored.'
+                      : '⚪ OFF — Real RSSI used. Move devices apart to test hopping.',
+                  style: TextStyle(
+                    color: _hopSimEnabled ? Colors.greenAccent : Colors.white54,
+                    fontSize: 12,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                // ── Explanation box ────────────────────────────────────
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0D1117),
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: const Text(
+                    'Sorts all 3 device UUIDs → assigns virtual positions '
+                    '[0]──[1]──[2].\n'
+                    'Adjacent devices get −60 dBm (NEAR).\n'
+                    'Non-adjacent get −96 dBm (FAR, below −90 threshold) '
+                    '→ forces relay hop.',
+                    style: TextStyle(
+                        color: Colors.white38,
+                        fontSize: 10,
+                        fontFamily: 'monospace'),
+                  ),
+                ),
+                // ── Live topology (only when enabled and peers visible) ─
+                if (_hopSimEnabled && _hopTopology.isNotEmpty) ...[
+                  const SizedBox(height: 10),
+                  const Divider(height: 1, color: Color(0xFF30363D)),
+                  const SizedBox(height: 8),
+                  const Text('Simulated topology:',
+                      style: TextStyle(
+                          color: Colors.white54,
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 4),
+                  Text(
+                    _hopTopology,
+                    style: const TextStyle(
+                        color: Colors.greenAccent,
+                        fontSize: 11,
+                        fontFamily: 'monospace'),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 
   Widget _buildIdentityCard() => _card(
     '📱 This Device',

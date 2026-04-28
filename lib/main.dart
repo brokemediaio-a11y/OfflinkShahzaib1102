@@ -11,6 +11,7 @@ import 'screens/broadcast/broadcast_screen.dart';
 import 'screens/splash/splash_screen.dart';
 import 'services/storage/message_storage.dart';
 import 'services/storage/device_storage.dart';
+import 'services/hop_simulator.dart';
 import 'services/storage/known_contacts_storage.dart';
 import 'services/storage/pending_message_storage.dart';
 import 'services/database_helper.dart';
@@ -45,6 +46,7 @@ void main() async {
   // ── Initialize storage services ───────────────────────────────────
   await MessageStorage.init();
   await DeviceStorage.init();
+  HopSimulator.load();
   await KnownContactsStorage.init();
   await PendingMessageStorage.init();
 

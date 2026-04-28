@@ -27,6 +27,7 @@ import 'ble_discovery_service.dart'; // ← Control Plane (discovery only)
 import 'ble_peripheral_service.dart';
 import 'wifi_direct_service.dart'; // ← Data Plane (primary transport)
 import '../group_session_manager.dart'; // ← Multi-GO group session state
+import '../hop_simulator.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Dual-Radio Architecture
@@ -608,8 +609,10 @@ class ConnectionManager {
               _connectedPeerId != null ||
               _isIncomingRelaySession ||
               _isAutoBroadcastConnection;
-          final shouldRestorePassiveGo =
-              _lastWifiSessionWasGroupOwner && hadRealSession;
+          // Always restore passive GO after any real session, regardless of
+          // whether we were GO or client — every device must stay connectable
+          // for incoming relay hops via connectToGroupByUuid.
+          final shouldRestorePassiveGo = hadRealSession;
 
           final idToRemove = _connectedPeerId ?? '__uuid_pending__';
           _transportManager.removeNeighbor(idToRemove);
@@ -1293,7 +1296,9 @@ class ConnectionManager {
   /// Disconnect from the current Wi-Fi Direct peer.
   Future<void> disconnect() async {
     try {
-      final shouldRestorePassiveGo = _lastWifiSessionWasGroupOwner;
+      // Always restore passive GO after manual disconnect — device must stay
+      // connectable for relay hops regardless of whether it was GO or client.
+      const shouldRestorePassiveGo = true;
 
       // Send graceful notice FIRST so the peer suppresses auto-reconnect.
       await _sendGracefulDisconnect();
@@ -1451,6 +1456,9 @@ class ConnectionManager {
         _connectingPeerName = null;
         _lastConnectedDevice = null; // prevent auto-reconnect after timeout
         _connectionController.add(ConnectionState.error);
+        // Restore passive GO so the device stays connectable for relay hops
+        // even when an outbound DTN connection timed out without a socket.
+        unawaited(_restorePassiveGoIfIdle('connection timeout'));
       }
     });
   }
@@ -2123,7 +2131,9 @@ class ConnectionManager {
     for (final d in _nativeScanDevices.values) {
       combined[d.id] = d;
     }
-    final deviceList = combined.values.toList();
+    final rawList = combined.values.toList();
+    final deviceList =
+        HopSimulator.apply(DeviceStorage.getDeviceId(), rawList);
     _deviceStreamController.add(deviceList);
 
     // Trigger broadcast (and unicast) auto-connect whenever ANY discovery
@@ -2167,7 +2177,8 @@ class ConnectionManager {
       combined[d.id] = d;
     }
     combined.remove(DeviceStorage.getDeviceId());
-    return combined.values.toList();
+    return HopSimulator.apply(
+        DeviceStorage.getDeviceId(), combined.values.toList());
   }
 
   void _startPendingUnicastLoop() {
@@ -2379,7 +2390,13 @@ class ConnectionManager {
   }
 
   /// Returns the current BLE-discovered device list for the debug panel.
-  List<DeviceModel> get debugBleDevices => List.unmodifiable(_bleDevices);
+  /// When HopSimulator is active, RSSI values are replaced with simulated ones
+  /// so the debug UI accurately reflects what the relay logic "sees".
+  List<DeviceModel> get debugBleDevices {
+    final simulated = HopSimulator.apply(
+        DeviceStorage.getDeviceId(), List<DeviceModel>.from(_bleDevices));
+    return List.unmodifiable(simulated);
+  }
 
   /// Whether DTN auto-connection is currently active.
   bool get debugIsDtnAutoConnection => _isDtnAutoConnection;
@@ -2753,7 +2770,7 @@ class ConnectionManager {
             Logger.info('[BROADCAST] Starting delivery round — '
                 '${_broadcastDeliveryQueue.length + 1} peer(s) queued; '
                 'connecting to ${target.name} first');
-            unawaited(connectToDevice(target));
+            unawaited(connectToDevice(target, forDtnDelivery: true));
             return;
           }
         }
@@ -2924,7 +2941,7 @@ class ConnectionManager {
       final next = _broadcastDeliveryQueue.removeAt(0);
       Logger.info('[BROADCAST] Connecting to next peer: ${next.name}');
       _isAutoBroadcastConnection = true; // still in delivery round
-      unawaited(connectToDevice(next));
+      unawaited(connectToDevice(next, forDtnDelivery: true));
     }).catchError((Object e) {
       Logger.error(
           '[BROADCAST] Error during auto-disconnect for delivery round', e);
