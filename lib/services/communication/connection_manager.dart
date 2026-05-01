@@ -198,6 +198,12 @@ class ConnectionManager {
   Timer? _pendingUnicastTimer;
   Timer? _passiveGoRestoreTimer;
   bool _pendingUnicastTickInProgress = false;
+  // Prevents multiple concurrent invocations of _checkAndAutoConnectForPendingMessages.
+  // DNS-SD and BLE discovery can fire several times within the same event-loop
+  // cycle; without this guard all of them pass the _isDtnAutoConnection check
+  // before any sets it to true, spawning duplicate connectToGroupByUuid calls
+  // that lock the native P2P stack in CONNECTING for up to 90 minutes.
+  bool _dtnCheckInProgress = false;
   static const Duration _pendingUnicastInterval = Duration(seconds: 3);
   static const Duration _dtnConnectCooldown = Duration(seconds: 12);
 
@@ -1276,15 +1282,10 @@ class ConnectionManager {
         return;
       }
 
-      final pendingUnicast = await DtnQueue.getPendingUnicastPackets(
-        ignoreRetryThrottle: true,
-      );
-      if (pendingUnicast.isNotEmpty) {
-        Logger.relay(
-            'Passive GO restore skipped after $reason - pending DTN outbound');
-        return;
-      }
-
+      // Passive GO is compatible with pending outbound DTN — we can be a
+      // connectable passive GO AND still initiate outbound connections.
+      // Skipping restore here caused a deadlock: both devices had pending
+      // DTN for each other and neither could accept an incoming connection.
       final res = await _wifiDirectService.restorePassiveGoMode();
       Logger.relay('Passive GO restored after $reason -> $res');
     } catch (e) {
@@ -2696,6 +2697,23 @@ class ConnectionManager {
   /// silently initiate a Wi-Fi Direct connection to flush the queue (T2).
   Future<void> _checkAndAutoConnectForPendingMessages(
       List<DeviceModel> discoveredDevices) async {
+    // Synchronous in-flight guard — set before the first await so that
+    // concurrent callers (DNS-SD multi-fire, BLE burst) bail immediately
+    // instead of all racing through the _isDtnAutoConnection check together.
+    if (_dtnCheckInProgress) {
+      Logger.debug('DTN auto-connect skipped: check already in progress');
+      return;
+    }
+    _dtnCheckInProgress = true;
+    try {
+      await _checkAndAutoConnectForPendingMessagesImpl(discoveredDevices);
+    } finally {
+      _dtnCheckInProgress = false;
+    }
+  }
+
+  Future<void> _checkAndAutoConnectForPendingMessagesImpl(
+      List<DeviceModel> discoveredDevices) async {
     // Don't interrupt an existing connection or connecting attempt.
     if (isConnected() || _currentConnectionType != ConnectionType.none) {
       Logger.debug('DTN auto-connect skipped: busy '
@@ -2824,11 +2842,11 @@ class ConnectionManager {
         // connect to the closest available peer as an epidemic relay carrier.
         // That peer's MeshHandler will forward the packet one hop closer.
         //
-        // Skip RSSI=0 devices in the first pass — Samsung returns 0 when signal
-        // is unknown, and 0 sorts above all negative dBm values so it would be
-        // incorrectly chosen over a real nearby peer.
-        // Also skip the already-rejected directTarget (the destination itself) so
-        // we don't loop back to trying the same out-of-range device again.
+        // First pass: prefer device with real RSSI, not the destination itself.
+        // RSSI=0 means DNS-SD-only discovery with no signal reading — these are
+        // often stale OUT_OF_RANGE ghost entries and should not be used as
+        // relay carriers until a real BLE/native-scan reading confirms they
+        // are still physically reachable.
         DeviceModel? anyRelay;
         for (final d in sortedDevices) {
           if (d.rssi != 0 && d.id != directTarget?.id) {
@@ -2836,23 +2854,29 @@ class ConnectionManager {
             break;
           }
         }
-        // Second pass: allow unknown RSSI, but still avoid the rejected
-        // destination so ACKs/messages use a real relay instead of looping.
+        // Second pass: still exclude RSSI=0 ghost devices — a peer that is
+        // only visible via DNS-SD (rssi=0) and was recently marked OUT_OF_RANGE
+        // by BLE will cause a 60+ second CONNECTING deadlock.
         if (anyRelay == null) {
           for (final d in sortedDevices) {
-            if (d.id != directTarget?.id) {
+            if (d.rssi != 0 && d.id != directTarget?.id) {
               anyRelay = d;
               break;
             }
           }
         }
-        // Last resort: if only the final target is visible, try it anyway.
+        // Last resort A: destination is the only visible peer — try direct.
         if (anyRelay == null &&
             directTarget != null &&
             sortedDevices.length == 1) {
           anyRelay = directTarget;
         }
-        anyRelay ??= sortedDevices.isNotEmpty ? sortedDevices.first : null;
+        // Last resort B: take any peer with a real signal reading.
+        if (anyRelay == null) {
+          for (final d in sortedDevices) {
+            if (d.rssi != 0) { anyRelay = d; break; }
+          }
+        }
         if (anyRelay != null) {
           Logger.hop(
               'RELAY CARRIER | ${anyRelay.name} RSSI=${anyRelay.rssi} dBm | forwarding ${pendingTargets.length} packet(s)');

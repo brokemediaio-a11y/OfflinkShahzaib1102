@@ -166,6 +166,11 @@ class WifiDirectManager(private val context: Context) {
     // concurrent discoverPeers() calls from the passive-discovery heartbeat.
     private val isBusyRecovering = AtomicBoolean(false)
 
+    // Tracks consecutive hard-BUSY recoveries so we can apply exponential
+    // backoff instead of always retrying after a fixed 6 s delay.
+    // Resets to 0 on any successful discoverPeers() call.
+    private val hardBusyRecoverCount = AtomicInteger(0)
+
     // Safety timeout: reset if we stay CONNECTING with no response.
     // DTN weak-link relay attempts are intentionally patient so links around
     // -89 dBm get enough time to form before we retry.
@@ -461,6 +466,7 @@ class WifiDirectManager(private val context: Context) {
                 Log.d(tag, "Peer discovery initiated successfully")
                 discoveryRetryCount.set(0)
                 discoveryErrorCount.set(0) // reset non-BUSY error counter on successful start
+                hardBusyRecoverCount.set(0) // reset hard-BUSY backoff counter on any successful start
                 // Only advance to DISCOVERING if we are not already further along
                 val phase = connectionPhase.get()
                 if (phase == ConnectionPhase.IDLE || phase == ConnectionPhase.DISCONNECTED ||
@@ -500,7 +506,18 @@ class WifiDirectManager(private val context: Context) {
                     }
                     reason == WifiP2pManager.BUSY -> {
                         discoveryRetryCount.set(0)
-                        Log.w(tag, "Peer discovery still BUSY — hard recover + delayed retry")
+                        val busyAttempt = hardBusyRecoverCount.incrementAndGet()
+                        // Exponential backoff: each consecutive hard-BUSY recovery
+                        // waits longer before re-attempting discoverPeers().
+                        // This prevents the "BUSY storm" observed in production where
+                        // rapid back-to-back recoveries permanently killed the P2P stack.
+                        val busyDelayMs = when (busyAttempt) {
+                            1    ->  6_000L
+                            2    -> 12_000L
+                            3    -> 20_000L
+                            else -> 30_000L
+                        }
+                        Log.w(tag, "Peer discovery still BUSY — hard recover #$busyAttempt, delay=${busyDelayMs}ms")
                         connectionPhase.set(ConnectionPhase.DISCONNECTED)
                         notifyConnectionState(
                             connected = false,
@@ -513,7 +530,7 @@ class WifiDirectManager(private val context: Context) {
                         // Use the aggressive path: removeGroup() included so any
                         // lingering stale group (the most common BUSY root cause on
                         // Samsung devices) is torn down before the next attempt.
-                        hardRecoverP2pSlot(6_000L) {
+                        hardRecoverP2pSlot(busyDelayMs) {
                             isBusyRecovering.set(false)
                             discoverPeers()
                         }
@@ -531,9 +548,19 @@ class WifiDirectManager(private val context: Context) {
                         val errorCount = discoveryErrorCount.incrementAndGet()
                         if (errorCount >= maxDiscoveryErrors) {
                             discoveryErrorCount.set(0)
-                            Log.w(tag, "Peer discovery FAILED $errorCount times — hard-recovering P2P stack")
+                            val errAttempt = hardBusyRecoverCount.incrementAndGet()
+                            // Reuse the same exponential backoff counter as BUSY hard-recovery.
+                            // Consecutive Internal error → BUSY cycles compound the backoff,
+                            // preventing the P2P stack death observed in the 10:51 demo session.
+                            val errDelayMs = when (errAttempt) {
+                                1    ->  8_000L
+                                2    -> 15_000L
+                                3    -> 25_000L
+                                else -> 35_000L
+                            }
+                            Log.w(tag, "Peer discovery FAILED $errorCount times — hard-recovering P2P stack (attempt #$errAttempt, delay=${errDelayMs}ms)")
                             isBusyRecovering.set(true)
-                            hardRecoverP2pSlot(8_000L) {
+                            hardRecoverP2pSlot(errDelayMs) {
                                 isBusyRecovering.set(false)
                                 if (connectionPhase.get() == ConnectionPhase.IDLE ||
                                     connectionPhase.get() == ConnectionPhase.DISCONNECTED ||
@@ -1127,19 +1154,32 @@ class WifiDirectManager(private val context: Context) {
         uuid: String,       // target UUID — used in WPS-PBC fallback
         fallbackName: String
     ) {
+        // Safety timeout started BEFORE mgr.connect() is called.
+        // On some OEM builds (observed: Infinix, Samsung A06) the
+        // WifiP2pManager.connect() ActionListener never fires onSuccess or
+        // onFailure — the callback is silently swallowed while the native P2P
+        // state machine sits in CONNECTING indefinitely.  Without a pre-call
+        // timeout the phase would stay CONNECTING forever and every subsequent
+        // connectToGroupByUuid would return {duplicate:true}, locking the relay
+        // path for the entire session (observed: 91 minutes in production logs).
+        // Starting the timer here guarantees it fires regardless of callback delivery.
+        connectingTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        val preCallTimeout = Runnable {
+            if (connectionPhase.get() != ConnectionPhase.CONNECTING) return@Runnable
+            Log.w(tag, "doGroupConnect: CONNECTING timeout (65 s, pre-call safety) — resetting to IDLE")
+            connectionPhase.set(ConnectionPhase.IDLE)
+            targetDeviceName = null
+            notifyConnectionState(connected = false, error = "connection_timeout")
+        }
+        connectingTimeoutRunnable = preCallTimeout
+        mainHandler.postDelayed(preCallTimeout, 65_000)
+
         mgr.connect(ch, config, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
                 Log.d(tag, "doGroupConnect: connect() accepted (dialog-free) for $fallbackName")
-                // Phase was already set to CONNECTING before we called removeGroup();
-                // it stays CONNECTING until CONNECTION_CHANGED fires.
                 connectRetryCount.set(0)
-
-                // Safety timeout: if no GROUP_FORMED arrives within 60 s, reset
-                // to IDLE so the Dart DTN retry loop can try again on the next
-                // 30-second cycle.  Do NOT fall back to connectByUuid here —
-                // that would send a WPS-PBC invitation which conflicts with the
-                // still-running Builder connect() and causes duplicate connection
-                // attempts that prevent the socket from completing.
+                // Callback confirmed — reset timer to the standard 60 s window
+                // counted from the moment Android accepted the request.
                 connectingTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
                 connectingTimeoutRunnable = Runnable {
                     if (connectionPhase.get() != ConnectionPhase.CONNECTING) return@Runnable
@@ -1151,22 +1191,19 @@ class WifiDirectManager(private val context: Context) {
                 mainHandler.postDelayed(connectingTimeoutRunnable!!, 60_000)
             }
             override fun onFailure(reason: Int) {
+                // Cancel the pre-call safety timer — failure is immediate, no need to wait.
+                connectingTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+                connectingTimeoutRunnable = null
                 // Credential-based connect failed (target likely has no passive GO group).
                 // Fall back to standard DNS-SD + WPS-PBC so the message can still be
                 // delivered — a dialog will appear on the target device, which is
                 // acceptable for direct nearby delivery.
-                //
-                // NOTE: this fallback is ONLY triggered on immediate failure (onFailure),
-                // NOT on timeout.  The previous session's bug (PBC invitation conflicting
-                // with an in-progress Builder connect) is avoided because onFailure means
-                // the Builder connect already terminated before we start WPS-PBC.
                 Log.w(tag, "doGroupConnect: connect() failed (${failureReason(reason)}) — falling back to DNS-SD / WPS-PBC")
                 connectionPhase.set(ConnectionPhase.IDLE)
                 targetDeviceName = fallbackName  // restore for connectByUuid auto-connect
                 if (uuid.isNotBlank()) {
                     connectByUuid(uuid, fallbackName)
                 } else {
-                    // UUID unknown — give up and let DTN retry
                     targetDeviceName = null
                     notifyConnectionState(connected = false, error = "connect_failed_no_uuid")
                 }
