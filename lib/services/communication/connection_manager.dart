@@ -221,7 +221,7 @@ class ConnectionManager {
   Timer? _connectionTimeoutTimer;
 
   /// Seconds before a pending connection attempt is abandoned automatically.
-  static const int _connectionTimeoutSeconds = 30;
+  static const int _connectionTimeoutSeconds = 50;
   static const int _dtnConnectionTimeoutSeconds = 75;
 
   /// Display name of the peer we are actively trying to connect to.
@@ -596,6 +596,29 @@ class ConnectionManager {
         Logger.info(
             'ConnectionManager: Wi-Fi Direct group formed, awaiting socket…');
       } else if (!state.connected) {
+        if (state.error == null &&
+            _connectionTimeoutTimer != null &&
+            _connectedPeerId != null) {
+          Logger.info(
+              'ConnectionManager: ignoring spurious null-error disconnect '
+              'during active connection attempt for '
+              '"${_connectedDevice?.name ?? _connectedPeerId}"');
+          _connectionController.add(ConnectionState.connecting);
+          return;
+        }
+
+        final loweredError = state.error?.toLowerCase();
+        if (loweredError != null &&
+            loweredError.contains('clearing and retrying') &&
+            _connectionTimeoutTimer != null &&
+            _connectedPeerId != null) {
+          Logger.info('ConnectionManager: P2P stack busy — native layer '
+              'self-recovering, keeping connecting state for '
+              '"${_connectedDevice?.name ?? _connectedPeerId}"');
+          _connectionController.add(ConnectionState.connecting);
+          return;
+        }
+
         if (state.status == 'connecting') {
           // ── connect() request accepted — P2P group is forming ────────
           // This is a transitional state fired by the native layer when

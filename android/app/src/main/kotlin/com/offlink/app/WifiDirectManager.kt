@@ -180,6 +180,11 @@ class WifiDirectManager(private val context: Context) {
     private val connectRetryCount = AtomicInteger(0)
     private val maxConnectRetries = 5   // covers stale-INVITED cleanup + simultaneous-tap deadlock
 
+    // True after the current one-to-one attempt has already tried the
+    // passive-GO UUID join fallback. Prevents looping when the target has
+    // no passive GO group available.
+    @Volatile private var triedPassiveGoJoin = false
+
     // ─── Passive Discovery Heartbeat ──────────────────────────────────────────
     // Android's discoverPeers() has an internal expiry (~60-120 s on most OEMs).
     // After it expires the device stops beaconing, making it invisible to remote
@@ -597,12 +602,15 @@ class WifiDirectManager(private val context: Context) {
             val mgr2 = wifiP2pManager ?: return mapOf("success" to false, "error" to "Manager null")
             val ch2  = p2pChannel   ?: return mapOf("success" to false, "error" to "Channel null")
             val saved = targetName
+            connectionPhase.set(ConnectionPhase.CONNECTING)
             mgr2.removeGroup(ch2, object : WifiP2pManager.ActionListener {
                 override fun onSuccess() {
+                    connectionPhase.set(ConnectionPhase.IDLE)
                     Log.d(tag, "Passive GO removed — retrying initiateConnection '$saved'")
                     mainHandler.postDelayed({ initiateConnection(saved) }, 500)
                 }
                 override fun onFailure(r: Int) {
+                    connectionPhase.set(ConnectionPhase.IDLE)
                     Log.w(tag, "removeGroup before initiateConnection failed ($r) — retrying anyway")
                     mainHandler.postDelayed({ initiateConnection(saved) }, 500)
                 }
@@ -1396,15 +1404,17 @@ class WifiDirectManager(private val context: Context) {
             Log.d(tag, "connectByUuid: removing passive GO before outgoing connect")
             isPassiveGoMode.set(false)
             pendingPassiveGoCreation.set(false)
-            connectionPhase.set(ConnectionPhase.DISCONNECTED)
+            connectionPhase.set(ConnectionPhase.CONNECTING)
             mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
                 override fun onSuccess() {
+                    connectionPhase.set(ConnectionPhase.IDLE)
                     mainHandler.postDelayed({
                         connectByUuid(savedUuid, savedName)
                     }, 500)
                 }
 
                 override fun onFailure(reason: Int) {
+                    connectionPhase.set(ConnectionPhase.IDLE)
                     Log.w(tag, "connectByUuid: remove passive GO failed " +
                         "(${failureReason(reason)}) - retrying anyway")
                     mainHandler.postDelayed({
@@ -1438,6 +1448,7 @@ class WifiDirectManager(private val context: Context) {
             Log.d(tag, "Connection already in progress ($phase) — waiting"); return
         }
 
+        if (this.targetDeviceName == null) triedPassiveGoJoin = false
         this.targetUuid       = targetUuid
         this.targetDeviceName = fallbackName
         discoveryRetryCount.set(0)
@@ -1655,6 +1666,18 @@ class WifiDirectManager(private val context: Context) {
 
         // ── Slow path: name-based P2P peer discovery ─────────────────────────
         // Clear DNS-SD service requests so discoverServices() stops; we switch to discoverPeers().
+        if (savedUuid != null &&
+            !triedPassiveGoJoin &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            triedPassiveGoJoin = true
+            Log.d(tag, "fallbackToNameBased: DNS-SD cache miss — trying passive-GO join for UUID=$savedUuid")
+            wifiP2pManager?.clearServiceRequests(p2pChannel, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() { connectToGroupByUuid(savedUuid, targetName) }
+                override fun onFailure(r: Int) { connectToGroupByUuid(savedUuid, targetName) }
+            })
+            return
+        }
+
         wifiP2pManager?.clearServiceRequests(p2pChannel, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
                 Log.d(tag, "Service requests cleared — starting name-based peer discovery for '$targetName'")
