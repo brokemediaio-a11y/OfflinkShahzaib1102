@@ -38,10 +38,10 @@ class RegistrationService {
       throw RegistrationException(validationError);
     }
 
-    final hasWifi = await ConnectivityService.hasWifiConnection();
-    if (!hasWifi) {
+    final online = await ConnectivityService.hasAnyNetworkConnection();
+    if (!online) {
       throw RegistrationException(
-        'Wi-Fi is required for account creation. Please connect to Wi-Fi and try again.',
+        'Internet is required for account creation. Connect to Wi‑Fi or mobile data and try again.',
       );
     }
 
@@ -104,15 +104,37 @@ class RegistrationService {
         '(firebaseUid=${user.uid}, deviceUuid=$deviceUuid)',
       );
     } on FirebaseException catch (e, st) {
-      Logger.error('RegistrationService: Firebase error creating account', e, st);
-      throw RegistrationException(
-        'Could not create your account right now. Please check your internet and try again.',
+      Logger.error(
+        'RegistrationService: Firebase error creating account '
+        '[${e.code}] ${e.message}',
+        e,
+        st,
       );
+      throw RegistrationException(_firestoreMessageForCode(e));
     } on RegistrationException {
       rethrow;
     } catch (e, st) {
       Logger.error('RegistrationService: unexpected error creating account', e, st);
       throw RegistrationException('Failed to create account. Please try again.');
+    }
+  }
+
+  /// Maps common Firestore / Auth codes so users see actionable text instead of a generic failure.
+  static String _firestoreMessageForCode(FirebaseException e) {
+    switch (e.code) {
+      case 'permission-denied':
+        return 'Server rejected this action (permissions). Ask your developer to check '
+            'Firestore security rules for anonymous users and users/usernames collections.';
+      case 'unavailable':
+      case 'deadline-exceeded':
+      case 'resource-exhausted':
+        return 'Firebase is temporarily unreachable. Check your connection and try again.';
+      case 'failed-precondition':
+        return 'Could not complete registration (conflict or precondition failed). Try another username.';
+      case 'already-exists':
+        return 'That username is already taken.';
+      default:
+        return 'Could not create your account (${e.code}). Check your internet or try again.';
     }
   }
 

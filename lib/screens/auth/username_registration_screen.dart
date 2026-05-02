@@ -244,7 +244,7 @@ class _UsernameRegistrationScreenState extends State<UsernameRegistrationScreen>
                       const SizedBox(width: 12),
                       Expanded(
                         child: Text(
-                          'Wi-Fi is required for first-time account creation. '
+                          'Internet is required for first-time account creation (Wi‑Fi or mobile data). '
                           'This username will be reserved globally and also shown to nearby OffLink devices.',
                           style: TextStyle(
                             fontSize: 13,
