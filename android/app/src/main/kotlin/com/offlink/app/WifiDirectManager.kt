@@ -441,6 +441,27 @@ class WifiDirectManager(private val context: Context) {
         })
     }
 
+    private fun resumeAfterBusyRecovery() {
+        isBusyRecovering.set(false)
+        val phase = connectionPhase.get()
+        val uuid = ownUuid
+        val canReceivePassively =
+            targetDeviceName == null &&
+            uuid != null &&
+            (phase == ConnectionPhase.DISCONNECTED ||
+                phase == ConnectionPhase.IDLE ||
+                phase == ConnectionPhase.DISCOVERING ||
+                phase == ConnectionPhase.FAILED)
+
+        if (canReceivePassively) {
+            Log.d(tag, "BUSY recovery complete — restoring passive GO readiness")
+            connectionPhase.set(ConnectionPhase.DISCONNECTED)
+            startPassiveGoMode(uuid)
+        } else {
+            discoverPeers()
+        }
+    }
+
     @SuppressLint("MissingPermission")
     fun discoverPeers(): Map<String, Any> {
         if (!initialized) return mapOf("success" to false, "error" to "Not initialized")
@@ -524,10 +545,14 @@ class WifiDirectManager(private val context: Context) {
                         }
                         Log.w(tag, "Peer discovery still BUSY — hard recover #$busyAttempt, delay=${busyDelayMs}ms")
                         connectionPhase.set(ConnectionPhase.DISCONNECTED)
-                        notifyConnectionState(
-                            connected = false,
-                            error = "Wi-Fi Direct was busy; clearing and retrying…"
-                        )
+                        if (targetDeviceName != null) {
+                            notifyConnectionState(
+                                connected = false,
+                                error = "Wi-Fi Direct was busy; clearing and retrying…"
+                            )
+                        } else {
+                            Log.d(tag, "Peer discovery BUSY while idle — recovering without surfacing a connection error")
+                        }
                         // Suppress the passive-discovery heartbeat so it doesn't
                         // fire concurrent discoverPeers() calls during recovery and
                         // make the BUSY state worse (Samsung Android 14 pattern).
@@ -536,8 +561,7 @@ class WifiDirectManager(private val context: Context) {
                         // lingering stale group (the most common BUSY root cause on
                         // Samsung devices) is torn down before the next attempt.
                         hardRecoverP2pSlot(busyDelayMs) {
-                            isBusyRecovering.set(false)
-                            discoverPeers()
+                            resumeAfterBusyRecovery()
                         }
                     }
                     else -> {
@@ -2658,6 +2682,33 @@ class WifiDirectManager(private val context: Context) {
         mainHandler.post { peerListListener?.invoke(peersForDart) }
 
         val phase  = connectionPhase.get()
+
+        // Passive GO groups are created before any relay/client joins. On some
+        // OEMs (observed: Infinix SMART 7 HD) Android does not deliver another
+        // connection-info callback when a client later joins that already-ready
+        // group; it only updates the peer list. Without this bridge the client
+        // reaches 192.168.49.1 but the GO never opens TCP/8988, producing
+        // ECONNREFUSED or a long connection timeout.
+        if (isPassiveGoMode.get() &&
+            isGroupOwner.get() &&
+            phase != ConnectionPhase.SOCKET_CONNECTING &&
+            phase != ConnectionPhase.SOCKET_CONNECTED) {
+            val connectedRelayClient = synchronized(availablePeers) {
+                availablePeers.firstOrNull { it.status == WifiP2pDevice.CONNECTED }
+            }
+            if (connectedRelayClient != null) {
+                Log.d(
+                    tag,
+                    "🔁 Passive GO: connected client ${connectedRelayClient.deviceName} " +
+                        "seen in peer list — starting TCP server"
+                )
+                isPassiveGoMode.set(false)
+                pendingPassiveGoCreation.set(false)
+                connectionPhase.set(ConnectionPhase.GROUP_FORMED)
+                startSocketOrFail()
+                return
+            }
+        }
 
         // ── Incoming Wi-Fi Direct invitation — request user consent ──────────
         // When another device has called connect() targeting us, Android places

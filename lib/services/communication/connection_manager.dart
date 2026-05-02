@@ -665,7 +665,16 @@ class ConnectionManager {
             _schedulePassiveGoRestore('Wi-Fi Direct disconnect');
           }
           if (wasAutoBroadcastConnection) {
-            _isAutoBroadcastConnection = false;
+            final lowerReason = reason.toLowerCase();
+            final isBroadcastFailure = lowerReason.contains('timeout') ||
+                lowerReason.contains('failed') ||
+                lowerReason.contains('error');
+            if (isBroadcastFailure) {
+              _handleBroadcastDeliveryFailure(
+                  _connectingPeerName ?? 'broadcast peer');
+            } else {
+              _isAutoBroadcastConnection = false;
+            }
             // ── Broadcast delivery round in progress — don't reconnect ────
             // The broadcast delivery system manages connections itself via
             // _scheduleNextBroadcastDelivery.  Suppressing the reconnect here
@@ -1586,6 +1595,7 @@ class ConnectionManager {
       _connectedPeerId = null;
       _lastConnectedDevice = null; // don't auto-reconnect after a cancel
       _connectionController.add(ConnectionState.disconnected);
+      _schedulePassiveGoRestore('connection cancel');
     } catch (e) {
       Logger.error('ConnectionManager: cancelConnection error', e);
     }
@@ -3083,11 +3093,21 @@ class ConnectionManager {
     Logger.warning('[BROADCAST] Delivery attempt to $peerName failed; '
         'moving to the next queued peer if available');
 
+    _cancelConnectionTimeout();
+    _currentConnectionType = ConnectionType.none;
+    _connectedDevice = null;
+    _connectedPeerId = null;
+    _connectingPeerName = null;
+    _lastConnectedDevice = null;
+    unawaited(_wifiDirectService.disconnect());
+
     if (_broadcastDeliveryQueue.isEmpty) {
       _isAutoBroadcastConnection = false;
       unawaited(DtnQueue.clearPendingBroadcasts());
       Logger.info('[BROADCAST] Delivery round ended with no remaining peers; '
           'cleared pending broadcast queue to avoid stale retries');
+      _connectionController.add(ConnectionState.disconnected);
+      _schedulePassiveGoRestore('broadcast delivery failure');
       return;
     }
 
