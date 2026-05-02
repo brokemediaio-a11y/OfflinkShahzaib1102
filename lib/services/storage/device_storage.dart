@@ -4,8 +4,12 @@ import '../../utils/logger.dart';
 
 class DeviceStorage {
   static const String _deviceIdKey = 'device_id';
+  static const String _firebaseUidKey = 'firebase_uid';
+  static const String _usernameKey = 'username';
   static const String _displayNameKey = 'display_name';
   static const String _registrationCompleteKey = 'registration_complete';
+  static const String _firebaseRegistrationSyncedKey =
+      'firebase_registration_synced';
   static const String _deviceBoxName = 'device_preferences';
   static Box? _deviceBox;
 
@@ -89,6 +93,68 @@ class DeviceStorage {
     }
   }
 
+  /// Get the user's globally reserved username.
+  static String? getUsername() {
+    try {
+      return _deviceBox?.get(_usernameKey) as String?;
+    } catch (e) {
+      Logger.error('Error getting username', e);
+      return null;
+    }
+  }
+
+  /// Persist the user's globally reserved username.
+  static Future<void> setUsername(String username) async {
+    try {
+      await _deviceBox?.put(_usernameKey, username);
+      Logger.info('Username set to: $username');
+    } catch (e) {
+      Logger.error('Error setting username', e);
+    }
+  }
+
+  /// Get the Firebase Authentication UID for this install.
+  static String? getFirebaseUid() {
+    try {
+      return _deviceBox?.get(_firebaseUidKey) as String?;
+    } catch (e) {
+      Logger.error('Error getting Firebase UID', e);
+      return null;
+    }
+  }
+
+  /// Persist the Firebase Authentication UID for this install.
+  static Future<void> setFirebaseUid(String uid) async {
+    try {
+      await _deviceBox?.put(_firebaseUidKey, uid);
+      Logger.info('Firebase UID stored');
+    } catch (e) {
+      Logger.error('Error setting Firebase UID', e);
+    }
+  }
+
+  /// Whether the local profile has been successfully synced to Firebase.
+  static bool isFirebaseRegistrationSynced() {
+    try {
+      return _deviceBox?.get(_firebaseRegistrationSyncedKey,
+              defaultValue: false) as bool? ??
+          false;
+    } catch (e) {
+      Logger.error('Error checking Firebase registration sync status', e);
+      return false;
+    }
+  }
+
+  /// Persist whether the local registration has been synced to Firebase.
+  static Future<void> setFirebaseRegistrationSynced(bool synced) async {
+    try {
+      await _deviceBox?.put(_firebaseRegistrationSyncedKey, synced);
+      Logger.info('Firebase registration synced status set to: $synced');
+    } catch (e) {
+      Logger.error('Error setting Firebase registration synced status', e);
+    }
+  }
+
   /// Check if user registration is complete
   static bool isRegistrationComplete() {
     try {
@@ -114,6 +180,9 @@ class DeviceStorage {
     try {
       await _deviceBox?.delete(_registrationCompleteKey);
       await _deviceBox?.delete(_displayNameKey);
+      await _deviceBox?.delete(_usernameKey);
+      await _deviceBox?.delete(_firebaseUidKey);
+      await _deviceBox?.delete(_firebaseRegistrationSyncedKey);
       Logger.info('Registration data cleared');
     } catch (e) {
       Logger.error('Error clearing registration', e);

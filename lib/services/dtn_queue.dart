@@ -8,8 +8,8 @@ import '../models/message_packet.dart';
 /// [DtnRetryLoop] polls this queue every 30 seconds and re-attempts delivery
 /// when new peers come into range.
 class DtnQueue {
-  static const _maxAttempts = 20;         // give up after 20 retries
-  static const _retryIntervalMs = 30000;  // retry every 30 seconds
+  static const _maxAttempts = 20; // give up after 20 retries
+  static const _retryIntervalMs = 30000; // retry every 30 seconds
 
   /// Buffer a packet for later delivery. Ignores duplicates (idempotent).
   static Future<void> enqueue(MessagePacket packet) async {
@@ -57,12 +57,12 @@ class DtnQueue {
   }) async {
     final db = await DatabaseHelper.database;
     final now = DateTime.now().millisecondsSinceEpoch;
-    final throttleWhere =
-        ignoreRetryThrottle ? '' : 'AND (last_attempt IS NULL OR last_attempt < ?)';
+    final throttleWhere = ignoreRetryThrottle
+        ? ''
+        : 'AND (last_attempt IS NULL OR last_attempt < ?)';
     final rows = await db.query(
       'outbound_queue',
-      where:
-          "status = ? AND attempts < ? AND to_user_id != '*' $throttleWhere",
+      where: "status = ? AND attempts < ? AND to_user_id != '*' $throttleWhere",
       whereArgs: ignoreRetryThrottle
           ? ['pending', _maxAttempts]
           : ['pending', _maxAttempts, now - _retryIntervalMs],
@@ -81,8 +81,8 @@ class DtnQueue {
       {required bool delivered}) async {
     final db = await DatabaseHelper.database;
     if (delivered) {
-      await db.delete('outbound_queue',
-          where: 'msg_id = ?', whereArgs: [msgId]);
+      await db
+          .delete('outbound_queue', where: 'msg_id = ?', whereArgs: [msgId]);
     } else {
       await db.rawUpdate('''
         UPDATE outbound_queue
@@ -128,12 +128,10 @@ class DtnQueue {
   /// size while giving the DTN layer enough time to reach all visible peers.
   static Future<List<MessagePacket>> getPendingBroadcasts() async {
     final db = await DatabaseHelper.database;
-    final cutoffMs =
-        DateTime.now().millisecondsSinceEpoch - (15 * 60 * 1000);
+    final cutoffMs = DateTime.now().millisecondsSinceEpoch - (15 * 60 * 1000);
     final rows = await db.query(
       'outbound_queue',
-      where:
-          "status = 'pending' AND to_user_id = '*' AND created_at >= ?",
+      where: "status = 'pending' AND to_user_id = '*' AND created_at >= ?",
       whereArgs: [cutoffMs],
     );
     return rows
@@ -154,6 +152,17 @@ class DtnQueue {
       SET last_attempt = ?
       WHERE msg_id = ? AND to_user_id = '*'
     ''', [DateTime.now().millisecondsSinceEpoch, msgId]);
+  }
+
+  /// Remove pending broadcasts after a delivery round has reached every peer
+  /// that was visible for that round. This prevents stale demo traffic from
+  /// repeatedly auto-connecting devices after the user has moved on.
+  static Future<void> clearPendingBroadcasts() async {
+    final db = await DatabaseHelper.database;
+    await db.delete(
+      'outbound_queue',
+      where: "to_user_id = '*' AND status = 'pending'",
+    );
   }
 
   /// Expire all broadcast packets older than [window].

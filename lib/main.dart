@@ -16,6 +16,8 @@ import 'services/storage/known_contacts_storage.dart';
 import 'services/storage/pending_message_storage.dart';
 import 'services/database_helper.dart';
 import 'services/dtn_queue.dart';
+import 'services/firebase_bootstrap_service.dart';
+import 'services/firebase_contact_service.dart';
 import 'utils/logger.dart';
 import 'utils/file_logger.dart';
 
@@ -49,6 +51,15 @@ void main() async {
   HopSimulator.load();
   await KnownContactsStorage.init();
   await PendingMessageStorage.init();
+
+  try {
+    await FirebaseBootstrapService.init();
+    await FirebaseContactService.init();
+  } catch (e) {
+    Logger.error(
+        'Firebase initialization failed; cloud registration features may be unavailable',
+        e);
+  }
 
   // ── Initialize SQLite (DTN routing / seen cache / outbound queue) ────
   await DatabaseHelper.database;

@@ -1,0 +1,29 @@
+{
+    "project_info": {
+      "project_number": "37947810543",
+      "project_id": "offlink-8a3a3",
+      "storage_bucket": "offlink-8a3a3.firebasestorage.app"
+    },
+    "client": [
+      {
+        "client_info": {
+          "mobilesdk_app_id": "1:37947810543:android:8f42438f731bc4d5b1711a",
+          "android_client_info": {
+            "package_name": "com.offlink.app"
+          }
+        },
+        "oauth_client": [],
+        "api_key": [
+          {
+            "current_key": "AIzaSyAfIhEP2MkfHyniU_IuRKprQFsLBt217F4"
+          }
+        ],
+        "services": {
+          "appinvite_service": {
+            "other_platform_oauth_client": []
+          }
+        }
+      }
+    ],
+    "configuration_version": "1"
+  }

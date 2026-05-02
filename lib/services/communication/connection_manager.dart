@@ -130,11 +130,6 @@ class ConnectionManager {
   /// DeviceModel cached after a successful Wi-Fi Direct negotiation.
   DeviceModel? _connectedDevice;
 
-  /// True only after a real socket session where this device acted as GO.
-  /// Restore Passive GO for receivers/carriers after teardown, not for an
-  /// outgoing initiator that just failed or disconnected.
-  bool _lastWifiSessionWasGroupOwner = false;
-
   // ── Auto-reconnect state ──────────────────────────────────────────
   /// Last device we had a full SOCKET_CONNECTED session with.
   DeviceModel? _lastConnectedDevice;
@@ -207,6 +202,12 @@ class ConnectionManager {
   static const Duration _pendingUnicastInterval = Duration(seconds: 3);
   static const Duration _dtnConnectCooldown = Duration(seconds: 12);
 
+  bool get _hasPendingWifiDirectAttempt =>
+      _connectionTimeoutTimer != null ||
+      _connectingPeerName != null ||
+      (_connectedPeerId != null &&
+          _currentConnectionType == ConnectionType.none);
+
   bool get isReconnecting =>
       _reconnectTimer != null ||
       (_lastConnectedDevice != null && _reconnectAttempt > 0);
@@ -214,7 +215,9 @@ class ConnectionManager {
   /// True when the active connection is a background relay or broadcast
   /// delivery pass — UI layers use this to skip chat navigation.
   bool get isRelaySession =>
-      _isIncomingRelaySession || _isAutoBroadcastConnection;
+      _isIncomingRelaySession ||
+      _isAutoBroadcastConnection ||
+      _isDtnAutoConnection;
 
   // ── Connection timeout ────────────────────────────────────────────
   /// Fires if the TCP socket has not opened within [_connectionTimeoutSeconds].
@@ -515,8 +518,6 @@ class ConnectionManager {
         // Cancel the 30-second watchdog — we made it in time.
         _cancelConnectionTimeout();
         _connectingPeerName = null;
-        _lastWifiSessionWasGroupOwner = state.isGroupOwner;
-
         // Always send a UUID handshake so the RECEIVING side (which never
         // called connectToDevice) can learn our UUID before chat opens.
         _sendUuidHandshake();
@@ -632,12 +633,15 @@ class ConnectionManager {
           // ── Actual disconnect or failure ─────────────────────────────
           final reason = state.error ?? 'disconnected';
           Logger.info('ConnectionManager: Wi-Fi Direct disconnected — $reason');
-          final hadRealSession =
-              _lastConnectedDevice != null ||
+          final wasDtnAutoConnection = _isDtnAutoConnection;
+          final wasAutoBroadcastConnection = _isAutoBroadcastConnection;
+          final wasIncomingRelaySession = _isIncomingRelaySession;
+          final hadRealSession = _lastConnectedDevice != null ||
               _connectedDevice != null ||
               _connectedPeerId != null ||
-              _isIncomingRelaySession ||
-              _isAutoBroadcastConnection;
+              wasIncomingRelaySession ||
+              wasAutoBroadcastConnection ||
+              wasDtnAutoConnection;
           // Always restore passive GO after any real session, regardless of
           // whether we were GO or client — every device must stay connectable
           // for incoming relay hops via connectToGroupByUuid.
@@ -660,9 +664,8 @@ class ConnectionManager {
           if (shouldRestorePassiveGo) {
             _schedulePassiveGoRestore('Wi-Fi Direct disconnect');
           }
-          _lastWifiSessionWasGroupOwner = false;
-
-          if (_isAutoBroadcastConnection) {
+          if (wasAutoBroadcastConnection) {
+            _isAutoBroadcastConnection = false;
             // ── Broadcast delivery round in progress — don't reconnect ────
             // The broadcast delivery system manages connections itself via
             // _scheduleNextBroadcastDelivery.  Suppressing the reconnect here
@@ -670,7 +673,15 @@ class ConnectionManager {
             // fires during the inter-peer gap and starts a duplicate round.
             _connectionController.add(ConnectionState.disconnected);
             return;
-          } else if (_isIncomingRelaySession) {
+          } else if (wasDtnAutoConnection) {
+            // A background delivery attempt failed or ended. Keep the UI quiet
+            // and let the DTN scheduler retry after cooldown instead of
+            // falling into the one-to-one auto-reconnect path.
+            _lastConnectedDevice = null;
+            _cancelReconnect();
+            _connectionController.add(ConnectionState.disconnected);
+            return;
+          } else if (wasIncomingRelaySession) {
             // ── Relay session ended — look for next hop immediately ───────
             // Don't reconnect to the sender; instead trigger a relay-delivery
             // check so packets we just received get forwarded onward quickly.
@@ -685,6 +696,16 @@ class ConnectionManager {
             // ── User tapped Disconnect — no auto-reconnect ──────────────
             _userInitiatedDisconnect = false;
             _userInitiatedDisconnectAt = null;
+            _connectionController.add(ConnectionState.disconnected);
+          } else if (reason.toLowerCase().contains('peer closed') ||
+              reason
+                  .toLowerCase()
+                  .contains('software caused connection abort')) {
+            // Most demo disconnects are intentional on the other device but the
+            // graceful frame can be lost if Android tears the socket down first.
+            // Treat these close notifications as final to avoid surprise invites.
+            _lastConnectedDevice = null;
+            _cancelReconnect();
             _connectionController.add(ConnectionState.disconnected);
           } else if (_lastConnectedDevice != null) {
             // ── Unexpected drop (range / signal) — auto-reconnect ────────
@@ -1092,6 +1113,42 @@ class ConnectionManager {
       // we never auto-disconnect while the user is actively chatting.
       if (!forDtnDelivery) _isDtnAutoConnection = false;
 
+      // A Wi-Fi Direct negotiation is already underway even before
+      // _currentConnectionType flips to wifiDirect. Starting another connect()
+      // in this window causes duplicate native CONNECTING attempts, stale
+      // invitations, and first-attempt timeouts.
+      if (_hasPendingWifiDirectAttempt && !isConnected()) {
+        final pendingPeerId = _connectedPeerId;
+        if (pendingPeerId == device.id) {
+          Logger.info(
+              'ConnectionManager: already connecting to "${device.name}" '
+              '- keeping the existing Wi-Fi Direct attempt');
+          _connectionController.add(ConnectionState.connecting);
+          return true;
+        }
+
+        if (forDtnDelivery) {
+          Logger.debug('DTN auto-connect skipped: Wi-Fi Direct attempt already '
+              'in flight for ${_connectingPeerName ?? pendingPeerId ?? "unknown peer"}');
+          return false;
+        }
+
+        Logger.info('ConnectionManager: cancelling in-flight Wi-Fi Direct '
+            'attempt to "${_connectingPeerName ?? pendingPeerId ?? "unknown peer"}" '
+            'before connecting to "${device.name}"');
+        _cancelConnectionTimeout();
+        _isDtnAutoConnection = false;
+        _isAutoBroadcastConnection = false;
+        _connectedPeerId = null;
+        _connectingPeerName = null;
+        _lastConnectedDevice = null;
+        _cancelReconnect();
+        await _wifiDirectService.disconnect();
+        _currentConnectionType = ConnectionType.none;
+        _connectedDevice = null;
+        await Future.delayed(const Duration(milliseconds: 1800));
+      }
+
       // ── Guard: connected to a DIFFERENT peer — disconnect first ───────
       // Android Wi-Fi Direct supports only one active P2P group at a time.
       // When the Kotlin layer is in SOCKET_CONNECTED state, connectToPeer()
@@ -1210,7 +1267,13 @@ class ConnectionManager {
           : await _wifiDirectService.initiateConnection(
               targetUuid: device.id, targetName: device.name);
 
-      if (result['success'] == true) {
+      final nativePhase = result['phase']?.toString();
+      final duplicateWhileConnecting = result['duplicate'] == true &&
+          (nativePhase == 'CONNECTING' ||
+              nativePhase == 'GROUP_FORMED' ||
+              nativePhase == 'SOCKET_CONNECTING');
+
+      if (result['success'] == true || duplicateWhileConnecting) {
         if (forDtnDelivery) {
           Logger.relay('⏳ NEGOTIATING | "${device.name}" — awaiting socket…');
         } else {
@@ -1297,8 +1360,6 @@ class ConnectionManager {
           isConnected() ||
           _connectedPeerId != null ||
           _connectingPeerName != null ||
-          _reconnectTimer != null ||
-          _lastConnectedDevice != null ||
           _isAutoBroadcastConnection) {
         Logger.relay(
             'Passive GO restore skipped after $reason - connection busy');
@@ -1312,8 +1373,8 @@ class ConnectionManager {
       final res = await _wifiDirectService.restorePassiveGoMode();
       Logger.relay('Passive GO restored after $reason -> $res');
     } catch (e) {
-      Logger.error('Passive GO restore failed after $reason', e, null,
-          Logger.conn);
+      Logger.error(
+          'Passive GO restore failed after $reason', e, null, Logger.conn);
     }
   }
 
@@ -1346,8 +1407,6 @@ class ConnectionManager {
       if (shouldRestorePassiveGo) {
         _schedulePassiveGoRestore('manual disconnect');
       }
-      _lastWifiSessionWasGroupOwner = false;
-
       Logger.info(
           'ConnectionManager: disconnected. Restarting BLE advertising…');
       await Future.delayed(const Duration(milliseconds: 500));
@@ -1463,6 +1522,9 @@ class ConnectionManager {
         if (!_isDtnAutoConnection) {
           _markUserInitiatedDisconnect(); // suppress normal auto-reconnect
         }
+        final wasAutoBroadcastDelivery = _isAutoBroadcastConnection;
+        final wasBackgroundDelivery =
+            _isDtnAutoConnection || wasAutoBroadcastDelivery || forDtnDelivery;
         // Reset DTN auto-connection flag so the next BLE scan batch is not
         // permanently blocked from triggering a new relay attempt.
         // Without this, _isDtnAutoConnection stays true after a timed-out DTN
@@ -1472,14 +1534,20 @@ class ConnectionManager {
         _wifiDirectService.disconnect();
         final idToRemove = _connectedPeerId ?? '__uuid_pending__';
         _transportManager.removeNeighbor(idToRemove);
-        if (_connectedPeerId != null)
+        if (_connectedPeerId != null) {
           _peerDiscovery.removePeer(_connectedPeerId!);
+        }
         _currentConnectionType = ConnectionType.none;
         _connectedDevice = null;
         _connectedPeerId = null;
         _connectingPeerName = null;
         _lastConnectedDevice = null; // prevent auto-reconnect after timeout
-        _connectionController.add(ConnectionState.error);
+        _connectionController.add(wasBackgroundDelivery
+            ? ConnectionState.disconnected
+            : ConnectionState.error);
+        if (wasAutoBroadcastDelivery) {
+          _handleBroadcastDeliveryFailure(peerName);
+        }
         // Restore passive GO so the device stays connectable for relay hops
         // even when an outbound DTN connection timed out without a socket.
         unawaited(_restorePassiveGoIfIdle('connection timeout'));
@@ -1510,8 +1578,9 @@ class ConnectionManager {
       await _wifiDirectService.disconnect();
       final idToRemove = _connectedPeerId ?? '__uuid_pending__';
       _transportManager.removeNeighbor(idToRemove);
-      if (_connectedPeerId != null)
+      if (_connectedPeerId != null) {
         _peerDiscovery.removePeer(_connectedPeerId!);
+      }
       _currentConnectionType = ConnectionType.none;
       _connectedDevice = null;
       _connectedPeerId = null;
@@ -1804,7 +1873,11 @@ class ConnectionManager {
   /// store-and-forward queue so delivery happens without user interaction.
   // ignore: unused_element
   Future<void> _triggerAutoConnectForTarget(String targetUserId) async {
-    if (isConnected() || _currentConnectionType != ConnectionType.none) return;
+    if (isConnected() ||
+        _currentConnectionType != ConnectionType.none ||
+        _hasPendingWifiDirectAttempt) {
+      return;
+    }
 
     // When the user explicitly disconnected, that flag prevents unwanted
     // reconnects to the OLD peer.  But a brand-new message to any peer
@@ -2092,11 +2165,11 @@ class ConnectionManager {
 
       final deviceName = await _resolveDeviceName();
       final started = await _blePeripheralService.startAdvertising(
-        deviceName: deviceName as String?,
+        deviceName: deviceName,
       );
       // Embed our username in the Wi-Fi Direct DNS-SD TXT record so peers
       // can display our name when discovered at Wi-Fi Direct range (~200 m).
-      if (deviceName is String && deviceName.isNotEmpty) {
+      if (deviceName.isNotEmpty) {
         unawaited(_wifiDirectService.setOwnUsername(deviceName));
       }
       _isAdvertising = started;
@@ -2156,8 +2229,7 @@ class ConnectionManager {
       combined[d.id] = d;
     }
     final rawList = combined.values.toList();
-    final deviceList =
-        HopSimulator.apply(DeviceStorage.getDeviceId(), rawList);
+    final deviceList = HopSimulator.apply(DeviceStorage.getDeviceId(), rawList);
     _deviceStreamController.add(deviceList);
 
     // Trigger broadcast (and unicast) auto-connect whenever ANY discovery
@@ -2178,7 +2250,9 @@ class ConnectionManager {
     _immediateRelayTimer?.cancel();
     _immediateRelayTimer = Timer(const Duration(milliseconds: 1500), () {
       _immediateRelayTimer = null;
-      if (!isConnected() && _currentConnectionType == ConnectionType.none) {
+      if (!isConnected() &&
+          _currentConnectionType == ConnectionType.none &&
+          !_hasPendingWifiDirectAttempt) {
         Logger.info(
             'ConnectionManager: [${Logger.hopping}] immediate relay check — '
             'checking for peers to forward queued packets',
@@ -2382,8 +2456,8 @@ class ConnectionManager {
       }
 
       final deviceName = await _resolveDeviceName();
-      final started = await _blePeripheralService.startAdvertising(
-          deviceName: deviceName as String?);
+      final started =
+          await _blePeripheralService.startAdvertising(deviceName: deviceName);
       _isAdvertising = started;
       if (started) {
         Logger.info('Peripheral role resumed successfully');
@@ -2475,8 +2549,8 @@ class ConnectionManager {
       // Remove from pending queue — delivery confirmed
       unawaited(DtnQueue.recordAttempt(messageId, delivered: true));
       unawaited(PendingMessageStorage.removePendingMessage(messageId));
-      unawaited(
-          MessageStorage.updateMessageStatus(messageId, MessageStatus.delivered));
+      unawaited(MessageStorage.updateMessageStatus(
+          messageId, MessageStatus.delivered));
 
       // Emit as a special JSON string so ConnectionNotifier can update UI
       _messageController.add(jsonEncode(ack));
@@ -2738,9 +2812,12 @@ class ConnectionManager {
   Future<void> _checkAndAutoConnectForPendingMessagesImpl(
       List<DeviceModel> discoveredDevices) async {
     // Don't interrupt an existing connection or connecting attempt.
-    if (isConnected() || _currentConnectionType != ConnectionType.none) {
+    if (isConnected() ||
+        _currentConnectionType != ConnectionType.none ||
+        _hasPendingWifiDirectAttempt) {
       Logger.debug('DTN auto-connect skipped: busy '
-          '(connected=${isConnected()}, type=$_currentConnectionType)');
+          '(connected=${isConnected()}, type=$_currentConnectionType, '
+          'pending=$_hasPendingWifiDirectAttempt)');
       return;
     }
     // Don't auto-connect if user explicitly cancelled / disconnected recently.
@@ -2897,7 +2974,10 @@ class ConnectionManager {
         // Last resort B: take any peer with a real signal reading.
         if (anyRelay == null) {
           for (final d in sortedDevices) {
-            if (d.rssi != 0) { anyRelay = d; break; }
+            if (d.rssi != 0) {
+              anyRelay = d;
+              break;
+            }
           }
         }
         if (anyRelay != null) {
@@ -2962,6 +3042,7 @@ class ConnectionManager {
         // ── Delivery round fully complete ─────────────────────────────
         // All peers reached.  Clear the flag and emit disconnected so the
         // UI banner disappears cleanly.  No next connection needed.
+        await DtnQueue.clearPendingBroadcasts();
         _isAutoBroadcastConnection = false;
         _connectionController.add(ConnectionState.disconnected);
         Logger.info('[BROADCAST] ✅ Broadcast delivery round complete — '
@@ -2993,6 +3074,36 @@ class ConnectionManager {
       Logger.error(
           '[BROADCAST] Error during auto-disconnect for delivery round', e);
       _isAutoBroadcastConnection = false;
+    });
+  }
+
+  void _handleBroadcastDeliveryFailure(String peerName) {
+    if (!_isAutoBroadcastConnection) return;
+
+    Logger.warning('[BROADCAST] Delivery attempt to $peerName failed; '
+        'moving to the next queued peer if available');
+
+    if (_broadcastDeliveryQueue.isEmpty) {
+      _isAutoBroadcastConnection = false;
+      unawaited(DtnQueue.clearPendingBroadcasts());
+      Logger.info('[BROADCAST] Delivery round ended with no remaining peers; '
+          'cleared pending broadcast queue to avoid stale retries');
+      return;
+    }
+
+    final next = _broadcastDeliveryQueue.removeAt(0);
+    Timer(const Duration(milliseconds: 2500), () {
+      if (_currentConnectionType != ConnectionType.none ||
+          isConnected() ||
+          _hasPendingWifiDirectAttempt) {
+        Logger.debug('[BROADCAST] Delayed retry skipped: Wi-Fi Direct busy');
+        return;
+      }
+      Logger.info(
+          '[BROADCAST] Retrying delivery round with next peer: ${next.name}');
+      _isAutoBroadcastConnection = true;
+      _lastDtnConnectAttemptTime = DateTime.now();
+      unawaited(connectToDevice(next, forDtnDelivery: true));
     });
   }
 

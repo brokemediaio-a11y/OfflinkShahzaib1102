@@ -4,6 +4,7 @@ import '../../core/app_colors.dart';
 import '../../core/app_strings.dart';
 import '../../providers/device_provider.dart';
 import '../../services/storage/device_storage.dart';
+import '../../services/registration_service.dart';
 import '../../utils/permissions_helper.dart';
 import '../../utils/logger.dart';
 import '../auth/username_registration_screen.dart';
@@ -29,15 +30,22 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
     await Future.delayed(const Duration(seconds: 2));
 
     // Check if user has completed registration (username setup)
-    final isRegistrationComplete = DeviceStorage.isRegistrationComplete();
-    Logger.info('Registration complete: $isRegistrationComplete');
+    final registrationComplete = DeviceStorage.isRegistrationComplete();
+    final needsRegistration = await RegistrationService.needsRegistration();
+    Logger.info(
+        'Registration complete: $registrationComplete, needsRegistration: $needsRegistration');
 
     if (!mounted) return;
 
-    if (!isRegistrationComplete) {
+    if (needsRegistration) {
       // First time launch - go to username registration
       Navigator.of(context).pushReplacement(
-        MaterialPageRoute(builder: (_) => const UsernameRegistrationScreen()),
+        MaterialPageRoute(
+          builder: (_) => UsernameRegistrationScreen(
+            initialUsername: DeviceStorage.getUsername() ??
+                DeviceStorage.getDisplayName(),
+          ),
+        ),
       );
       return;
     }

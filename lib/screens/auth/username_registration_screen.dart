@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../../core/app_colors.dart';
+import '../../services/registration_service.dart';
 import '../../services/storage/device_storage.dart';
 import '../../utils/logger.dart';
 import '../../utils/permissions_helper.dart';
@@ -8,7 +9,9 @@ import '../auth/permissions_screen.dart';
 
 /// Screen for capturing username on first app launch
 class UsernameRegistrationScreen extends StatefulWidget {
-  const UsernameRegistrationScreen({super.key});
+  const UsernameRegistrationScreen({super.key, this.initialUsername});
+
+  final String? initialUsername;
 
   @override
   State<UsernameRegistrationScreen> createState() => _UsernameRegistrationScreenState();
@@ -19,6 +22,15 @@ class _UsernameRegistrationScreenState extends State<UsernameRegistrationScreen>
   final _formKey = GlobalKey<FormState>();
   bool _isLoading = false;
   String? _errorMessage;
+
+  @override
+  void initState() {
+    super.initState();
+    _usernameController.text = widget.initialUsername ??
+        DeviceStorage.getUsername() ??
+        DeviceStorage.getDisplayName() ??
+        '';
+  }
 
   @override
   void dispose() {
@@ -38,13 +50,9 @@ class _UsernameRegistrationScreenState extends State<UsernameRegistrationScreen>
 
     try {
       final username = _usernameController.text.trim();
-      
-      // Save username as display name
-      await DeviceStorage.setDisplayName(username);
-      
-      // Mark that registration is complete
-      await DeviceStorage.setRegistrationComplete(true);
-      
+
+      await RegistrationService.createAccount(username: username);
+
       Logger.info('User registered with username: $username');
       
       // Check if permissions are already granted
@@ -64,6 +72,12 @@ class _UsernameRegistrationScreenState extends State<UsernameRegistrationScreen>
           );
         }
       }
+    } on RegistrationException catch (e) {
+      Logger.error('Error creating Firebase-backed account', e);
+      setState(() {
+        _errorMessage = e.message;
+        _isLoading = false;
+      });
     } catch (e) {
       Logger.error('Error saving username', e);
       setState(() {
@@ -149,20 +163,10 @@ class _UsernameRegistrationScreenState extends State<UsernameRegistrationScreen>
                     color: AppColors.textPrimary,
                   ),
                   validator: (value) {
-                    if (value == null || value.trim().isEmpty) {
+                    if (value == null) {
                       return 'Please enter a username';
                     }
-                    if (value.trim().length < 3) {
-                      return 'Username must be at least 3 characters';
-                    }
-                    if (value.trim().length > 20) {
-                      return 'Username must be less than 20 characters';
-                    }
-                    // Check for valid characters (alphanumeric, spaces, underscores, hyphens)
-                    if (!RegExp(r'^[a-zA-Z0-9 _-]+$').hasMatch(value)) {
-                      return 'Username can only contain letters, numbers, spaces, and - _';
-                    }
-                    return null;
+                    return RegistrationService.validateUsername(value);
                   },
                   textInputAction: TextInputAction.done,
                   onFieldSubmitted: (_) => _saveUsername(),
@@ -240,7 +244,8 @@ class _UsernameRegistrationScreenState extends State<UsernameRegistrationScreen>
                       const SizedBox(width: 12),
                       Expanded(
                         child: Text(
-                          'This username will be visible to others when they scan for nearby devices.',
+                          'Wi-Fi is required for first-time account creation. '
+                          'This username will be reserved globally and also shown to nearby OffLink devices.',
                           style: TextStyle(
                             fontSize: 13,
                             color: AppColors.textSecondary,

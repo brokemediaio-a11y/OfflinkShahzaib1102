@@ -6,6 +6,7 @@ import '../../models/device_model.dart';
 import '../../models/known_contact_model.dart';
 import '../../providers/connection_provider.dart';
 import '../../services/communication/connection_manager.dart';
+import '../../services/firebase_contact_service.dart';
 import '../../services/storage/known_contacts_storage.dart';
 import '../chat/chat_screen.dart';
 
@@ -106,6 +107,11 @@ class _ContactBookScreenState extends ConsumerState<ContactBookScreen>
         backgroundColor: AppColors.primary,
         foregroundColor: AppColors.textLight,
         actions: [
+          IconButton(
+            icon: const Icon(Icons.person_add_alt_1),
+            tooltip: 'Add by username',
+            onPressed: _showAddByUsernameSheet,
+          ),
           IconButton(
             icon: const Icon(Icons.refresh),
             tooltip: 'Refresh',
@@ -355,6 +361,124 @@ class _ContactBookScreenState extends ConsumerState<ContactBookScreen>
           ],
         ),
       ),
+    );
+  }
+
+  Future<void> _showAddByUsernameSheet() async {
+    final controller = TextEditingController();
+    String? errorText;
+    bool isSubmitting = false;
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setSheetState) {
+            Future<void> submit() async {
+              final rawUsername = controller.text.trim();
+              if (rawUsername.isEmpty) {
+                setSheetState(() => errorText = 'Enter a username');
+                return;
+              }
+
+              setSheetState(() {
+                isSubmitting = true;
+                errorText = null;
+              });
+
+              try {
+                final contact =
+                    await FirebaseContactService.lookupByUsername(rawUsername);
+                if (contact == null) {
+                  setSheetState(() {
+                    errorText = 'No OffLink user found with that username.';
+                    isSubmitting = false;
+                  });
+                  return;
+                }
+
+                await KnownContactsStorage.saveContact(
+                  peerId: contact.peerId,
+                  displayName: contact.displayName,
+                  deviceAddress: contact.deviceAddress,
+                  addedVia: 'firebase',
+                  avatarHash: contact.avatarHash,
+                );
+
+                if (!mounted || !ctx.mounted) return;
+                Navigator.of(ctx).pop();
+                _loadContacts();
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text('${contact.displayName} added to contact book'),
+                  ),
+                );
+              } catch (e) {
+                setSheetState(() {
+                  errorText = e.toString().replaceFirst('Bad state: ', '');
+                  isSubmitting = false;
+                });
+              }
+            }
+
+            final bottomInset = MediaQuery.of(ctx).viewInsets.bottom;
+            return Padding(
+              padding: EdgeInsets.fromLTRB(16, 16, 16, 16 + bottomInset),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Text(
+                    'Add by Username',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Search the global OffLink directory using internet, then save the person locally for offline chat and DTN delivery.',
+                    style: TextStyle(color: Colors.grey[600], fontSize: 13),
+                  ),
+                  const SizedBox(height: 16),
+                  TextField(
+                    controller: controller,
+                    enabled: !isSubmitting,
+                    textInputAction: TextInputAction.search,
+                    onSubmitted: (_) => submit(),
+                    decoration: InputDecoration(
+                      labelText: 'Username',
+                      hintText: 'Enter exact username',
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      errorText: errorText,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  ElevatedButton(
+                    onPressed: isSubmitting ? null : submit,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: AppColors.primary,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                    ),
+                    child: isSubmitting
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              valueColor:
+                                  AlwaysStoppedAnimation<Color>(Colors.white),
+                            ),
+                          )
+                        : const Text('Add Contact'),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
     );
   }
 
